@@ -1,2 +1,5 @@
-# STL_dev
-Development of the STL library
+# STL (temporary package name)
+
+Welcome to the Scattering Transform Library!
+
+Doc: https://stl-dev.readthedocs.io/en/latest/
