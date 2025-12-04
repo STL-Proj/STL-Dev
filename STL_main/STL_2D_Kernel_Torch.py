@@ -19,6 +19,7 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch_backend import to_torch_tensor
 
 def _conv2d_circular(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """
@@ -178,7 +179,7 @@ class STL_2D_Kernel_Torch:
         
             
     ###########################################################################
-    def to_array(self,array):
+    def to_array(self, array):
         """
         Transform input array (NumPy or PyTorch) into a PyTorch tensor.
         Should return None if None.
@@ -198,16 +199,9 @@ class STL_2D_Kernel_Torch:
             return None
         elif isinstance(array, list):
             return array
-
-        # Choose device: use GPU if available, otherwise CPU
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if isinstance(array, np.ndarray):
-            return torch.from_numpy(array).to(device)
-        elif isinstance(array, torch.Tensor):
-            return array.to(device)
         else:
-            raise TypeError(f"Unsupported array type: {type(array)}")
+            # Choose device: use GPU if available, otherwise CPU
+            return to_torch_tensor(array)
             
     ###########################################################################
     def copy(self, empty=False):

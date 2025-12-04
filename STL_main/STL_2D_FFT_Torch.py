@@ -3,30 +3,15 @@ Created on Wed Nov 14:07 2018
 """
 import numpy as np
 import torch
-from copy import deepcopy
+from torch_backend import to_torch_tensor
 
 class STL_2D_FFT_Torch:
     """
     Class for 2D planar STL FFT using PyTorch
     """
-    @staticmethod
-    def to_array(data):
-        """
-        Convert input to a PyTorch array.
-        """
-        array = torch.as_tensor(data)
-        return array
-    
-    @staticmethod
-    def copy_array(data):
-        """
-        Copies input PyTorch array.
-        """
-        array = copy(data)
-        return array
 
     @staticmethod    
-    def covariance(array1, fourier_status1, array2, fourier_status2, mask, remove_mean=False):
+    def covariance(array1, fourier_status1, array2, fourier_status2, mask=None, remove_mean=False):
         """
         Compute the covariance of two tensors on their last two dimensions.
         
@@ -91,13 +76,13 @@ class STL_2D_FFT_Torch:
         return cov
     
 
-    def __init__(self, data, fourier_status=False):
+    def __init__(self, array, fourier_status=False):
         """
         Initialize the STL_2D_FFT_torch class.
 
         fourier_status: True if data is in Fourier space.
         """
-        self.array = self.__class__.to_array(data) if data is not None else None
+        self.array = self.to_array(array)
         self.fourier_status = fourier_status
 
         self.DT = '2D_FFT_Torch'
@@ -116,6 +101,31 @@ class STL_2D_FFT_Torch:
         new.array = self.array[key]
 
         return new
+    
+
+    def to_array(self, array):
+        """
+        Transform input array (NumPy or PyTorch) into a PyTorch tensor.
+        Should return None if None.
+
+        Parameters
+        ----------
+        array : np.ndarray or torch.Tensor
+            Input array to be converted.
+
+        Returns
+        -------
+        torch.Tensor
+            Converted PyTorch tensor.
+        """
+        
+        if array is None:
+            return None
+        elif isinstance(array, list):
+            return array
+        else:
+            # Choose device: use GPU if available, otherwise CPU
+            return to_torch_tensor(array)
 
 
     def findN(self):
@@ -143,7 +153,7 @@ class STL_2D_FFT_Torch:
                     
         Output 
         ----------
-        - StlData
+        - STL_2D_FFT_Torch
            copy of self
         """
         
@@ -304,101 +314,30 @@ class STL_2D_FFT_Torch:
             return self.array
         else:
             return torch.fft.ifft2(self.array, norm="ortho")
-
-    def subsampling(self, dg_out, O_fourier = False, mask_MR=None):
-        """
-        Downsample the self.array to the specified resolution.
         
-        Note: Masks are not supported in this data type.
+        
+    def set_fourier_status(self, target_fourier_status, inplace=True):
+        """
+        Put the  in the desired Fourier status (target_fourier_status).
         
         Parameters
         ----------
-        dg_out : int
-            Desired downsampling factor of the data.
-        mask_MR : None
-            Placeholder for mask, not used in this function.
-        
-        Returns
-        -------
-        torch.Tensor
-            Downsampled data at the desired downgrading factor dg_out.
-        fourier_status : bool
-            Indicates whether output array is in Fourier space.        
+        - target_fourier_status : bool
+            Desired Fourier status: True = Fourier space, False = real space.
+        - inplace : bool
+            If True, acts in-place and returns self.
+            If False, returns a new stl_array instance.
         """
-        
-        if mask_MR is not None:
-            raise Exception("Masks are not supported in DT1") 
-            
-        if dg_out == self.dg:
-            return self
-        
-        # Tuning parameter to keep the aspect ratio and a unified resolution
-        min_x, min_y = 8, 8
-        if self.N0[0] > self.N0[1]:
-            min_x = int(min_x * self.N0[0]/self.N0[1])
-        elif self.N0[1] > self.N0[0]:
-            min_y = int(min_y * self.N0[1]/self.N0[0])
+        data = self if inplace else self.copy()
 
-        # Identify the new dimensions
-        dx = int(max(min_x, self.N0[0] // 2**(dg_out + 1)))
-        dy = int(max(min_y, self.N0[1] // 2**(dg_out + 1)))
-        
-        # Check expected current dimensions
-        dx_cur = int(max(min_x, self.N0[0] // 2**(self.dg + 1)))
-        dy_cur = int(max(min_y, self.N0[1] // 2**(self.dg + 1)))
-        
-        # Perform downsampling if necessary
-        if dx != dx_cur or dy != dy_cur:
-            
-            # Fourier transform if in real space
-            if not self.fourier_status:
-                array = self.fourier()
-                self.fourier_status = True
-            else:
-                array = self.array
-                        
-            # Downsampling in Fourier
-            array_dg = torch.cat(
-                (torch.cat(
-                    (array[...,:dx, :dy], array[...,-dx:, :dy]), -2),
-                torch.cat(
-                    (array[...,:dx, -dy:], array[...,-dx:, -dy:]), -2)
-                ),-1) * np.sqrt(dx * dy / dx_cur / dy_cur)
-            
-            self.array = array_dg
-            if O_fourier == False:
-                self.array = self.out_fourier(O_fourier)
-                self.fourier_status = False
-            return self
-
-        else:
-            return self
-        
-    def out_fourier(self, O_fourier):
-        """
-        Put the  in the desired Fourier status (O_Fourier).
-        
-        Parameters
-        ----------
-        - O_fourier : bool
-            Desired Fourier status (True = Fourier space, False = real space)
-        - copy : bool
-            If True, returns a new stl_array instance.
-        """
-        
-        # Check that O_Fourier is a bool
-        if not isinstance(O_fourier, bool):
-            raise Exception("0_Fourier should be a bool")
-    
         # If current status differs from desired
-        if self.fourier_status != O_fourier:
-            if O_fourier:
-                data = self.fourier()
+        if data.fourier_status != target_fourier_status:
+            if target_fourier_status:
+                data.array = data.fourier()
             else:
-                data = self.ifourier()
-        # Already in desired space
-        else:
-            data = self.copy()
+                data.array = data.ifourier()
+            # update the fourier_status
+            data.fourier_status = target_fourier_status
     
         return data
         
@@ -646,10 +585,13 @@ class CrappyWavelateOperator2D_FFT_torch:
         self.j_to_dg = []
         for j in range(self.J):
             dg = min(j, self.dg_max)
-            subsampled_wavelet_array, fourier_status = STL_2D_FFT_Torch(data=self.wavelet_array[j],
-                                                                        fourier_status=True).subsampling(dg_out=dg)
-            assert fourier_status
-            self.wavelet_array_MR.append(subsampled_wavelet_array)
+            subsampled_wavelet = self.downsample(data=STL_2D_FFT_Torch(array=self.wavelet_array[j], 
+                                                                       fourier_status=True), 
+                                                 dg_out=dg, 
+                                                 inplace=True, 
+                                                 target_fourier_status=True)
+            assert subsampled_wavelet.fourier_status
+            self.wavelet_array_MR.append(subsampled_wavelet.array)
             self.j_to_dg.append(dg)
 
             
@@ -678,87 +620,71 @@ class CrappyWavelateOperator2D_FFT_torch:
         # To be done
 
     @staticmethod
-    def wavelet_conv_full(data, wavelet_set, fourier_status, mask=None):
+    def wavelet_conv_full(data, wavelet_set, mask=None):
         """
-        Perform a convolution of data by the entire wavelet set at full resolution.
-        
+        Perform convolutions of data with the entire wavelet set at full resolution.
+        WARNING: Sets the data in Fourier space in place if data is in real space.
         No mask is allowed in this DT.
 
         Parameters
         ----------
-        - data : torch.Tensor of size (..., N0)
-            Data whose convolution is computed
-        - wavelet_set : torch.Tensor of size (J, L, N0)
-            Wavelet set
-        - fourier_status:
-            Fourier status of the data
+        - data: STL_2D_FFT_Torch instance whose array attribute is a torch.Tensor of size (..., N0)
+            Data to be filtered by the wavelt_set
+        - wavelet_set: torch.Tensor of size (J, L, N0)
+            Wavelet set in Fourier space at all J scales and L orientations
         - mask : torch.Tensor of size (...,N0) -> None expected
-            Mask for the convolution
-
-        Returns
-        -------
-        - conv: torch.Tensor (..., J, L, N0)
-            Convolution between data and wavelet_set
-        - fourier_status: bool 
-            Fourier status of the convolution (True in this DT)
-        """
-        
-        if mask is not None:
-            raise NotImplementedError("Mask is not yet allowed in this DT")
-
-        # Pass data in Fourier if in real space
-        _data = data if fourier_status else torch.fft.fft2(data)
-        
-        # Compute the convolution
-        conv = _data[..., None, None, :, :] * wavelet_set
-        
-        # Fourier status related to the DT
-        fourier_status = True
-        
-        return conv, fourier_status
-    
-    @staticmethod
-    def wavelet_conv(data, wavelet_j, fourier_status, mask_MR=None):
-        """
-        Perform a convolution of data by the wavelet at a given scale and L 
-        orientation. Both the data and the wavelet should be at the Nj resolution.
-        
-        No mask is allowed in this DT.
-
-        Parameters
-        ----------
-        - data : torch.Tensor of size (..., Nj)
-            Data whose convolution is computed, at resolution Nj
-        - wavelet_set : torch.Tensor of size (L, Nj)
-            Wavelet set at scale j
-        - fourier_status:
-            Fourier status of the data
-        - mask_MR : list of torch.Tensor of size (...,Nj) -> None expected
             Multi-resolution masks for the convolution
 
         Returns
         -------
-        - conv: torch.Tensor (..., L, N0)
-            Convolution between data and wavelet_set at scale j
-        - fourier_status: bool 
-            Fourier status of the convolution (True in this DT)
+        - STL_2D_FFT_Torch instance with:
+            - array: torch.Tensor (..., J, L, N0)
+                Convolution in Fourier space between data and wavelet_set
+            - fourier_status: bool 
+                True
         """
-        if mask_MR is not None:
-            raise NotImplementedError("Mask is not yet allowed in this DT")
-        
-        # Pass data in Fourier if in real space
-        _data = data if fourier_status else torch.fft.fft2(data)
-        
-        # Compute the convolution
-        conv = _data[..., None, :, :] * wavelet_j
-        
-        # Fourier status related to the DT
-        fourier_status = True
-        
-        return conv, fourier_status
+        if mask is not None:
+            raise NotImplementedError("Mask is not yet allowed in STL_2D_FFT_Torch.")
+    
+        # Set data in Fourier space in place
+        data = data.set_fourier_status(target_fourier_status=True, inplace=True)
+        return STL_2D_FFT_Torch(array=data[..., None, None, :, :].array * wavelet_set, fourier_status=True)
+    
+    @staticmethod
+    def wavelet_conv(data, wavelet_j, mask=None):
+        """
+        Perform convolutions of data with a set of L wavelets fixed at a given scale and covering all orientations.
+        Both the data and the wavelet should be at the Nj resolution.
+        WARNING: Sets the data in Fourier space in place if data is in real space.
+        No mask is allowed in this DT.
+
+        Parameters
+        ----------
+        - data: STL_2D_FFT_Torch instance whose array attribute is a torch.Tensor of size (..., Nj)
+            Data to be filtered by the wavelt_set, at resolution Nj
+        - wavelet_j: torch.Tensor of size (L, Nj)
+            Wavelet set in Fourier space at scale j and L orientations
+        - mask: list of torch.Tensor of size (...,Nj) -> None expected
+            Masks for the convolution
+
+        Returns
+        -------
+        - STL_2D_FFT_Torch instance with:
+            - array: torch.Tensor (..., L, N0)
+                Convolution in Fourier space between data and wavelet_set at scale j
+            - fourier_status: bool 
+                True
+        """
+        if mask is not None:
+            raise NotImplementedError("Mask is not yet allowed in STL_2D_FFT_Torch.")
+    
+        # Set data in Fourier space in place
+        data = data.set_fourier_status(target_fourier_status=True, inplace=True)
+        return STL_2D_FFT_Torch(array=data[..., None, :, :].array * wavelet_j, fourier_status=True)
+    
         
     ###########################################################################
-    def apply(self, data, j=None, MR=None, mask_MR=None, O_Fourier=None):
+    def apply(self, data, j=None, MR=None, mask_MR=None, target_fourier_status=None):
                   
         '''
         Compute the Wavelet Transform (WT) of data.
@@ -791,7 +717,7 @@ class CrappyWavelateOperator2D_FFT_torch:
            
         Parameters
         ----------
-        - data : StlData, 
+        - data : STL_2D_FFT_Torch, 
             Input data of same DT/N0, can be batched on several dimension.
             -> MR=False dg=0 if fullJ 
             -> MR=True list_dg=range(dg_max+1) if fullJ_MR 
@@ -803,7 +729,7 @@ class CrappyWavelateOperator2D_FFT_torch:
         - mask_MR : StlData with MR=True or None
             Multi-resolution masks, requires list_dg = range(dg_max + 1)
             mask is not allowed in fullJ mode
-        - O_Fourier : bool or None
+        - target_fourier_status : bool or None
             Desired Fourier status of output. 
             If None, DT-dependent default is used.
             
@@ -876,9 +802,9 @@ class CrappyWavelateOperator2D_FFT_torch:
                     raise Exception("Data should be at dg=0 resolution") 
                 # Create a new output STL_2D_FFT_Torch instance 
                 # and compute the WT, all DT are not necessarily included here.
-                WT = STL_2D_FFT_Torch(*self.__class__.wavelet_conv_full(
-                    data.array, self.wavelet_array, data.fourier_status, 
-                    None if mask_MR is None else mask_MR.array[0]))
+                WT = self.__class__.wavelet_conv_full(data, 
+                                                      self.wavelet_array, 
+                                                      mask_MR=None if mask_MR is None else mask_MR.array[0])
             
             # fullJ_MR
             elif MR==True:
@@ -910,12 +836,77 @@ class CrappyWavelateOperator2D_FFT_torch:
                 raise Exception("Data should be at dg_j resolution") 
             # Create the autput stl_array instance for the Wavelet Transform
             # and compute the WT at a given j
-            WT = STL_2D_FFT_Torch(*self.__class__.wavelet_conv(
-                data.array, self.wavelet_j(j), data.fourier_status, 
-                None if mask_MR is None else mask_MR.array[j]))
+            WT = self.__class__.wavelet_conv(data, 
+                                             self.wavelet_j(j), 
+                                             mask=None if mask_MR is None else mask_MR.array[j])
        
         # Transform to correct Fourier status if necessary
-        if O_Fourier is not None:
-            WT.out_fourier(O_Fourier)
+        if target_fourier_status is not None:
+            WT.set_fourier_status(target_fourier_status)
 
         return WT
+
+    def downsample(self, data, dg_out, mask_MR=None, inplace=True, target_fourier_status=True):
+        """
+        Downsample the self.array to the dg_out resolution.
+        
+        Note: Masks are not supported in this data type.
+        
+        Parameters
+        ----------
+        dg_out : int
+            Desired downsampling factor of the data.
+        mask_MR : None
+            Placeholder for mask, not used in this function.
+        target_fourier_status : bool
+            Desired Fourier status of the output data.
+            As downsample is performed in Fourier space, default is True 
+            to avoid a final inverse Fourier step.
+        
+        Returns
+        -------
+        STL_2D_FFT_Torch instance
+            Downsampled data at the desired downgrading factor dg_out.    
+        """
+        if mask_MR is not None:
+            raise Exception("Masks are not supported in 2D_FFT_Torch downsample") 
+            
+        data = data if inplace else data.copy()
+
+        if dg_out == data.dg:
+            return data
+        
+        # Tuning parameter to keep the aspect ratio and a unified resolution
+        min_x, min_y = 8, 8
+        if data.N0[0] > data.N0[1]:
+            min_x = int(min_x * data.N0[0]/data.N0[1])
+        elif data.N0[1] > data.N0[0]:
+            min_y = int(min_y * data.N0[1]/data.N0[0])
+
+        # Identify the new dimensions
+        dx = int(max(min_x, data.N0[0] // 2**(dg_out + 1)))
+        dy = int(max(min_y, data.N0[1] // 2**(dg_out + 1)))
+        
+        # Check expected current dimensions
+        dx_cur = int(max(min_x, data.N0[0] // 2**(data.dg + 1)))
+        dy_cur = int(max(min_y, data.N0[1] // 2**(data.dg + 1)))
+        
+        # Perform downsampling if necessary
+        if dx != dx_cur or dy != dy_cur:
+
+            # set data to Fourier space
+            data = data.set_fourier_status(target_fourier_status=True, inplace=True)
+                        
+            # Downsampling in Fourier
+            data.array = torch.cat(
+                (torch.cat(
+                    (data.array[...,:dx, :dy], data.array[...,-dx:, :dy]), -2),
+                torch.cat(
+                    (data.array[...,:dx, -dy:], data.array[...,-dx:, -dy:]), -2)
+                ),-1) * np.sqrt(dx * dy / dx_cur / dy_cur)
+            
+            data.N0 = data.findN()
+
+        data.dg = dg_out
+        data = data.set_fourier_status(target_fourier_status=target_fourier_status, inplace=True)
+        return data

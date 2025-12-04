@@ -79,6 +79,31 @@ def from_numpy(x: np.ndarray, device=None, dtype=None):
     return t.to(_get_device(device))
 
 
+def to_torch_tensor(array):
+    """
+    Transform input array (NumPy or PyTorch) into a PyTorch tensor.
+
+    Parameters
+    ----------
+    array : np.ndarray or torch.Tensor
+        Input array to be converted.
+
+    Returns
+    -------
+    torch.Tensor
+        Converted PyTorch tensor.
+    """
+    # Choose device: use GPU if available, otherwise CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if isinstance(array, np.ndarray):
+        return torch.from_numpy(array).to(device)
+    elif isinstance(array, torch.Tensor):
+        return array.to(device)
+    else:
+        raise TypeError(f"Unsupported array type: {type(array)}")
+
+
 def zeros(shape, device=None, dtype=torch.float32):
     """
     Return a tensor of zeros on CPU or GPU depending on `device`.
