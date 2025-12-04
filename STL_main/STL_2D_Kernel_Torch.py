@@ -11,15 +11,17 @@ This class makes all computations in torch.
 
 Characteristics:
     - in pytorch
-    - assume real maps 
+    - assume real maps
     - N0 gives x and y sizes for array shaped (..., Nx, Ny).
     - masks are supported in convolutions
 """
 import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch_backend import to_torch_tensor
+
 
 def _conv2d_circular(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """
@@ -70,46 +72,47 @@ def _complex_conv2d_circular(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         return torch.complex(real_part, imag_part)
     return real_part
 
+
 ###############################################################################
 ###############################################################################
 class STL_2D_Kernel_Torch:
-    '''
+    """
     Class which contain the different types of data used in STL.
     Store important parameters, such as DT, N0, and the Fourier type.
     Also allow to convert from numpy to pytorch (or other type).
     Allow to transfer internally these parameters.
-    
+
     Has different standard functions as methods (
     modulus, mean, cov, downsample)
-    
-    The initial resolution N0 is fixed, but the maps can be downgraded. The 
-    downgrading factor is the power of 2 that is used. A map of initial 
+
+    The initial resolution N0 is fixed, but the maps can be downgraded. The
+    downgrading factor is the power of 2 that is used. A map of initial
     resolution N0=256 and with dg = 3 is thus at resolution 256/2^3 = 32.
     The downgraded resolutions are called N0, N1, N2, ...
-    
+
     Can store array at a given downgradind dg:
         - attribute MR is False
         - attribute N0 gives the initial resolution
         - attribute dg gives the downgrading level
         - attribute list_dg is None
-        - array is an array of size (..., N) with N = N0 // 2^dg 
+        - array is an array of size (..., N) with N = N0 // 2^dg
     Or at multi-resolution (MR):
         - attribute MR is True
         - attribute N0 gives the initial resolution
         - attribute dg is None
         - attribute list_dg is the list of downgrading
-        - array is a list of array of sizes (..., N1), (..., N2), etc., 
+        - array is a list of array of sizes (..., N1), (..., N2), etc.,
         with the same dimensions excepts N.
-     
+
     Method usages if MR=True.
         - mean, cov give a single vector or last dim len(list_N)
-        - downsample gives an output of size (..., len(list_N), Nout). Only 
+        - downsample gives an output of size (..., len(list_N), Nout). Only
           possible if all resolution are downsampled this way.
-          
-    The class initialization is the frontend one, which can work from DT and 
-    data only. It enforces MR=False and dg=0. Two backend init functions for 
+
+    The class initialization is the frontend one, which can work from DT and
+    data only. It enforces MR=False and dg=0. Two backend init functions for
     MR=False and MR=True also exist.
-    
+
     Attributes
     ----------
     - DT : str
@@ -119,65 +122,65 @@ class STL_2D_Kernel_Torch:
     - N0 : tuple of int
         Initial size of array (can be multiple dimensions)
     - dg : int
-        2^dg is the downgrading level w.r.t. N0. None if MR==False  
+        2^dg is the downgrading level w.r.t. N0. None if MR==False
     - list_dg : list of int
         list of dowgrading level w.r.t. N0, None if MR==False
     - array : array (..., N) if MR==False
           liste of (..., N1), (..., N2), etc. if MR==True
           array(s) to store
-         
-    '''
-    
+
+    """
+
     ###########################################################################
-    def __init__(self, array, smooth_kernel=None,dg=None,N0=None):
-        '''
-        Constructor, see details above. Frontend version, which assume the 
+    def __init__(self, array, smooth_kernel=None, dg=None, N0=None):
+        """
+        Constructor, see details above. Frontend version, which assume the
         array is at N0 resolution with dg=0, with MR=False.
-        
+
         More sophisticated Back-end constructors (_init_SR and _init_MR) exist.
-        
-        '''
-        
+
+        """
+
         # Check that MR==False array is given
         if isinstance(array, list):
             raise ValueError("Only single resolution array are accepted.")
-        
-        # Main 
-        self.DT = 'Planar2D_kernel_torch'
+
+        # Main
+        self.DT = "Planar2D_kernel_torch"
         self.MR = False
         if dg is None:
             self.dg = 0
             self.N0 = array.shape[-2:]
         else:
-            self.dg=dg
+            self.dg = dg
             if N0 is None:
                 raise ValueError("dg is given, N0 should not be None")
-            self.N0=N0
-        
-        
+            self.N0 = N0
+
         self.array = self.to_array(array)
-        
+
         self.list_dg = None
-        
+
         # Find N0 value
-        self.device=self.array.device
-        self.dtype=self.array.dtype
+        self.device = self.array.device
+        self.dtype = self.array.dtype
 
         if smooth_kernel is None:
-            smooth_kernel=self._smooth_kernel(3)
-        self.smooth_kernel=smooth_kernel
-        
-        
-    def _smooth_kernel(self,kernel_size: int):
+            smooth_kernel = self._smooth_kernel(3)
+        self.smooth_kernel = smooth_kernel
+
+    def _smooth_kernel(self, kernel_size: int):
         """Create a 2D Gaussian kernel."""
-        sigma=1
-        coords = torch.arange(kernel_size, device=self.device, dtype=self.dtype) - (kernel_size - 1) / 2.0
+        sigma = 1
+        coords = (
+            torch.arange(kernel_size, device=self.device, dtype=self.dtype)
+            - (kernel_size - 1) / 2.0
+        )
         yy, xx = torch.meshgrid(coords, coords, indexing="ij")
         kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
         kernel = kernel / kernel.sum()
         return kernel.view(1, kernel_size, kernel_size)
-        
-            
+
     ###########################################################################
     def to_array(self, array):
         """
@@ -194,7 +197,7 @@ class STL_2D_Kernel_Torch:
         torch.Tensor
             Converted PyTorch tensor.
         """
-        
+
         if array is None:
             return None
         elif isinstance(array, list):
@@ -202,19 +205,19 @@ class STL_2D_Kernel_Torch:
         else:
             # Choose device: use GPU if available, otherwise CPU
             return to_torch_tensor(array)
-            
+
     ###########################################################################
     def copy(self, empty=False):
         """
         Copy a STL_2D_Kernel_Torch instance.
         Array is put to None if empty==True.
-        
+
         Parameters
         ----------
         - empty : bool
             If True, set array to None.
-                    
-        Output 
+
+        Output
         ----------
         - STL_2D_Kernel_Torch
            copy of self
@@ -230,27 +233,32 @@ class STL_2D_Kernel_Torch:
         new.dtype = self.dtype
 
         # Copy kernels
-        new.smooth_kernel = (self.smooth_kernel.clone()
-                             if isinstance(self.smooth_kernel, torch.Tensor)
-                             else None)
+        new.smooth_kernel = (
+            self.smooth_kernel.clone()
+            if isinstance(self.smooth_kernel, torch.Tensor)
+            else None
+        )
 
         # Copy array
         if empty:
             new.array = None
         else:
             if self.MR:
-                new.array = [a.clone() if isinstance(a, torch.Tensor) else None
-                             for a in self.array]
+                new.array = [
+                    a.clone() if isinstance(a, torch.Tensor) else None
+                    for a in self.array
+                ]
             else:
-                new.array = (self.array.clone()
-                             if isinstance(self.array, torch.Tensor) else None)
+                new.array = (
+                    self.array.clone() if isinstance(self.array, torch.Tensor) else None
+                )
 
         return new
 
     ###########################################################################
     def __getitem__(self, key):
         """
-        To slice directly the array attribute. Produce a view of array, to 
+        To slice directly the array attribute. Produce a view of array, to
         match with usual practices, allowing to conveniently pass only part
         of an instance.
         """
@@ -274,7 +282,7 @@ class STL_2D_Kernel_Torch:
             new.array = self.array[key]
 
         return new
-    
+
     ###########################################################################
     def _get_mask_at_dg(self, mask_MR, dg):
         """Helper to pick the mask at a given dg from a MR mask object."""
@@ -289,7 +297,7 @@ class STL_2D_Kernel_Torch:
         except ValueError:
             raise ValueError(f"Mask does not contain dg={dg}.")
         return mask_MR.array[idx]
-    
+
     ###########################################################################
     def smooth(self, inplace=False):
         """Apply isotropic smoothing mirroring FoCUS.smooth 2D pathway."""
@@ -310,7 +318,7 @@ class STL_2D_Kernel_Torch:
 
         target.dtype = target.array.dtype
         return target
-    
+
     ###########################################################################
     def modulus(self, inplace=False):
         """
@@ -322,14 +330,14 @@ class STL_2D_Kernel_Torch:
             data.array = [torch.abs(a) for a in data.array]
         else:
             data.array = torch.abs(data.array)
-            
-        data.dtype=data.array.dtype
+
+        data.dtype = data.array.dtype
 
         return data
-        
+
     ###########################################################################
     def mean(self, square=False, mask_MR=None):
-        '''
+        """
         Compute the mean on the last two dimensions (Nx, Ny).
 
         If MR=True, the mean is computed for each resolution and stacked in
@@ -338,7 +346,7 @@ class STL_2D_Kernel_Torch:
         If a multi-resolution mask is given, it is assumed to have unit mean
         at each resolution (as enforced by downsample_toMR_Mask), so the mean
         is computed as mean(x * mask).
-        '''
+        """
         if self.MR:
             means = []
             for arr, dg in zip(self.array, self.list_dg):
@@ -363,7 +371,7 @@ class STL_2D_Kernel_Torch:
                 mean = arr_use.nanmean(dim=dims)
 
         return mean
-        
+
     ###########################################################################
     def cov(self, data2=None, mask_MR=None, remove_mean=False):
         """
@@ -410,34 +418,36 @@ class STL_2D_Kernel_Torch:
                 x_c = x
                 y_c = y
             cov = (x_c * y_c.conj()).nanmean(dim=dims)
-            
-        return cov        
-       
+
+        return cov
+
     def get_wavelet_op(self, J=None, L=None, kernel_size=None):
         if L is None:
             L = 4
         if kernel_size is None:
             kernel_size = 5
         if J is None:
-            J = np.min([int(np.log2(self.N0[0])),int(np.log2(self.N0[1]))])-2
-        
-        return WavelateOperator2Dkernel_torch(kernel_size,L,J,
-                                              device=self.array.device,dtype=self.array.dtype)
-       
+            J = np.min([int(np.log2(self.N0[0])), int(np.log2(self.N0[1]))]) - 2
+
+        return WavelateOperator2Dkernel_torch(
+            kernel_size, L, J, device=self.array.device, dtype=self.array.dtype
+        )
+
 
 class WavelateOperator2Dkernel_torch:
-    def __init__(self, kernel_size: int, L: int, J: int,
-                 device='cuda', dtype=torch.float):
+    def __init__(
+        self, kernel_size: int, L: int, J: int, device="cuda", dtype=torch.float
+    ):
         self.KERNELSZ = kernel_size
         self.L = L
         self.J = J
         self.device = torch.device(device)
         self.dtype = dtype
-        
-        self.kernel = self._wavelet_kernel(kernel_size,L)
-        self.WType='simple'
-        
-    def _wavelet_kernel(self,kernel_size: int,n_orientation: int,sigma=1):
+
+        self.kernel = self._wavelet_kernel(kernel_size, L)
+        self.WType = "simple"
+
+    def _wavelet_kernel(self, kernel_size: int, n_orientation: int, sigma=1):
         """Create a 2D Wavelet kernel."""
         # coords = torch.arange(kernel_size, device=self.device, dtype=self.dtype) - (kernel_size - 1) / 2.0
         # yy, xx = torch.meshgrid(coords, coords, indexing="ij")
@@ -448,36 +458,48 @@ class WavelateOperator2Dkernel_torch:
         # kernel = kernel - torch.mean(kernel,dim=(1,2))[:,None,None]
         # kernel = kernel / torch.sqrt(torch.sum(kernel**2, dim=(1,2)))[:,None,None]
         # return kernel.reshape(1,n_orientation,kernel_size,kernel_size)
-        
-        ###Morlay wavelet
-        coords = torch.arange(kernel_size, device=self.device, dtype=self.dtype) - (kernel_size - 1) / 2.0
+
+        # Morlay wavelet
+        coords = (
+            torch.arange(kernel_size, device=self.device, dtype=self.dtype)
+            - (kernel_size - 1) / 2.0
+        )
         yy, xx = torch.meshgrid(coords, coords, indexing="ij")
-        
+
         # Gaussian envelope
         gaussian_envelope = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
-        
+
         # Orientations
-        angles = torch.arange(n_orientation, device=self.device, dtype=self.dtype) / n_orientation * torch.pi
-        
+        angles = (
+            torch.arange(n_orientation, device=self.device, dtype=self.dtype)
+            / n_orientation
+            * torch.pi
+        )
+
         # Morlet wavelet: exp(i*k0*x_rot) * gaussian_envelope
         # x_rot is the coordinate along the orientation direction
-        x_rot = xx[None, :, :] * torch.cos(angles[:, None, None]) + yy[None, :, :] * torch.sin(angles[:, None, None])
-        
+        x_rot = xx[None, :, :] * torch.cos(angles[:, None, None]) + yy[
+            None, :, :
+        ] * torch.sin(angles[:, None, None])
+
         # Complex Morlet wavelet
-        kernel = torch.exp(1j * 0.75 * np.pi * x_rot ) * gaussian_envelope[None, :, :]
-        
+        kernel = torch.exp(1j * 0.75 * np.pi * x_rot) * gaussian_envelope[None, :, :]
+
         # Remove DC component (admissibility condition)
         kernel = kernel - torch.mean(kernel, dim=(1, 2))[:, None, None]
-        
+
         # L2 normalization
-        kernel = kernel / torch.sqrt(torch.sum(torch.abs(kernel)**2, dim=(1, 2)))[:, None, None]
-        
+        kernel = (
+            kernel
+            / torch.sqrt(torch.sum(torch.abs(kernel) ** 2, dim=(1, 2)))[:, None, None]
+        )
+
         return kernel.reshape(1, n_orientation, kernel_size, kernel_size)
-            
+
     def get_L(self):
         return self.L
-        
-    def apply(self, data,j):
+
+    def apply(self, data, j):
         """
         Apply the convolution kernel to data.array [..., Nx, Ny]
         and return cdata [..., L, Nx, Ny].
@@ -493,9 +515,9 @@ class WavelateOperator2Dkernel_torch:
         torch.Tensor
             Convolved data with shape [..., L, Nx, Ny].
         """
-        if j!=data.dg :
-            raise 'j is not equal to dg, convolution not possible'
-            
+        if j != data.dg:
+            raise "j is not equal to dg, convolution not possible"
+
         x = data.array  # [..., Nx, Ny]
 
         # Ensure x is a torch tensor on the same device / dtype as the kernel
@@ -505,8 +527,10 @@ class WavelateOperator2Dkernel_torch:
 
         convolved = _complex_conv2d_circular(x, weight)
 
-        return STL_2D_Kernel_Torch(convolved,smooth_kernel=data.smooth_kernel,dg=data.dg,N0=data.N0)
-        
+        return STL_2D_Kernel_Torch(
+            convolved, smooth_kernel=data.smooth_kernel, dg=data.dg, N0=data.N0
+        )
+
     def apply_smooth(self, data: STL_2D_Kernel_Torch, inplace: bool = False):
         """
         Smooth the data by convolving with a smooth kernel derived from the
@@ -531,7 +555,6 @@ class WavelateOperator2Dkernel_torch:
         out.array = y
         return out
 
-        
     @staticmethod
     def _downsample_tensor(x: torch.Tensor, dg_inc: int) -> torch.Tensor:
         """
@@ -545,7 +568,7 @@ class WavelateOperator2Dkernel_torch:
         if dg_inc == 0:
             return x
 
-        scale = 2 ** dg_inc
+        scale = 2**dg_inc
         H, W = x.shape[-2:]
         if H % scale != 0 or W % scale != 0:
             raise ValueError(
@@ -559,9 +582,9 @@ class WavelateOperator2Dkernel_torch:
             kernel_size = int(6 * sigma + 1)
             if kernel_size % 2 == 0:
                 kernel_size += 1
-            
+
             x_coord = torch.arange(kernel_size, dtype=dtype) - kernel_size // 2
-            gauss_1d = torch.exp(-x_coord**2 / (2 * sigma**2))
+            gauss_1d = torch.exp(-(x_coord**2) / (2 * sigma**2))
             gauss_1d = gauss_1d / gauss_1d.sum()
             gauss_2d = gauss_1d.unsqueeze(0) * gauss_1d.unsqueeze(1)
             return gauss_2d.unsqueeze(0).unsqueeze(0), kernel_size
@@ -573,21 +596,22 @@ class WavelateOperator2Dkernel_torch:
         for _ in range(dg_inc):
             h, w = y.shape[-2:]
             if h % 2 != 0 or w % 2 != 0:
-                raise ValueError("Downsampling requires even spatial dimensions at each step.")
+                raise ValueError(
+                    "Downsampling requires even spatial dimensions at each step."
+                )
             sigma = 1.0
             kernel, kernel_size = get_gaussian_kernel(sigma, dtype=y.dtype)
             kernel = kernel.to(y.device)
             # Add circular padding for periodic boundaries
             pad = kernel_size // 2
-            y_padded = F.pad(y, (pad, pad, pad, pad), mode='circular')
+            y_padded = F.pad(y, (pad, pad, pad, pad), mode="circular")
             y = F.conv2d(y_padded, kernel)
             # Now downsample with 2x2 mean pooling
             y = F.avg_pool2d(y, kernel_size=2, stride=2)
 
         H2, W2 = y.shape[-2:]
         return y.reshape(*leading_dims, H2, W2)
-  
-  
+
     ###########################################################################
     def downsample(self, data, dg_out, mask_MR=None, inplace=True):
         """
@@ -619,7 +643,7 @@ class WavelateOperator2Dkernel_torch:
                 raise ValueError("Mask and data have incompatible spatial shapes.")
             data.array = data.array * mask
         return data
-        
+
     def _gaussian_kernel_5x5(self, device, dtype, sigma: float = 1.0):
         """
         Build and cache a normalized 5x5 Gaussian kernel on (device, dtype)
@@ -630,9 +654,11 @@ class WavelateOperator2Dkernel_torch:
         kernel : torch.Tensor
             Shape (1, 5, 5): [O_c, wx, wy]
         """
-        if (not hasattr(self, "_smooth_kernel_5x5")
+        if (
+            not hasattr(self, "_smooth_kernel_5x5")
             or self._smooth_kernel_5x5.device != device
-            or self._smooth_kernel_5x5.dtype  != dtype):
+            or self._smooth_kernel_5x5.dtype != dtype
+        ):
             size = 5
             coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2.0
             yy, xx = torch.meshgrid(coords, coords, indexing="ij")
@@ -655,7 +681,7 @@ class WavelateOperator2Dkernel_torch:
 
         device = x.device
         dtype = x.dtype
-        factor = 2 ** dg_inc
+        factor = 2**dg_inc
 
         # ---- reshape to (B, H, W) for _conv2d_circular ----
         *leading, H, W = x.shape
@@ -666,8 +692,8 @@ class WavelateOperator2Dkernel_torch:
         x_flat = x.reshape(B, H, W)  # (B, H, W)
 
         # ---- Gaussian smoothing with NaN handling (circular) ----
-        mask_valid = ~torch.isnan(x_flat)          # (B, H, W) bool
-        mask_f = mask_valid.to(dtype)             # float
+        mask_valid = ~torch.isnan(x_flat)  # (B, H, W) bool
+        mask_f = mask_valid.to(dtype)  # float
 
         # replace NaN with 0 so they don't contribute
         x_filled = torch.where(mask_valid, x_flat, torch.zeros_like(x_flat))
@@ -677,20 +703,22 @@ class WavelateOperator2Dkernel_torch:
         kernel = self._gaussian_kernel_5x5(device=device, dtype=dtype, sigma=sigma)
 
         # Convolution on data and on mask (circular)
-        num = _conv2d_circular(x_filled, kernel)   # (B, 1, H, W)
-        w_sum = _conv2d_circular(mask_f,   kernel) # (B, 1, H, W)
+        num = _conv2d_circular(x_filled, kernel)  # (B, 1, H, W)
+        w_sum = _conv2d_circular(mask_f, kernel)  # (B, 1, H, W)
 
         eps = 1e-8
-        x_smooth = num / (w_sum + eps)            # (B, 1, H, W)
-        x_smooth = x_smooth.squeeze(1)            # (B, H, W)
+        x_smooth = num / (w_sum + eps)  # (B, 1, H, W)
+        x_smooth = x_smooth.squeeze(1)  # (B, H, W)
 
         # Put NaN where no valid pixel at all in the 5x5 window
         no_valid = w_sum.squeeze(1) <= 0
-        x_smooth = torch.where(no_valid, torch.full_like(x_smooth, float("nan")), x_smooth)
+        x_smooth = torch.where(
+            no_valid, torch.full_like(x_smooth, float("nan")), x_smooth
+        )
 
         # ---- Downsample with nan-aware mean via avg_pool2d ----
         # Treat (B,1,H,W) again
-        x_smooth_4d = x_smooth.unsqueeze(1)       # (B,1,H,W)
+        x_smooth_4d = x_smooth.unsqueeze(1)  # (B,1,H,W)
         mask_valid2 = ~torch.isnan(x_smooth_4d)
         mask2_f = mask_valid2.to(dtype)
 
@@ -698,10 +726,14 @@ class WavelateOperator2Dkernel_torch:
         x2_filled = torch.where(mask_valid2, x_smooth_4d, torch.zeros_like(x_smooth_4d))
 
         # average pooling of data and mask (non-overlapping blocks)
-        pool_num = F.avg_pool2d(x2_filled, kernel_size=factor, stride=factor)   # (B,1,H',W')
-        pool_mask = F.avg_pool2d(mask2_f,  kernel_size=factor, stride=factor)   # (B,1,H',W')
+        pool_num = F.avg_pool2d(
+            x2_filled, kernel_size=factor, stride=factor
+        )  # (B,1,H',W')
+        pool_mask = F.avg_pool2d(
+            mask2_f, kernel_size=factor, stride=factor
+        )  # (B,1,H',W')
 
-        y = pool_num / (pool_mask + eps)          # nan-aware mean
+        y = pool_num / (pool_mask + eps)  # nan-aware mean
         no_valid_block = pool_mask <= 0
         y = torch.where(no_valid_block, torch.full_like(y, float("nan")), y)
 
@@ -709,7 +741,7 @@ class WavelateOperator2Dkernel_torch:
         H_out, W_out = y.shape[-2:]
         y = y.view(*leading, H_out, W_out)
         return y
-        
+
     ###########################################################################
     def nandownsample(self, data, dg_out, mask_MR=None, inplace=True):
         """
@@ -742,6 +774,3 @@ class WavelateOperator2Dkernel_torch:
             data.array = data.array * mask
 
         return data
-
-
-

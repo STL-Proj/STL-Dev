@@ -1,7 +1,8 @@
+import numpy as np
 import torch
 from torch import nn
 from torch.optim import LBFGS
-import numpy as np
+
 # Suppose:
 # - STLDataClass is your data wrapper class (e.g. STL2DKernel)
 # - st_op is an operator such that st_op.apply(DC).to_flatten()
@@ -23,12 +24,13 @@ class ScatteringMatchModel(nn.Module):
 
         # Learnable field u
         self.u = STLDataClass(torch.randn(init_shape, device=device, dtype=dtype))
-        self.u = nn.Parameter(st_op.wavelet_op.apply_smooth(self.u,inplace=False).array)
-        
+        self.u = nn.Parameter(
+            st_op.wavelet_op.apply_smooth(self.u, inplace=False).array
+        )
 
     def forward(self):
         DC_u = self.STLDataClass(self.u)
-        st_u = self.st_op.apply(DC_u,norm='load_ref')
+        st_u = self.st_op.apply(DC_u, norm="load_ref")
         s_flat_u = st_u.to_flatten(mean_along_batch=True)
         return s_flat_u
 
@@ -45,24 +47,24 @@ def optimize_scattering_LBFGS(
     verbose=True,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_NaN = np.sum(np.isnan(target))>0
+    use_NaN = np.sum(np.isnan(target)) > 0
     if use_NaN:
-        print('NaN detected in the target, the synthesis takes it into account')
-        
+        print("NaN detected in the target, the synthesis takes it into account")
+
     target = torch.as_tensor(target, device=device, dtype=torch.float32)
 
     # Reference scattering
     DC_target = STLDataClass(target)
     st_op = SO_class(DC_target)
     with torch.no_grad():
-        r = st_op.apply(DC_target,norm='store_ref',use_NaN=use_NaN).to_flatten()
+        r = st_op.apply(DC_target, norm="store_ref", use_NaN=use_NaN).to_flatten()
     r = r.detach()
-    
+
     # Model with learnable u
     model = ScatteringMatchModel(
         st_op=st_op,
         STLDataClass=STLDataClass,
-        init_shape=(nbatch,1,*target.shape),
+        init_shape=(nbatch, 1, *target.shape),
         device=device,
         dtype=target.dtype,
     )
@@ -70,11 +72,11 @@ def optimize_scattering_LBFGS(
     optimizer = LBFGS(
         [model.u],
         lr=lr,
-        max_iter=max_iter,        # <-- le nombre d'itérations internes LBFGS
+        max_iter=max_iter,  # <-- le nombre d'itérations internes LBFGS
         history_size=history_size,
         line_search_fn="strong_wolfe",
-        tolerance_grad=1e-12, 
-        tolerance_change=1e-15
+        tolerance_grad=1e-12,
+        tolerance_change=1e-15,
     )
 
     loss_history = []
@@ -89,7 +91,7 @@ def optimize_scattering_LBFGS(
         loss_val = loss.item()
         loss_history.append(loss_val)
         if verbose:
-            if len(loss_history)%print_iter==0:
+            if len(loss_history) % print_iter == 0:
                 print(f"[LBFGS] inner iter {len(loss_history)}, loss = {loss_val:.6e}")
 
         return loss
@@ -98,11 +100,10 @@ def optimize_scattering_LBFGS(
     optimizer.step(closure)
 
     u_opt = model.u.detach()
-    
-    if nbatch==1:
-        u_opt=u_opt[0,0]
-    else:
-        u_opt=u_opt[:,0]
-        
-    return u_opt, loss_history
 
+    if nbatch == 1:
+        u_opt = u_opt[0, 0]
+    else:
+        u_opt = u_opt[:, 0]
+
+    return u_opt, loss_history
