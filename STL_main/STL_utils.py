@@ -60,18 +60,27 @@ class Gaussianise:
         Φ^{-1}(u) = sqrt(2) * erfinv(2u - 1)
         """
         u = u.clamp(self.eps, 1.0 - self.eps)
-        return torch.sqrt(torch.tensor(2.0, device=u.device, dtype=u.dtype)) * torch.erfinv(2.0 * u - 1.0)
+        return torch.sqrt(
+            torch.tensor(2.0, device=u.device, dtype=u.dtype)
+        ) * torch.erfinv(2.0 * u - 1.0)
 
     def _phi(self, z: torch.Tensor) -> torch.Tensor:
         """
         CDF of standard normal using erf.
         Φ(z) = 0.5 * [1 + erf(z / sqrt(2))]
         """
-        return 0.5 * (1.0 + torch.erf(z / torch.sqrt(torch.tensor(2.0, device=z.device, dtype=z.dtype))))
+        return 0.5 * (
+            1.0
+            + torch.erf(
+                z / torch.sqrt(torch.tensor(2.0, device=z.device, dtype=z.dtype))
+            )
+        )
 
     # ----- helper: 1D monotone interpolation -----
 
-    def _interp_1d(self, xq: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def _interp_1d(
+        self, xq: torch.Tensor, x: torch.Tensor, y: torch.Tensor
+    ) -> torch.Tensor:
         """
         1D linear interpolation: given sorted x, corresponding y, and query xq,
         approximate yq = f(xq).
@@ -100,7 +109,7 @@ class Gaussianise:
         y_hi = y[idx_hi]
 
         # Avoid division by zero when x_hi == x_lo (duplicate x)
-        denom = (x_hi - x_lo)
+        denom = x_hi - x_lo
         denom = torch.where(denom.abs() < 1e-12, torch.ones_like(denom), denom)
 
         t = (xq_flat - x_lo) / denom

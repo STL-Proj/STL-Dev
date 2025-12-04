@@ -59,6 +59,7 @@ def _get_device(device=None) -> torch.device:
 # Core API
 # ---------------------------------------------------------------------
 
+
 def from_numpy(x: np.ndarray, device=None, dtype=None):
     """
     Convert a NumPy array to a torch.Tensor on the requested device.
