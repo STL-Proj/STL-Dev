@@ -3,13 +3,13 @@ repos:
   # Code formatters
   # ------------------------
   - repo: https://github.com/psf/black
-    rev: 23.9.1
+    rev: 24.3.0
     hooks:
       - id: black
         language_version: python3
 
-  - repo: https://github.com/PyCQA/isort
-    rev: 6.0.0
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
     hooks:
       - id: isort
         language_version: python3
@@ -18,7 +18,7 @@ repos:
   # Linter / style
   # ------------------------
   - repo: https://github.com/pycqa/flake8
-    rev: 6.1.0
+    rev: 7.0.0
     hooks:
       - id: flake8
         additional_dependencies: [flake8-docstrings, pydocstyle]
@@ -28,8 +28,13 @@ repos:
   # ------------------------
   # checking docstrings
   # ------------------------
-  - repo: https://github.com/antonio-murphy/pre-commit-docstrings
-    rev: v1.0.3
+  - repo: https://github.com/pycqa/pydocstyle
+    rev: 6.3.0
     hooks:
-      - id: check-docstrings
+      - id: pydocstyle
+        args:
+          [
+            "--convention=numpy",
+            "--add-ignore=D100,D104",
+          ]
         files: "STL_main/.*\\.py$"
