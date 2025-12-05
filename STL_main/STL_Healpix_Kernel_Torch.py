@@ -17,7 +17,8 @@ Assumptions
 import numpy as np
 import torch
 import torch.nn.functional as F
-from SphericalStencil import SphericalStencil  # adapt if needed
+
+from STL_main.SphericalStencil import SphericalStencil  # adapt if needed
 
 
 ###############################################################################
