@@ -4,7 +4,8 @@ Created on Wed Nov 14:07 2018
 
 import numpy as np
 import torch
-from torch_backend import to_torch_tensor
+
+from STL_main.torch_backend import to_torch_tensor
 
 
 class STL_2D_FFT_Torch:

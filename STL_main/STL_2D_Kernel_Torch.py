@@ -20,7 +20,8 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch_backend import to_torch_tensor
+
+from STL_main.torch_backend import to_torch_tensor
 
 
 def _conv2d_circular(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
