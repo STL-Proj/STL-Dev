@@ -7,7 +7,8 @@ Tentative proposal by EA
 
 import numpy as np
 import torch as bk  # from_numpy, zeros, dim, shape, nan
-from ST_Statistics import ST_Statistics
+
+from STL_main.ST_Statistics import ST_Statistics
 
 ###############################################################################
 ###############################################################################
