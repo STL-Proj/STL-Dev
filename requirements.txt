@@ -2,3 +2,5 @@ sphinx
 sphinx-rtd-theme
 sphinx-autodoc-typehints
 pytest
+numpy
+torch
