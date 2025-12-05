@@ -629,8 +629,8 @@ class CrappyWavelateOperator2D_FFT_torch:
             Data to be filtered by the wavelt_set
         - wavelet_set: torch.Tensor of size (J, L, N0)
             Wavelet set in Fourier space at all J scales and L orientations
-        - mask : torch.Tensor of size (...,N0) -> None expected
-            Multi-resolution masks for the convolution
+        - mask: torch.Tensor of size (...,N0) -> None expected
+            Masks for the convolution
 
         Returns
         -------
@@ -806,7 +806,7 @@ class CrappyWavelateOperator2D_FFT_torch:
                 WT = self.__class__.wavelet_conv_full(
                     data,
                     self.wavelet_array,
-                    mask_MR=None if mask_MR is None else mask_MR.array[0],
+                    mask=None if mask_MR is None else mask_MR.array[0],
                 )
 
             # fullJ_MR
