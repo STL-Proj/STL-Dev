@@ -52,8 +52,6 @@ class ST_Statistics:
         maximum scale difference for ST statistics computation
     - pbc : bool
         periodic boundary conditions
-    - mask_MR : StlData with MR=True or None
-        Multi-resolution masks, requires list_dg = range(dg_max + 1)
 
     # Data array parameters
     - Nb : int
@@ -63,7 +61,7 @@ class ST_Statistics:
 
     Attributes
     ----------
-    - parent parameters (DT,N0,J,L,WType,SC,jmin,jmax,dj,pbc,mask_MR,Nb,Nc)
+    - parent parameters (DT,N0,J,L,WType,SC,jmin,jmax,dj,pbc,Nb,Nc)
 
     # Additional transform/compression
     - norm : str
@@ -88,7 +86,7 @@ class ST_Statistics:
 
     ########################################
     def __init__(
-        self, DT, N0, J, L, WType, SC, jmin, jmax, dj, pbc, mask_MR, Nb, Nc, wavelet_op
+        self, DT, N0, J, L, WType, SC, jmin, jmax, dj, pbc, Nb, Nc, wavelet_op
     ):
         """
         Constructor, see details above.

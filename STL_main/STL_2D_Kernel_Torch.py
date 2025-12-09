@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from STL_main.torch_backend import to_torch_tensor
+from STL_main.torch_backend import nanmean, to_torch_tensor
 
 
 ###############################################################################
@@ -181,10 +181,7 @@ class STL_2D_Kernel_Torch:
         """
         data = self.copy(empty=False) if not inplace else self
 
-        if data.MR:
-            data.array = [torch.abs(a) for a in data.array]
-        else:
-            data.array = torch.abs(data.array)
+        data.array = torch.abs(data.array)
 
         data.dtype = data.array.dtype
 
@@ -196,9 +193,8 @@ class STL_2D_Kernel_Torch:
         Compute the mean on the last two dimensions (Nx, Ny).
         """
         arr_use = torch.abs(self.array) ** 2 if square else self.array
-        mean = arr_use.nanmean(dim=(-2, -1))
 
-        return mean
+        return nanmean(arr_use, dim=(-2, -1))
 
     ###########################################################################
     def cov(self, data2=None, remove_mean=False):
@@ -222,7 +218,7 @@ class STL_2D_Kernel_Torch:
         else:
             x_c = x
             y_c = y
-        cov = (x_c * y_c.conj()).nanmean(dim=dims)
+        cov = nanmean(x_c * y_c.conj(), dim=(-2, -1))
 
         return cov
 
@@ -299,7 +295,8 @@ class WavelateOperator2Dkernel_torch:
 
         if torch.is_complex(x) or torch.is_complex(w):
             return torch.complex(real_part, imag_part)
-        return real_part
+        else:
+            return real_part
 
     def __init__(
         self,
@@ -347,7 +344,7 @@ class WavelateOperator2Dkernel_torch:
             assert smooth_kernel.sum().item() == 1.0
 
             # no need for reweighting at resolution dg=0.
-            for dg in range(1, self.J):
+            for dg in range(1, self.J + 1):
                 parent = local_nan_weight_maps[dg - 1] if dg > 1 else self.mask_full_res
                 local_nan_weight_maps[dg] = STL_2D_Kernel_Torch(
                     array=self._downsample_tensor(
@@ -431,7 +428,7 @@ class WavelateOperator2Dkernel_torch:
             Convolved data with shape [..., L, Nx, Ny].
         """
         if j != data.dg:
-            raise "j is not equal to dg, convolution not possible"
+            raise ValueError("j is not equal to dg, convolution not possible")
 
         x = data.array  # [..., Nx, Ny]
 
