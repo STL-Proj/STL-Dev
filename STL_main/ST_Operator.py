@@ -65,8 +65,6 @@ class ST_Operator:
         maximum scale difference for ST statistics computation
     - pbc : bool
         periodic boundary conditions
-    - mask_MR : StlData with MR=True or None
-        Multi-resolution masks, requires list_dg = range(dg_max + 1)
 
     # Additional transform/compression
     - norm : str
@@ -118,14 +116,9 @@ class ST_Operator:
         Single_Kernel=None,
         mask_st=None,
         mask_opt=False,
-        mask_MR=None,
     ):
         """
         Constructor, see details above.
-
-        The mask parameter either expect:
-            - a MR=False mask at dg=0, then converted to the mask_MR format.
-            - a MR=True mask_MR with list_dg = range(dg_max + 1)
         """
         # Main parameters
         self.DT = data.DT
@@ -155,29 +148,6 @@ class ST_Operator:
         self.scale_ft = scale_ft
         self.flatten = flatten
         self.mask_st = mask_st
-        self.mask_MR = mask_MR
-
-        # Check mask coherence and construct MR mask if necessary
-        self.mask_MR = None
-        if mask is not None:
-            if not self.wavelet_op.mask_opt:
-                raise Exception(
-                    "Wavelet transform with masks not supported for this DT"
-                )
-            if not isinstance(mask, StlData):
-                raise Exception("Mask should be a StlData instance")
-            if self.DT != mask.DT:
-                raise Exception("Mask and wavelet transform should have same DT")
-            if self.N0 != mask.N0:
-                raise Exception("Mask and wavelet transform should have same N0")
-            if mask.Fourier:
-                raise Exception("Mask should be in real space")
-            if not mask.MR:
-                self.mask_MR = mask.downsample_toMR_Mask(self.wavelet_op.dg_max)
-            else:
-                if mask.list_dg != list(range(self.wavelet_op.dg_max + 1)):
-                    raise Exception("Mask should be between MR between dg=0 and dg_max")
-                self.mask_MR = mask
 
     ########################################
     @classmethod
@@ -214,7 +184,6 @@ class ST_Operator:
             jmax=st_stat.jmax,
             dj=st_stat.dj,
             pbc=st_stat.pbc,
-            mask_MR=st_stat.mask_MR,
             norm=st_stat.norm,
             S2_ref=st_stat.S2_ref,
             iso=st_stat.iso,
@@ -233,7 +202,6 @@ class ST_Operator:
         jmax=None,
         dj=None,
         pbc=None,
-        mask_MR=None,
         pass_mask=False,
         norm=None,
         S2_ref=None,
@@ -242,7 +210,6 @@ class ST_Operator:
         scale_ft=None,
         flatten=None,
         mask_st=None,
-        use_NaN=False,
     ):
         """
         Compute the Scattering Transform (ST) of data, which are either stored
@@ -279,8 +246,6 @@ class ST_Operator:
             maximum scale difference for ST statistics computation
         - pbc : bool
             periodic boundary conditions
-        - mask_MR : StlData with MR=True or None
-            Multi-resolution masks, requires list_dg = range(dg_max + 1)
         - pass_mask : bool
             Pass mask to ST statistics object if True
 
@@ -328,7 +293,6 @@ class ST_Operator:
         jmax = self.jmax if jmax is None else jmax
         dj = self.dj if dj is None else dj
         pbc = self.pbc if pbc is None else pbc
-        mask_MR = self.mask_MR if mask_MR is None else mask_MR
 
         # Local value for the additional transforms parameters
         norm = self.norm if norm is None else norm
@@ -363,7 +327,6 @@ class ST_Operator:
             jmax,
             dj,
             pbc,
-            mask_MR if pass_mask else None,
             Nb,
             Nc,
             self.wavelet_op,
@@ -371,9 +334,7 @@ class ST_Operator:
 
         # Define the mask for conv computation if necessary
         if not pbc:
-            mask_bc = self.construct_mask_bc(mask_MR)
-        else:
-            mask_bc = mask_MR
+            raise
 
         # Initialize ST statistics values
         # Add readability w.r.t. having it in the ST statistics initilization
@@ -406,7 +367,6 @@ class ST_Operator:
         for j3 in range(J):
             # Compute first convolution and modulus
             data_l1 = self.wavelet_op.apply(l_data, j=j3)  # (Nb,Nc,L,N3)
-
             data_l1m[j3] = data_l1.modulus(inplace=False)  # (Nb,Nc,L,N3)
             # Compute S1 and S2
 
@@ -417,7 +377,7 @@ class ST_Operator:
             for j2 in range(j3 + 1):
                 data_l1m_l2 = self.wavelet_op.apply(
                     data_l1m[j2], j=j3
-                )  # (Nb,Nc,L2,L3,N3)
+                )  # (Nb,Nc,L2,L3,N3) #################################### can be fully filled with nans
                 # S3(j2,j3) = Cov(|I*psi2|*psi3, I*psi3)
                 data_st.S3[:, :, j2, j3, :, :] = data_l1m_l2.cov(
                     data_l1[:, :, None]
@@ -433,19 +393,13 @@ class ST_Operator:
 
             if data_st.DT != "2D_FFT_Torch":
                 # Downsample at Nj3
-                if use_NaN:
-                    self.wavelet_op.nandownsample(l_data, j3 + 1)  # (Nb,Nc,j3+1,L,N3)
-                else:
-                    self.wavelet_op.downsample(l_data, j3 + 1)  # (Nb,Nc,j3+1,L,N3)
+                self.wavelet_op.downsample(
+                    data=l_data, dg_out=j3 + 1, inplace=True
+                )  # (Nb,Nc,j3+1,L,N3)
                 for j2 in range(j3 + 1):
-                    if use_NaN:
-                        self.wavelet_op.nandownsample(
-                            data_l1m[j2], j3 + 1
-                        )  # (Nb,Nc,j3+1,L,N3)
-                    else:
-                        self.wavelet_op.downsample(
-                            data_l1m[j2], j3 + 1
-                        )  # (Nb,Nc,j3+1,L,N3)
+                    self.wavelet_op.downsample(
+                        data=data_l1m[j2], dg_out=j3 + 1, inplace=True
+                    )  # (Nb,Nc,j3+1,L,N3)
 
         ########################################
         # Additional transform/compression
@@ -476,25 +430,6 @@ class ST_Operator:
             data_st.flatten(mask_st)
 
         return data_st
-
-    ########################################
-    def construct_mask_bc(self, mask_MR):
-        """
-        Construct the MR mask used when computing mean and covariances.
-        It takes into acount the initial mask_MR if not None.
-        Else, it just return a mask to deal with the non-periodic boundary
-        conditions.
-
-        To be written.
-
-        Returns
-        -------
-        mask_bc_MR : TYPE
-            DESCRIPTION.
-
-        """
-
-        return 1
 
     #########################################
     def additional_ST_Computation(self):

@@ -24,9 +24,11 @@ class ScatteringMatchModel(nn.Module):
 
         # Learnable field u
         self.u = STLDataClass(torch.randn(init_shape, device=device, dtype=dtype))
-        self.u = nn.Parameter(
-            st_op.wavelet_op.apply_smooth(self.u, inplace=False).array
-        )
+        self.u = nn.Parameter(self.u.array)
+
+    #        self.u = nn.Parameter(
+    #            st_op.wavelet_op.apply_smooth(self.u, inplace=False).array
+    #        )
 
     def forward(self):
         DC_u = self.STLDataClass(self.u)
@@ -47,8 +49,7 @@ def optimize_scattering_LBFGS(
     verbose=True,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_NaN = np.sum(np.isnan(target)) > 0
-    if use_NaN:
+    if np.any(np.isnan(target)):
         print("NaN detected in the target, the synthesis takes it into account")
 
     target = torch.as_tensor(target, device=device, dtype=torch.float32)
@@ -57,7 +58,7 @@ def optimize_scattering_LBFGS(
     DC_target = STLDataClass(target)
     st_op = SO_class(DC_target)
     with torch.no_grad():
-        r = st_op.apply(DC_target, norm="store_ref", use_NaN=use_NaN).to_flatten()
+        r = st_op.apply(DC_target, norm="store_ref").to_flatten()
     r = r.detach()
 
     # Model with learnable u

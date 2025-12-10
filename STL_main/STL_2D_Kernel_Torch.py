@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from STL_main.torch_backend import to_torch_tensor
+from STL_main.torch_backend import nanmean, to_torch_tensor
 
 
 ###############################################################################
@@ -45,13 +45,11 @@ class STL_2D_Kernel_Torch:
         - attribute MR is False
         - attribute N0 gives the initial resolution
         - attribute dg gives the downgrading level
-        - attribute list_dg is None
         - array is an array of size (..., N) with N = N0 // 2^dg
     Or at multi-resolution (MR):
         - attribute MR is True
         - attribute N0 gives the initial resolution
         - attribute dg is None
-        - attribute list_dg is the list of downgrading
         - array is a list of array of sizes (..., N1), (..., N2), etc.,
         with the same dimensions excepts N.
 
@@ -100,8 +98,6 @@ class STL_2D_Kernel_Torch:
             self.N0 = N0
 
         self.array = self.to_array(array)
-
-        self.list_dg = None
 
         # Find N0 value
         self.device = self.array.device
@@ -185,10 +181,7 @@ class STL_2D_Kernel_Torch:
         """
         data = self.copy(empty=False) if not inplace else self
 
-        if data.MR:
-            data.array = [torch.abs(a) for a in data.array]
-        else:
-            data.array = torch.abs(data.array)
+        data.array = torch.abs(data.array)
 
         data.dtype = data.array.dtype
 
@@ -200,9 +193,8 @@ class STL_2D_Kernel_Torch:
         Compute the mean on the last two dimensions (Nx, Ny).
         """
         arr_use = torch.abs(self.array) ** 2 if square else self.array
-        mean = arr_use.nanmean(dim=(-2, -1))
 
-        return mean
+        return nanmean(arr_use, dim=(-2, -1))
 
     ###########################################################################
     def cov(self, data2=None, remove_mean=False):
@@ -226,20 +218,31 @@ class STL_2D_Kernel_Torch:
         else:
             x_c = x
             y_c = y
-        cov = (x_c * y_c.conj()).nanmean(dim=dims)
+        cov = nanmean(x_c * y_c.conj(), dim=(-2, -1))
 
         return cov
 
-    def get_wavelet_op(self, J=None, L=None, kernel_size=None):
+    def get_wavelet_op(
+        self, J=None, L=None, kernel_size=None, mask_full_res=None, *args, **kwargs
+    ):
         if L is None:
             L = 4
         if kernel_size is None:
             kernel_size = 5
         if J is None:
             J = np.min([int(np.log2(self.N0[0])), int(np.log2(self.N0[1]))]) - 2
-
+        if mask_full_res is None:
+            if torch.any(torch.isnan(self.array)):
+                mask_full_res = torch.isnan(self.array)
         return WavelateOperator2Dkernel_torch(
-            kernel_size, L, J, device=self.array.device, dtype=self.array.dtype
+            kernel_size,
+            L,
+            J,
+            device=self.array.device,
+            dtype=self.array.dtype,
+            mask_full_res=mask_full_res,
+            *args,
+            **kwargs,
         )
 
 
@@ -292,7 +295,8 @@ class WavelateOperator2Dkernel_torch:
 
         if torch.is_complex(x) or torch.is_complex(w):
             return torch.complex(real_part, imag_part)
-        return real_part
+        else:
+            return real_part
 
     def __init__(
         self,
@@ -302,6 +306,8 @@ class WavelateOperator2Dkernel_torch:
         device="cuda",
         mask_full_res=None,
         dtype=torch.float,
+        sigma_smooth=1.0,
+        downsample_nan_weight_threshold=0.33,
     ):
         self.KERNELSZ = kernel_size
         self.L = L
@@ -310,16 +316,60 @@ class WavelateOperator2Dkernel_torch:
         self.dtype = dtype
 
         self._wav_kernel = self._build_wavelet_kernel()
+        self.sigma_smooth = (
+            sigma_smooth  # to build smoothing kernel used in downsampling
+        )
+        # raise
+        # build low pass kernel?
         self.WType = "simple"
 
-        self.mask_full_res = mask_full_res
+        self.mask_full_res = (
+            STL_2D_Kernel_Torch(array=mask_full_res)
+            if mask_full_res is not None
+            else None
+        )  # None if no NaN in the data. Is True where the data is NaN.
+        self.downsample_nan_weight_threshold = downsample_nan_weight_threshold
         self._reweighting_maps = self._build_reweighting_maps()
 
     def _build_reweighting_maps(self):
-        # mask_full_res None or not ?
         # recup le smooth kernel
         # convol le smooth kernel avec le nan mask
-        raise
+        if self.mask_full_res is None:
+            return None
+        else:
+            local_nan_weight_maps = {}
+            smooth_kernel = self._gaussian_kernel_5x5(
+                device=self.mask_full_res.array.device, dtype=self.dtype
+            )
+            assert smooth_kernel.sum().item() == 1.0
+
+            # no need for reweighting at resolution dg=0.
+            for dg in range(1, self.J + 1):
+                parent = local_nan_weight_maps[dg - 1] if dg > 1 else self.mask_full_res
+                local_nan_weight_maps[dg] = STL_2D_Kernel_Torch(
+                    array=self._downsample_tensor(
+                        x=(torch.isnan(parent.array) if dg > 1 else parent.array).to(
+                            dtype=self.dtype
+                        ),
+                        smooth_kernel=smooth_kernel,
+                        dg_inc=1,
+                    ),
+                    dg=dg,
+                    N0=(parent[dg - 1].N0[0] // 2, parent[dg - 1].N0[1] // 2),
+                )  # local nan fraction
+
+                local_nan_weight_maps[dg].array = torch.where(
+                    condition=local_nan_weight_maps[dg].array
+                    <= self.downsample_nan_weight_threshold,
+                    input=local_nan_weight_maps[dg].array,
+                    other=torch.nan,
+                )  # replace with nan where above threshold
+
+            reweighting_maps = local_nan_weight_maps
+            for dg in reweighting_maps:
+                reweighting_maps[dg].array = 1.0 / (1.0 - reweighting_maps[dg].array)
+
+            return reweighting_maps
 
     def _build_wavelet_kernel(self, sigma=1):
         """Create a 2D Wavelet kernel."""
@@ -378,7 +428,7 @@ class WavelateOperator2Dkernel_torch:
             Convolved data with shape [..., L, Nx, Ny].
         """
         if j != data.dg:
-            raise "j is not equal to dg, convolution not possible"
+            raise ValueError("j is not equal to dg, convolution not possible")
 
         x = data.array  # [..., Nx, Ny]
 
@@ -393,35 +443,13 @@ class WavelateOperator2Dkernel_torch:
 
         return STL_2D_Kernel_Torch(convolved, dg=data.dg, N0=data.N0)
 
-    def apply_smooth(self, data: STL_2D_Kernel_Torch, inplace: bool = False):
-        """
-        Smooth the data by convolving with a smooth kernel derived from the
-        wavelet orientation 0. The data shape is preserved.
-        """
-        x = data.array  # [..., Nx, Ny]
-        *leading, Nx, Ny = x.shape
-
-        # Build a real, positive smoothing kernel from orientation 0
-        # self.kernel: (1, L, K, K) complex
-        k0 = torch.abs(self._wav_kernel[0, 0])  # (K, K)
-        k0 = k0 / k0.sum()
-        w_smooth = k0.unsqueeze(0).to(device=data.device, dtype=data.dtype)  # (1, K, K)
-
-        # Convolution is circular through _conv2d_circular
-        y = _conv2d_circular(x, w_smooth)  # [..., 1, Nx, Ny]
-
-        # Remove the extra output-channel dim
-        y = y.squeeze(-3)  # from [..., 1, Nx, Ny] -> [..., Nx, Ny]
-
-        out = data.copy(empty=True) if not inplace else data
-        out.array = y
-        return out
-
     @staticmethod
-    def _downsample_tensor(x: torch.Tensor, dg_inc: int) -> torch.Tensor:
+    def _downsample_tensor(
+        x: torch.Tensor, smooth_kernel: torch.Tensor, dg_inc: int
+    ) -> torch.Tensor:
         """
         Downsample a tensor by a factor 2**dg_inc along the last two
-        dimensions using 2x2 mean pooling (FoCUS ud_grade strategy).
+        dimensions using (successive iterations of, if dg_inc > 1) torch.conv2d with stride=2.
 
         Requires that both spatial dimensions be divisible by 2**dg_inc.
         """
@@ -437,19 +465,12 @@ class WavelateOperator2Dkernel_torch:
                 f"Cannot downsample from ({H},{W}) by 2^{dg_inc}: "
                 "dimensions must be divisible."
             )
-
-        # Create Gaussian kernel for anti-aliasing
-        def get_gaussian_kernel(sigma=1.0, dtype=torch.float32):
-            """Create a 2D Gaussian kernel with kernel_size based on sigma"""
-            kernel_size = int(6 * sigma + 1)
-            if kernel_size % 2 == 0:
-                kernel_size += 1
-
-            x_coord = torch.arange(kernel_size, dtype=dtype) - kernel_size // 2
-            gauss_1d = torch.exp(-(x_coord**2) / (2 * sigma**2))
-            gauss_1d = gauss_1d / gauss_1d.sum()
-            gauss_2d = gauss_1d.unsqueeze(0) * gauss_1d.unsqueeze(1)
-            return gauss_2d.unsqueeze(0).unsqueeze(0), kernel_size
+        if len(smooth_kernel.shape) != 2:
+            raise ValueError("Smooth kernel must be of dimension 2.")
+        if smooth_kernel.shape[0] != smooth_kernel.shape[1]:
+            raise ValueError("Smooth kernel must be a square.")
+        if smooth_kernel.shape[-1] % 2 == 0:
+            raise ValueError("Smooth kernel side length must be odd.")
 
         leading_dims = x.shape[:-2]
         B = int(torch.prod(torch.tensor(leading_dims))) if leading_dims else 1
@@ -461,15 +482,14 @@ class WavelateOperator2Dkernel_torch:
                 raise ValueError(
                     "Downsampling requires even spatial dimensions at each step."
                 )
-            sigma = 1.0
-            kernel, kernel_size = get_gaussian_kernel(sigma, dtype=y.dtype)
-            kernel = kernel.to(y.device)
             # Add circular padding for periodic boundaries
-            pad = kernel_size // 2
-            y_padded = F.pad(y, (pad, pad, pad, pad), mode="circular")
-            y = F.conv2d(y_padded, kernel)
-            # Now downsample with 2x2 mean pooling
-            y = F.avg_pool2d(y, kernel_size=2, stride=2)
+            pad = smooth_kernel.shape[-1] // 2
+            y_padded = F.pad(
+                y, (pad, pad, pad, pad), mode="circular"
+            )  # TODO: check if really necessary to pad with PBC.
+            y = F.conv2d(
+                input=y_padded, weight=smooth_kernel.unsqueeze(0).unsqueeze(0), stride=2
+            )
 
         H2, W2 = y.shape[-2:]
         return y.reshape(*leading_dims, H2, W2)
@@ -478,17 +498,8 @@ class WavelateOperator2Dkernel_torch:
     def downsample(self, data, dg_out, inplace=True):
         """
         Downsample the data to the dg_out resolution.
-
-        Downsampling is done in real space by
-
-
-
-        average pooling,
-
-
-
-        with factor
-        2^(dg_out - dg) on both spatial axes.
+        Downsampling is done in real space along the last two dimensions using (successive iterations of, if dg_out - dg > 1) torch.conv2d with stride=2.
+        If a mask is provided at full resolution, the downsampling is nan-aware, and sufficiently isolated NaNs can be removed through local averaging.
         """
         if dg_out < 0:
             raise ValueError("dg_out must be non-negative.")
@@ -502,23 +513,44 @@ class WavelateOperator2Dkernel_torch:
         data = data.copy(empty=False) if not inplace else data
         dg_inc = dg_out - data.dg
 
-        if True:  # nan or not:
-            raise
-            if dg_inc > 0:
-                data.array = self._downsample_tensor(data.array, dg_inc)
+        if dg_inc > 0:
+            smooth_kernel = self._gaussian_kernel_5x5(
+                device=data.array.device, dtype=data.array.dtype
+            )
+            if self.mask_full_res is None:  # no mask
+                data.array = self._downsample_tensor(
+                    x=data.array, smooth_kernel=smooth_kernel, dg_inc=dg_inc
+                )
                 data.dg = dg_out
-
+            else:  # mask
+                for _ in range(
+                    dg_inc
+                ):  # downsampling is done step by step to apply reweighting at each step
+                    data.array = torch.where(
+                        condition=(
+                            ~self.mask_full_res.array
+                            if data.dg == 0
+                            else ~torch.isnan(self._reweighting_maps[data.dg].array)
+                        ),
+                        input=data.array,
+                        other=0.0,
+                    )
+                    data.array = self._downsample_tensor(
+                        x=data.array, smooth_kernel=smooth_kernel, dg_inc=1
+                    )
+                    data.dg += 1
+                    data.array *= self._reweighting_maps[data.dg].array  # reweighting
         return data
 
-    def _gaussian_kernel_5x5(self, device, dtype, sigma: float = 1.0):
+    def _gaussian_kernel_5x5(self, device, dtype):
         """
         Build and cache a normalized 5x5 Gaussian kernel on (device, dtype)
-        for circular convolution with _conv2d_circular.
+        for antialiasing 2D filter used in downsampling.
 
         Returns
         -------
         kernel : torch.Tensor
-            Shape (1, 5, 5): [O_c, wx, wy]
+            Shape (5, 5)
         """
         if (
             not hasattr(self, "_smooth_kernel_5x5")
@@ -528,115 +560,8 @@ class WavelateOperator2Dkernel_torch:
             size = 5
             coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2.0
             yy, xx = torch.meshgrid(coords, coords, indexing="ij")
-            kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+            kernel = torch.exp(-(xx**2 + yy**2) / (2 * self.sigma_smooth**2))
             kernel = kernel / kernel.sum()
             # _conv2d_circular expects w shape (O_c, wx, wy)
-            self._smooth_kernel_5x5 = kernel.view(1, size, size)
+            self._smooth_kernel_5x5 = kernel
         return self._smooth_kernel_5x5
-
-    def _nandownsample_tensor(self, x: torch.Tensor, dg_inc: int) -> torch.Tensor:
-        """
-        Smooth x with a 5x5 Gaussian ignoring NaNs, then downsample by a factor
-        2**dg_inc using a nan-aware mean (nanmean) on each block.
-
-        x : tensor of shape (..., H, W)
-        returns : tensor of shape (..., H/2**dg_inc, W/2**dg_inc)
-        """
-        if dg_inc <= 0:
-            return x
-
-        device = x.device
-        dtype = x.dtype
-        factor = 2**dg_inc
-
-        # ---- reshape to (B, H, W) for _conv2d_circular ----
-        *leading, H, W = x.shape
-        if leading:
-            B = math.prod(leading)
-        else:
-            B = 1
-        x_flat = x.reshape(B, H, W)  # (B, H, W)
-
-        # ---- Gaussian smoothing with NaN handling (circular) ----
-        mask_valid = ~torch.isnan(x_flat)  # (B, H, W) bool
-        mask_f = mask_valid.to(dtype)  # float
-
-        # replace NaN with 0 so they don't contribute
-        x_filled = torch.where(mask_valid, x_flat, torch.zeros_like(x_flat))
-
-        # kernel 5x5, shape (1, 5, 5) for _conv2d_circular
-        sigma = getattr(self, "sigma_smooth", 1.0)
-        kernel = self._gaussian_kernel_5x5(device=device, dtype=dtype, sigma=sigma)
-
-        # Convolution on data and on mask (circular)
-        num = _conv2d_circular(x_filled, kernel)  # (B, 1, H, W)
-        w_sum = _conv2d_circular(mask_f, kernel)  # (B, 1, H, W)
-
-        eps = 1e-8
-        x_smooth = num / (w_sum + eps)  # (B, 1, H, W)
-        x_smooth = x_smooth.squeeze(1)  # (B, H, W)
-
-        # Put NaN where no valid pixel at all in the 5x5 window
-        no_valid = w_sum.squeeze(1) <= 0
-        x_smooth = torch.where(
-            no_valid, torch.full_like(x_smooth, float("nan")), x_smooth
-        )
-
-        # ---- Downsample with nan-aware mean via avg_pool2d ----
-        # Treat (B,1,H,W) again
-        x_smooth_4d = x_smooth.unsqueeze(1)  # (B,1,H,W)
-        mask_valid2 = ~torch.isnan(x_smooth_4d)
-        mask2_f = mask_valid2.to(dtype)
-
-        # replace NaN by 0 for pooling
-        x2_filled = torch.where(mask_valid2, x_smooth_4d, torch.zeros_like(x_smooth_4d))
-
-        # average pooling of data and mask (non-overlapping blocks)
-        pool_num = F.avg_pool2d(
-            x2_filled, kernel_size=factor, stride=factor
-        )  # (B,1,H',W')
-        pool_mask = F.avg_pool2d(
-            mask2_f, kernel_size=factor, stride=factor
-        )  # (B,1,H',W')
-
-        y = pool_num / (pool_mask + eps)  # nan-aware mean
-        no_valid_block = pool_mask <= 0
-        y = torch.where(no_valid_block, torch.full_like(y, float("nan")), y)
-
-        # reshape back to original leading dims + downsampled spatial dims
-        H_out, W_out = y.shape[-2:]
-        y = y.view(*leading, H_out, W_out)
-        return y
-
-    ###########################################################################
-    def nandownsample(self, data, dg_out, mask_MR=None, inplace=True):
-        """
-        Nan-aware downsample of `data` to resolution `dg_out`:
-
-          1) Circular Gaussian smoothing with a 5x5 kernel ignoring NaNs
-             (normalized by sum of valid weights),
-          2) nan-aware average pooling by factor 2^(dg_out - dg).
-        """
-        if data.MR:
-            raise ValueError("downsample only supports MR == False.")
-        if dg_out < 0:
-            raise ValueError("dg_out must be non-negative.")
-        if dg_out == data.dg:
-            return data
-        if dg_out < data.dg:
-            raise ValueError("Requested dg_out < current dg; upsampling not supported.")
-
-        data = data.copy(empty=False) if not inplace else data
-        dg_inc = dg_out - data.dg
-
-        if dg_inc > 0:
-            data.array = self._nandownsample_tensor(data.array, dg_inc)
-            data.dg = dg_out
-
-        if mask_MR is not None:
-            mask = self._get_mask_at_dg(mask_MR, data.dg)
-            if mask.shape[-2:] != data.array.shape[-2:]:
-                raise ValueError("Mask and data have incompatible spatial shapes.")
-            data.array = data.array * mask
-
-        return data

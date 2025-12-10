@@ -128,6 +128,16 @@ def mean(x, dim):
     return torch.mean(x, dim=dim)
 
 
+def nanmean(x, dim):
+    """Wrapper of torch nanmean method that handles complex values.
+    Compute the mean ignoring NaNs along specified dimensions."""
+
+    if not torch.is_complex(x):
+        return x.nanmean(dim=dim)
+    else:
+        return torch.complex(x.real.nanmean(dim=dim), x.imag.nanmean(dim=dim))
+
+
 def dim(x) -> int:
     """
     Return the number of dimensions of a tensor-like object.
