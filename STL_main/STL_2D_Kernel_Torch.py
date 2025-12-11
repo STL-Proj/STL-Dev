@@ -76,7 +76,7 @@ class STL_2D_Kernel_Torch:
     """
 
     ###########################################################################
-    def __init__(self, array, dg=None, N0=None):
+    def __init__(self, array, dg=None, N0=None, pbc=False):
         """
         Constructor, see details above. Frontend version, which assume the
         array is at N0 resolution with dg=0.
@@ -98,6 +98,7 @@ class STL_2D_Kernel_Torch:
             self.N0 = N0
 
         self.array = self.to_array(array)
+        self.pbc = pbc  # By default, no periodic BC
 
         # Find N0 value
         self.device = self.array.device
@@ -231,6 +232,14 @@ class STL_2D_Kernel_Torch:
             kernel_size = 5
         if J is None:
             J = np.min([int(np.log2(self.N0[0])), int(np.log2(self.N0[1]))]) - 2
+
+        # Check for periodic BCs
+        if self.pbc:
+            B_full = 0
+        else:
+            # crop border thickness at full resolution (dg = 0) to avoid border effects
+            B_full = 2**(J-1) # most conservative choice (may be improved later)
+
         if mask_full_res is None:
             if torch.any(torch.isnan(self.array)):
                 mask_full_res = torch.isnan(self.array)
@@ -238,6 +247,7 @@ class STL_2D_Kernel_Torch:
             kernel_size,
             L,
             J,
+            B_full=B_full,
             device=self.array.device,
             dtype=self.array.dtype,
             mask_full_res=mask_full_res,
@@ -303,6 +313,7 @@ class WavelateOperator2Dkernel_torch:
         kernel_size: int,
         L: int,
         J: int,
+        B_full: int,
         device="cuda",
         mask_full_res=None,
         dtype=torch.float,
@@ -311,7 +322,8 @@ class WavelateOperator2Dkernel_torch:
     ):
         self.KERNELSZ = kernel_size
         self.L = L
-        self.J = J
+        self.J = J 
+        self.B_full = B_full
         self.device = torch.device(device)
         self.dtype = dtype
 
@@ -411,7 +423,7 @@ class WavelateOperator2Dkernel_torch:
 
         return kernel.reshape(1, self.L, self.KERNELSZ, self.KERNELSZ)
 
-    def apply(self, data, j):
+    def apply(self, data: STL_2D_Kernel_Torch, j: int)-> STL_2D_Kernel_Torch:
         """
         Apply the convolution kernel to data.array [..., Nx, Ny]
         and return cdata [..., L, Nx, Ny].
@@ -441,7 +453,53 @@ class WavelateOperator2Dkernel_torch:
 
         convolved = self.__class__._complex_conv2d_circular(x, weight)
 
+        # Crop border if not periodic BCs. 
+        if not data.pbc:
+            # crop border thickness at current resolution dg to avoid border effects
+            B_dg = math.ceil(self.B_full / (2**data.dg))
+            convolved[..., :B_dg, :] = float('nan')
+            convolved[..., -B_dg:, :] = float('nan')
+            convolved[..., :, :B_dg] = float('nan')
+            convolved[..., :, -B_dg:] = float('nan')
+          
+
         return STL_2D_Kernel_Torch(convolved, dg=data.dg, N0=data.N0)
+    
+def crop_array(
+    self, data: STL_2D_Kernel_Torch, inplace: bool = False) -> STL_2D_Kernel_Torch:
+    """
+    Adaptive cropping to the resolution of `data` if not periodic boundary conditions.
+
+    Parameters
+    ----------
+    data : STL_2D_Kernel_Torch
+        Input data to crop.
+    inplace : bool, default True
+
+
+    Returns
+    -------
+    STL_2D_Kernel_Torch
+        Cropped data with NaN values at the borders.
+    """
+    data = data.copy(empty=False) if not inplace else data
+
+    if data.pbc:
+        return data
+
+    # Crop border thickness at current resolution dg to avoid border effects
+    B_dg = math.ceil(self.B_full / (2**data.dg))
+
+    arr = data.array
+
+    # In-place assignment of NaNs on the borders
+    arr[..., :B_dg, :] = float('nan')
+    arr[..., -B_dg:, :] = float('nan')
+    arr[..., :, :B_dg] = float('nan')
+    arr[..., :, -B_dg:] = float('nan')
+
+    return data 
+    
 
     @staticmethod
     def _downsample_tensor(

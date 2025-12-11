@@ -361,11 +361,11 @@ class ST_Operator:
         # for FFT
 
         data_l1m = {}
-        l_data = data.copy()
+        l_data = self.wavelet_op.crop_array(data, inplace=False)  # (Nb,Nc,L,N3)
         ### Higher order computation ###
 
         for j3 in range(J):
-            # Compute first convolution and modulus
+            # Compute first convolution and modulus        
             data_l1 = self.wavelet_op.apply(l_data, j=j3)  # (Nb,Nc,L,N3)
             data_l1m[j3] = data_l1.modulus(inplace=False)  # (Nb,Nc,L,N3)
             # Compute S1 and S2
