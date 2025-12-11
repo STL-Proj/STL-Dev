@@ -33,14 +33,15 @@ class ScatteringMatchModel(nn.Module):
     def forward(self):
         DC_u = self.STLDataClass(self.u)
         st_u = self.st_op.apply(DC_u, norm="load_ref")
-        s_flat_u = st_u.to_flatten(mean_along_batch=True)
+        s_flat_u = st_u.to_flatten(mean_along_batch=True, keepnans=True)
         return s_flat_u
 
 
 def optimize_scattering_LBFGS(
     target,
     STLDataClass,
-    SO_class,
+    st_op_target,
+    st_op_running,
     max_iter=100,
     nbatch=1,
     lr=1.0,
@@ -56,14 +57,16 @@ def optimize_scattering_LBFGS(
 
     # Reference scattering
     DC_target = STLDataClass(target)
-    st_op = SO_class(DC_target)
     with torch.no_grad():
-        r = st_op.apply(DC_target, norm="store_ref").to_flatten()
+        r = st_op_target.apply(DC_target, norm="store_ref").to_flatten(keepnans=True)
     r = r.detach()
+    target_coeffs_mask = ~torch.isnan(r)
+    print("synthesis on {:} ST coefficients".format(target_coeffs_mask.sum().item()))
+    st_op_running.S2_ref = st_op_target.S2_ref
 
     # Model with learnable u
     model = ScatteringMatchModel(
-        st_op=st_op,
+        st_op=st_op_running,
         STLDataClass=STLDataClass,
         init_shape=(nbatch, 1, *target.shape),
         device=device,
@@ -85,7 +88,7 @@ def optimize_scattering_LBFGS(
     def closure():
         optimizer.zero_grad()
         s_flat_u = model()
-        loss = ((s_flat_u - r).abs() ** 2).sum()
+        loss = ((s_flat_u[target_coeffs_mask] - r[target_coeffs_mask]).abs() ** 2).sum()
         loss.backward()
 
         # Log à chaque appel interne

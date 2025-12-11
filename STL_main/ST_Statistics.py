@@ -281,7 +281,7 @@ class ST_Statistics:
         return self
 
     ########################################
-    def to_flatten(self, mask_st=None, mean_along_batch=False):
+    def to_flatten(self, mask_st=None, mean_along_batch=False, keepnans=False):
         """
         Produce a 1d array that can be used for loss constructions.
 
@@ -314,8 +314,7 @@ class ST_Statistics:
         for S in stats:
             # S may contain NaNs → keep only non-NaNs
             S_flat = S.reshape(-1)
-            valid = ~bk.isnan(S_flat)
-            flattened_list.append(S_flat[valid])
+            flattened_list.append(S_flat if keepnans else S_flat[~bk.isnan(S_flat)])
 
         # Concatenate all statistics into a single 1D vector
         st_flatten = bk.cat(flattened_list, dim=0)
