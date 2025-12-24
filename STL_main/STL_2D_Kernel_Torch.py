@@ -215,7 +215,7 @@ class STL_2D_Kernel_Torch:
         if J is None:
             J = np.min([int(np.log2(self.N0[0])), int(np.log2(self.N0[1]))]) - 2
         if mask_full_res is None:
-            if torch.any(self.array.isnan()) or not pbc:
+            if torch.any(self.array.isnan()):
                 mask_full_res = self.array.isnan()
         return WaveletOperator2Dkernel_torch(
             kernel_size,
@@ -276,10 +276,38 @@ class WaveletOperator2Dkernel_torch:
     def _semicomplex_conv2d_circular(
         cls, x: torch.Tensor, w: torch.Tensor, padding_mode: str
     ) -> torch.Tensor:
-        """Semicomplex-aware wrapper around ``_conv2d_circular``."""
+        """
+        Perform a 2D convolution with a real input and complex kernel.
+        This method decomposes the complex kernel ``w`` into its real and
+        imaginary parts, applies ``_conv2d_circular`` separately to each part
+        using the real-valued input ``x``, and combines the two real-valued
+        results into a complex-valued output tensor.
+        Parameters
+        ----------
+        x : torch.Tensor
+            Real-valued input tensor of shape ``[..., Nx, Ny]``. The tensor
+            must not be complex (``torch.is_complex(x)`` is expected to be
+            ``False``).
+        w : torch.Tensor
+            Complex-valued convolution kernel of shape ``[O_c, wx, wy]``. The
+            tensor must be complex (``torch.is_complex(w)`` is expected to be
+            ``True``), and its real and imaginary parts are convolved with
+            ``x`` separately.
+        padding_mode : str
+            Padding mode passed through to :func:`torch.nn.functional.pad` in
+            ``_conv2d_circular``. Typically ``"circular"`` for periodic
+            boundary conditions or ``"replicate"`` for non-periodic padding,
+            but any mode supported by ``torch.nn.functional.pad`` may be used.
+        Returns
+        -------
+        torch.Tensor
+            Complex-valued output tensor of shape ``[..., O_c, Nx, Ny]``,
+            where ``O_c`` is the number of output channels defined by the
+            kernel ``w``.
+        """
 
-        assert not torch.is_complex(x)
-        assert torch.is_complex(w)
+        assert not torch.is_complex(x), "Input tensor x must be real-valued"
+        assert torch.is_complex(w), "Kernel w must be complex-valued"
 
         wr = torch.real(w)  # if torch.is_complex(w) else w
         wi = torch.imag(w)  # if torch.is_complex(w) else torch.zeros_like(wr)
@@ -383,10 +411,6 @@ class WaveletOperator2Dkernel_torch:
             )
 
         # NaNs handling
-        if not pbc and mask_full_res is None:
-            raise ValueError(
-                "If PBC is False, mask_full_res must be provided. If data has no NaNs, mask_full_res can be a tensor full of False."
-            )
         self.mask_full_res = (
             STL_2D_Kernel_Torch(
                 array=mask_full_res.to(device=self.device, dtype=torch.bool)
@@ -433,7 +457,7 @@ class WaveletOperator2Dkernel_torch:
                         x=parent_array,
                         smooth_kernel=smooth_kernel,
                         dg_inc=1,
-                        padding_mode=padding_mode,  # if not PBC, operates as if NaNs were padded all around the map before smoothing convolution
+                        padding_mode=padding_mode,
                     ),
                     dg=dg,
                     N0=self.mask_full_res.N0,
@@ -465,7 +489,7 @@ class WaveletOperator2Dkernel_torch:
                                 else local_nan_weight_maps_smooth[dg].array.isnan()
                             ).to(dtype=self.dtype),
                             w=wav_kernels_envelope,  # assumes identical wavelet support for all angles
-                            padding_mode=padding_mode,  # if not PBC, operates as if NaNs were padded all around the map before wavelet convolution
+                            padding_mode=padding_mode,
                         ).squeeze(0)
                     )
                     > 0.0,
@@ -498,7 +522,7 @@ class WaveletOperator2Dkernel_torch:
                             x=parent_array,
                             smooth_kernel=smooth_kernel,
                             dg_inc=1,
-                            padding_mode=padding_mode,  # if not PBC, operates as if NaNs were padded all around the map before smoothing convolution
+                            padding_mode=padding_mode,
                         ),
                         dg=dg,
                         N0=self.mask_full_res.N0,
@@ -524,7 +548,7 @@ class WaveletOperator2Dkernel_torch:
                                     else layer1_mask[j3].array
                                 ).to(dtype=self.dtype),
                                 w=wav_kernels_envelope,
-                                padding_mode=padding_mode,  # if not PBC, operates as if NaNs were padded all around the map before wavelet convolution
+                                padding_mode=padding_mode,
                             )
                             .squeeze(0)
                             .squeeze(0)
