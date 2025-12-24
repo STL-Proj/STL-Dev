@@ -294,7 +294,7 @@ class WaveletOperator2Dkernel_torch:
             ``True``), and its real and imaginary parts are convolved with
             ``x`` separately.
         padding_mode : str
-            Padding mode passed through to :func:`torch.nn.functional.pad` in
+            Padding mode passed through to ``torch.nn.functional.pad`` in
             ``_conv2d_circular``. Typically ``"circular"`` for periodic
             boundary conditions or ``"replicate"`` for non-periodic padding,
             but any mode supported by ``torch.nn.functional.pad`` may be used.
