@@ -485,8 +485,25 @@ class CrappyWavelateOperator2D_FFT_torch:
         return filters_bank
 
     @staticmethod
+    def _calculate_base_sigma0(wavelet_op):
+        """
+        Calculate the base sigma value used in gaussian_bank.
+
+        Parameters
+        ----------
+        wavelet_op : CrappyWavelateOperator2D_FFT_torch
+            Wavelet operator instance.
+
+        Returns
+        -------
+        float
+            Base sigma value calculated as min(wavelet_op.N0) / 8.
+        """
+        return min(wavelet_op.N0) / 8
+
+    @staticmethod
     def _get_crop_border_size_largest_scale_second_layer(data, wavelet_op):
-        sigma0 = min(wavelet_op.N0) / 8  # base sigma used in gaussian_bank
+        sigma0 = CrappyWavelateOperator2D_FFT_torch._calculate_base_sigma0(wavelet_op)
         if data.pbc:
             return 0
         else:
@@ -503,7 +520,7 @@ class CrappyWavelateOperator2D_FFT_torch:
 
     @staticmethod
     def _get_crop_border_size_largest_scale_layer_flexible(data, wavelet_op):
-        sigma0 = min(wavelet_op.N0) / 8  # base sigma used in gaussian_bank
+        sigma0 = CrappyWavelateOperator2D_FFT_torch._calculate_base_sigma0(wavelet_op)
         if data.pbc or len(data.conv_history) == 0:
             return 0
         else:
@@ -519,7 +536,7 @@ class CrappyWavelateOperator2D_FFT_torch:
 
     @staticmethod
     def _get_crop_border_size_fully_flexible(data, wavelet_op):
-        sigma0 = min(wavelet_op.N0) / 8  # base sigma used in gaussian_bank
+        sigma0 = CrappyWavelateOperator2D_FFT_torch._calculate_base_sigma0(wavelet_op)
         safety_prefactor = math.sqrt(
             4 * math.log(10)
         )  # point where Gaussian is ~1% of max
