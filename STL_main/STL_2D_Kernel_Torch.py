@@ -317,10 +317,11 @@ class WaveletOperator2Dkernel_torch:
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
-        self._wav_kernel = self._build_wavelet_kernel()
         self.sigma_smooth = (
             sigma_smooth  # to build smoothing kernel used in downsampling
         )
+        #simag_smooth should be defined before build wavelet kernel for dg=0
+        self._wav_kernel,self._wav_kernel_0 = self._build_wavelet_kernel()
         # raise
         # build low pass kernel?
         self.WType = "simple"
@@ -546,7 +547,8 @@ class WaveletOperator2Dkernel_torch:
         yy, xx = torch.meshgrid(coords, coords, indexing="ij")
 
         # Gaussian envelope
-        gaussian_envelope = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        gaussian_envelope = torch.exp(-2*(xx**2 + yy**2) / (self.L*sigma**2))
+        gaussian_envelope_0 = torch.exp(-8*(xx**2 + yy**2) / (self.L*sigma**2))
 
         # Orientations
         angles = (
@@ -562,18 +564,58 @@ class WaveletOperator2Dkernel_torch:
         ] * torch.sin(angles[:, None, None])
 
         # Complex Morlet wavelet
+        
         kernel = torch.exp(1j * 0.75 * np.pi * x_rot) * gaussian_envelope[None, :, :]
+        
+        # y: (L, 3K, 3K)
+        y = torch.zeros([self.L, self.KERNELSZ*3, self.KERNELSZ*3],
+                        device=self.device, dtype=kernel.dtype)
+        y[:, self.KERNELSZ:self.KERNELSZ*2, self.KERNELSZ:self.KERNELSZ*2] = kernel
 
+        # conv2d expects 4D input: (N, C, H, W)
+        y4 = y.unsqueeze(1)  # (L, 1, 3K, 3K)
+
+        # weight: (C_out=1, C_in=1, 5, 5)
+        w = gaussian_envelope_0.unsqueeze(0).unsqueeze(0)  # (1,1,5,5)
+        w = w.to(dtype=kernel.dtype)  # optional: cast to complex if you want
+
+        # No padding needed because you already embedded into a larger array
+        y4 = F.conv2d(input=y4, weight=w, stride=1, padding=0)  # (L,1,3K-4,3K-4)
+
+        # Back to (L, H, W)
+        y = y4.squeeze(1)  # (L, 3K-4, 3K-4)
+
+        # IMPORTANT: indices shift because output is smaller by 4 pixels
+        # You want the central KxK block corresponding to original center
+        kernel_0 = y[:, (self.KERNELSZ-2):(self.KERNELSZ-2)+self.KERNELSZ,
+                       (self.KERNELSZ-2):(self.KERNELSZ-2)+self.KERNELSZ]
+            
         # Remove DC component (admissibility condition)
         kernel = kernel - torch.mean(kernel, dim=(1, 2))[:, None, None]
+        kernel_0 = kernel_0 - torch.mean(kernel_0, dim=(1, 2))[:, None, None]
 
         # L2 normalization
+        # tune the normalisation 
+        kernel_0 /= 2*self.L
+        kernel   /= self.L
+        '''
+        if self.L==4:
+            kernel[1]*=1.5
+            kernel[3]*=1.5
+            kernel_0[1]*=2
+            kernel_0[3]*=2
+        
+        kernel_0 = (
+            kernel_0
+            / torch.sqrt(torch.sum(torch.abs(kernel) ** 2, dim=(1, 2)))[:, None, None]
+        )
         kernel = (
             kernel
             / torch.sqrt(torch.sum(torch.abs(kernel) ** 2, dim=(1, 2)))[:, None, None]
         )
-
-        return kernel.reshape(1, self.L, self.KERNELSZ, self.KERNELSZ)
+        '''
+        return kernel.reshape(1, self.L, self.KERNELSZ, self.KERNELSZ), \
+            kernel_0.reshape(1, self.L, self.KERNELSZ, self.KERNELSZ)
 
     def _crop(self, array, border):
         """
@@ -845,7 +887,10 @@ class WaveletOperator2Dkernel_torch:
         # Ensure x is a torch tensor on the same device as the _wav_kernel
         x = torch.as_tensor(x, device=self._wav_kernel.device)
 
-        weight = self._wav_kernel.squeeze(0)  # [L, K, K]
+        if j==0:
+            weight = self._wav_kernel_0.squeeze(0)  # [L, K, K]
+        else:
+            weight = self._wav_kernel.squeeze(0)  # [L, K, K]
 
         convolved = self.__class__._semicomplex_conv2d_circular(
             x, weight, padding_mode=self.__class__._get_padding_mode(pbc=data.pbc)
@@ -908,6 +953,77 @@ class WaveletOperator2Dkernel_torch:
         H2, W2 = y.shape[-2:]
         return y.reshape(*leading_dims, H2, W2)
 
+    @staticmethod
+    def _upsample_tensor(
+        x: torch.Tensor,
+        smooth_kernel: torch.Tensor,
+        dg_inc: int,
+        padding_mode: str,  # kept for symmetry; not used here
+    ) -> torch.Tensor:
+        """
+        Upsample by factor 2**dg_inc using conv_transpose2d so that
+        downsample->upsample recovers exact spatial sizes.
+
+        Assumes the corresponding downsample used:
+            y_padded = F.pad(y, pad, mode=padding_mode)
+            y = F.conv2d(y_padded, weight, stride=2)
+        with kernel size k and pad = k//2.
+        """
+        if dg_inc < 0:
+            raise ValueError("dg_inc must be non-negative")
+        if dg_inc == 0:
+            return x
+
+        if len(smooth_kernel.shape) != 2:
+            raise ValueError("Smooth kernel must be of dimension 2.")
+        if smooth_kernel.shape[0] != smooth_kernel.shape[1]:
+            raise ValueError("Smooth kernel must be a square.")
+        if smooth_kernel.shape[-1] % 2 == 0:
+            raise ValueError("Smooth kernel side length must be odd.")
+
+        k = smooth_kernel.shape[-1]
+        pad = k // 2
+        stride = 2
+
+        leading_dims = x.shape[:-2]
+        Hc, Wc = x.shape[-2:]
+        B = int(torch.prod(torch.tensor(leading_dims))) if leading_dims else 1
+        y = x.reshape(B, 1, Hc, Wc)
+
+        weight = smooth_kernel.unsqueeze(0).unsqueeze(0)
+
+        for _ in range(dg_inc):
+            # target size after one upsampling step
+            target_h = y.shape[-2] * 2
+            target_w = y.shape[-1] * 2
+
+            # Base output size with output_padding=0
+            base_h = (y.shape[-2] - 1) * stride - 2 * pad + k
+            base_w = (y.shape[-1] - 1) * stride - 2 * pad + k
+
+            # output_padding must be 0 or 1 for stride=2
+            out_pad_h = target_h - base_h
+            out_pad_w = target_w - base_w
+            if out_pad_h not in (0, 1) or out_pad_w not in (0, 1):
+                raise ValueError(
+                    f"Invalid output_padding computed: ({out_pad_h},{out_pad_w}). "
+                    f"Check kernel/padding assumptions."
+                )
+
+            y = F.conv_transpose2d(
+                input=y,
+                weight=weight,
+                stride=stride,
+                padding=pad,
+                output_padding=(out_pad_h, out_pad_w),
+            )
+
+            # Optional: compensate amplitude dilution for 2D stride=2
+            y = y * 4.0
+
+        Hf, Wf = y.shape[-2:]
+        return y.reshape(*leading_dims, Hf, Wf)
+    
     ###########################################################################
     def downsample(self, data, dg_out, inplace=True, replace_nan_value=nan):
         """
@@ -1013,6 +1129,166 @@ class WaveletOperator2Dkernel_torch:
                     )  # put a large value instead of NaNs WARNING: if applied, this breaks the backprop!!!
         return data
 
+    ###########################################################################
+    def upsample(self, data, dg_out, inplace=True, replace_nan_value=nan):
+        """
+        Upsample the data to the dg_out resolution.
+
+        Upsampling is performed in real space along the last two dimensions
+        using successive applications (if dg - dg_out >1) of
+        torch.conv_transpose2d with stride=2 and the same 5x5 smoothing kernel.
+
+        This corresponds to the adjoint (transpose) of the downsampling operator.
+
+        If a full-resolution mask is defined, a mask-aware behavior is applied.
+        Note that exact adjointness of the full masked + reweighted pipeline
+        depends on the interpretation of the reweighting maps.
+        """
+
+        # Periodic boundary conditions must be defined
+        if data.pbc is None:
+            raise ValueError(
+                "data.pbc must be specified to perform upsampling "
+                "(for adequate padding mode)."
+            )
+
+        if dg_out < 0:
+            raise ValueError("dg_out must be non-negative.")
+
+        # No change in resolution
+        if dg_out == data.dg and inplace:
+            return data
+
+        # Upsampling only (downsampling must use downsample())
+        if dg_out >= data.dg:
+            raise ValueError(
+                "Requested dg_out <= current dg; "
+                "downsampling not supported by upsampling method."
+            )
+
+        # Work on a copy if not inplace
+        data = data.copy(empty=False) if not inplace else data
+
+        dg_inc = data.dg - dg_out
+        if dg_inc == 0:
+            return data
+
+        # Build the same smoothing kernel used for downsampling
+        smooth_kernel = self._gaussian_kernel_5x5(
+            device=data.array.device,
+            dtype=data.array.dtype,
+        )
+
+        padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
+
+        # ============================================================
+        # Case A — No mask defined
+        # ============================================================
+        if self.mask_full_res is None:
+
+            # Apply transpose operator step-by-step
+            data.array = self._upsample_tensor(
+                x=data.array,
+                smooth_kernel=smooth_kernel,
+                dg_inc=dg_inc,
+                padding_mode=padding_mode,
+            )
+
+            data.dg = dg_out
+            return data
+
+        # ============================================================
+        # Case B — Mask-aware upsampling
+        # ============================================================
+
+        # Determine convolution history (same logic as in downsample)
+        if len(data.conv_history) == 0:
+            convolved_at = None
+        else:
+            assert len(data.conv_history) < 2, (
+                "data must be at layer 0 or 1 to be upsampled."
+            )
+            convolved_at = data.conv_history[0]
+
+        # Replace NaNs by zeros before applying transpose convolution
+        input_mask = data.array.isnan()
+        data.array = torch.where(
+            ~input_mask,
+            data.array,
+            torch.zeros_like(data.array),
+        )
+
+        # Perform step-by-step upsampling
+        for _ in range(dg_inc):
+
+            # Apply one level of transpose convolution (factor 2)
+            data.array = self._upsample_tensor(
+                x=data.array,
+                smooth_kernel=smooth_kernel,
+                dg_inc=1,
+                padding_mode=padding_mode,
+            )
+
+            data.dg -= 1
+
+            # Retrieve corresponding reweighting map at new resolution
+            reweighting_map = (
+                self._reweighting_maps_smooth[padding_mode][data.dg]
+                if convolved_at is None
+                else self._reweighting_maps_wav[padding_mode][data.dg][convolved_at]
+            )
+
+            # --------------------------------------------------------
+            # Scaling strategy
+            #
+            # In downsampling, data was multiplied by reweighting_map.
+            #
+            # Two possible interpretations here:
+            #
+            # 1) Strict adjoint of scaling:
+            #       multiply again by reweighting_map
+            #
+            # 2) Reconstruction-oriented behavior (default here):
+            #       divide by reweighting_map (undo normalization)
+            #
+            # The second option is typically preferred for field
+            # reconstruction rather than gradient consistency.
+            # --------------------------------------------------------
+
+            denom = torch.where(
+                ~reweighting_map.array.isnan(),
+                reweighting_map.array,
+                torch.ones_like(reweighting_map.array),
+            )
+
+            # Avoid division by very small values
+            eps = torch.tensor(1e-12, device=denom.device, dtype=denom.dtype)
+            denom = torch.where(
+                denom.abs() > eps,
+                denom,
+                torch.ones_like(denom),
+            )
+
+            # Reconstruction-oriented scaling
+            data.array = data.array / denom
+
+            # If strict adjoint behavior is desired instead:
+            # data.array *= torch.where(
+            #     ~reweighting_map.array.isnan(),
+            #     reweighting_map.array,
+            #     0.0,
+            # )
+
+            # Restore NaN (or large placeholder) if requested
+            if replace_nan_value is not None:
+                data.array = torch.where(
+                    ~reweighting_map.array.isnan(),
+                    data.array,
+                    replace_nan_value,
+                )
+
+        return data
+        
     def _gaussian_kernel_5x5(self, device, dtype):
         """
         Build and cache a normalized 5x5 Gaussian kernel on (device, dtype)
@@ -1028,13 +1304,23 @@ class WaveletOperator2Dkernel_torch:
             or self._smooth_kernel_5x5.device != device
             or self._smooth_kernel_5x5.dtype != dtype
         ):
-            size = 5
-            coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2.0
-            yy, xx = torch.meshgrid(coords, coords, indexing="ij")
-            kernel = torch.exp(-(xx**2 + yy**2) / (2 * self.sigma_smooth**2))
+            # force real dtype for arange/meshgrid
+            if dtype == torch.complex128:
+                rdtype = torch.float64
+            elif dtype == torch.complex64:
+                rdtype = torch.float32
+            else:
+                rdtype = dtype
+
+            ax = torch.arange(-2, 3, device=device, dtype=rdtype)
+            xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+
+            sigma = torch.tensor(1.0, device=device, dtype=rdtype)
+            kernel = torch.exp(-(xx**2 + yy**2) / (2*sigma**2))
             kernel = kernel / kernel.sum()
+
             # _conv2d_circular expects w shape (O_c, wx, wy)
-            self._smooth_kernel_5x5 = kernel
+            self._smooth_kernel_5x5 = kernel.to(dtype=dtype)
         return self._smooth_kernel_5x5
 
 
