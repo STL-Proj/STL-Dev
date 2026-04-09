@@ -496,12 +496,9 @@ class ST_Operator:
             if (
                 compute_cross_matrix * (~bk.eye(Nc, dtype=bool, device=data.device))
             ).any():
-                data_l1_modulus_square_rooted = data_l1.copy(empty=True)
-                data_l1_modulus_square_rooted.array = data_l1.array * (
-                    data_l1m[j3].array + 1e-8
-                ) ** (
-                    -0.5
-                )  # (Nb,Nc,L,N3)
+                data_l1_modulus_square_rooted = data_l1.divide(
+                    data_l1m[j3], epsilon=1e-8, pow=0.5, inplace=False
+                )  # [Nb,Nc,L,N3]
 
                 self.wavelet_op._compute_and_store_cross_cov(
                     data_l1_modulus_square_rooted,

@@ -256,6 +256,43 @@ def optimize_scattering_LBFGS(
 
 
 #######################################################################################
+# ------- Post-processing functions -------
+def apply_nyquist_filter(tensor):
+    """
+    Apply a low-pass filter to an input tensor, keeping only frequencies within the Nyquist radius.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        Input tensor in real space of shape (..., N, M) where N and M are the spatial dimensions
+
+    Returns
+    -------
+    torch.Tensor
+        Filtered tensor in real space of the same shape as input, with high frequencies removed
+    """
+
+    # Compute frequency grids
+    N, M = tensor.shape[-2:]
+    fx = N * torch.fft.fftfreq(N, d=1.0, device=tensor.device)
+    fy = M * torch.fft.fftfreq(M, d=1.0, device=tensor.device)
+    FX, FY = torch.meshgrid(fx, fy, indexing="ij")
+
+    # Create low-pass mask based on Nyquist radius
+    r2 = FX**2 + FY**2
+    nyquist_radius = min(N, M) / 2
+    mask = r2 <= nyquist_radius**2
+
+    # Apply mask in Fourier space
+    tensor_fft = torch.fft.fft2(tensor)
+    tensor_fft[..., ~mask] = 0
+
+    # Inverse Fourier transform to get the filtered tensor in real space
+    tensor_filtered = torch.fft.ifft2(tensor_fft).real
+
+    return tensor_filtered
+
+
 def synthesize_from_maps(
     data_target,
     pbc_running,
@@ -356,5 +393,7 @@ def synthesize_from_maps(
         mean_field=mean_field,
         **optim_params,
     )
+
+    u_opt = apply_nyquist_filter(u_opt)
 
     return u_opt
