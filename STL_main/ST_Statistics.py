@@ -514,20 +514,24 @@ class ST_Statistics:
         return self
 
     ########################################
-    def to_flatten(self, mask_st=None, mean_along_batch=False, keepnans=False):
+    def to_flatten(
+        self, keep_batch_dim=False, mask_st=None, mean_along_batch=False, keepnans=False
+    ):
         """
-        Produce a 1d array that can be used for loss constructions.
+        Produce either a 1d array that can be used for loss constructions or a 2d array, keeping the batch dimension, if keep_batch_dim is True.
 
         A mask can be used to select the coefficients from the initial 1d array.
 
         Parameters
         ----------
+        - keep_batch_dim : bool, default False
+            if True, the output will have shape [Nb, n_coeff] instead of [Nb * n_coeff]
         - mask_st : binary 1d array
             mask for st coefficients after initial flattening
 
         Output
         ----------
-        - st_flatten : 1d array
+        - st_flatten : 1d array if keep_batch_dim is False, else 2d array with shape [Nb, n_coeff]
 
         """
 
@@ -547,19 +551,36 @@ class ST_Statistics:
         flattened_list = []
         for S in stats:
             # S may contain NaNs → keep only non-NaNs
-            S_flat = S.reshape(-1)
-            flattened_list.append(S_flat if keepnans else S_flat[~bk.isnan(S_flat)])
+            S_flat = S.reshape(-1) if not keep_batch_dim else S.reshape(S.shape[0], -1)
+
+            # NaN removal incompatible with batch structure
+            if keep_batch_dim and not keepnans:
+                raise ValueError(
+                    "keep_batch_dim=True is incompatible with keepnans=False "
+                    "(cannot remove NaNs without breaking batch structure)."
+                )
+
+            flattened_list.append(S_flat[~bk.isnan(S_flat)] if not keepnans else S_flat)
 
         # Concatenate all statistics into a single 1D vector
-        st_flatten = bk.cat(flattened_list, dim=0)
+        st_flatten = (
+            bk.cat(flattened_list, dim=0)
+            if not keep_batch_dim
+            else bk.cat(flattened_list, dim=1)
+        )
 
         # Optional mask after nan-removal
         if mask_st is not None:
             mask_st = bk.as_tensor(mask_st, dtype=bk.bool, device=st_flatten.device)
-            if mask_st.numel() != st_flatten.numel():
+            if not keep_batch_dim and mask_st.numel() != st_flatten.numel():
                 raise ValueError(
                     f"mask_st length {mask_st.numel()} does not match "
                     f"flattened statistic length {st_flatten.numel()}."
+                )
+            elif keep_batch_dim and mask_st.shape != st_flatten.shape:
+                raise ValueError(
+                    f"mask_st shape {mask_st.shape} does not match expected "
+                    f"batch-preserving flattened statistic shape {st_flatten.shape}."
                 )
             st_flatten = st_flatten[mask_st]
 
