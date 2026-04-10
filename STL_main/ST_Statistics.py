@@ -515,7 +515,12 @@ class ST_Statistics:
 
     ########################################
     def to_flatten(
-        self, keep_batch_dim=False, mask_st=None, mean_along_batch=False, keepnans=False
+        self,
+        keep_batch_dim=False,
+        mask_st=None,
+        mean_along_batch=False,
+        keepnans=False,
+        flatten_complex=False,
     ):
         """
         Produce either a 1d array that can be used for loss constructions or a 2d array, keeping the batch dimension, if keep_batch_dim is True.
@@ -528,7 +533,9 @@ class ST_Statistics:
             if True, the output will have shape [Nb, n_coeff] instead of [Nb * n_coeff]
         - mask_st : binary 1d array
             mask for st coefficients after initial flattening
-
+        - flatten_complex : bool, default False
+            if True, complex coefficients will be flattened into two separate real numbers (real and imaginary parts).
+            Since S1, S2 and PS are real, their null imaginary part won't be included in the flattened statistics tensor.
         Output
         ----------
         - st_flatten : 1d array if keep_batch_dim is False, else 2d array with shape [Nb, n_coeff]
@@ -537,27 +544,37 @@ class ST_Statistics:
 
         # Collect all statistics into a list
         stats = [self.mean, self.var]  # Always include mean and variance
+        stats_names = ["mean", "var"]
 
         if self.SC == "ScatCov":
             stats += [self.S1, self.S2, self.S3, self.S4]
+            stats_names += ["S1", "S2", "S3", "S4"]
 
         if self.compute_PS:
             stats += [self.PS]
+            stats_names += ["PS"]
 
         if mean_along_batch:
             stats = [bk.mean(s, 0) for s in stats]
 
         # Flatten each, remove NaNs, concat
         flattened_list = []
-        for S in stats:
-            # S may contain NaNs → keep only non-NaNs
+        for S, S_name in zip(stats, stats_names):
+            if flatten_complex and bk.is_complex(S):
+
+                S = bk.view_as_real(
+                    S
+                )  # [..., 2] with last dimension for real and imag parts
+
+                if S_name in ["S1", "S2", "PS"]:
+                    S = S[..., 0]  # Keep only real part
+
             S_flat = S.reshape(-1) if not keep_batch_dim else S.reshape(S.shape[0], -1)
 
             # NaN removal incompatible with batch structure
             if keep_batch_dim and not keepnans:
                 raise ValueError(
-                    "keep_batch_dim=True is incompatible with keepnans=False "
-                    "(cannot remove NaNs without breaking batch structure)."
+                    "keepnans=False is not supported when keep_batch_dim=True, since it would flatten the batch dimension while removing NaNs."
                 )
 
             flattened_list.append(S_flat[~bk.isnan(S_flat)] if not keepnans else S_flat)
@@ -574,14 +591,15 @@ class ST_Statistics:
             mask_st = bk.as_tensor(mask_st, dtype=bk.bool, device=st_flatten.device)
             if not keep_batch_dim and mask_st.numel() != st_flatten.numel():
                 raise ValueError(
-                    f"mask_st length {mask_st.numel()} does not match "
-                    f"flattened statistic length {st_flatten.numel()}."
+                    f"mask_st length ({mask_st.numel()}) does not match "
+                    f"flattened statistic length ({st_flatten.numel()})."
                 )
-            elif keep_batch_dim and mask_st.shape != st_flatten.shape:
+
+            elif keep_batch_dim:
                 raise ValueError(
-                    f"mask_st shape {mask_st.shape} does not match expected "
-                    f"batch-preserving flattened statistic shape {st_flatten.shape}."
+                    "mask_st is not supported when keep_batch_dim=True, since it would flatten the batch dimension."
                 )
+
             st_flatten = st_flatten[mask_st]
 
         self.st_flatten = st_flatten
