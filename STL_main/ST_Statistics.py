@@ -571,13 +571,21 @@ class ST_Statistics:
 
             S_flat = S.reshape(-1) if not keep_batch_dim else S.reshape(S.shape[0], -1)
 
-            # NaN removal incompatible with batch structure
-            if keep_batch_dim and not keepnans:
-                raise ValueError(
-                    "keepnans=False is not supported when keep_batch_dim=True, since it would flatten the batch dimension while removing NaNs."
-                )
+            # Remove NaNs if specified
+            if not keepnans:
+                nan_mask = bk.isnan(S_flat)
 
-            flattened_list.append(S_flat[~bk.isnan(S_flat)] if not keepnans else S_flat)
+                if not keep_batch_dim:
+                    flattened_list.append(S_flat[~nan_mask])
+                else:
+                    # Check that all batch elements have NaNs in the same positions
+                    assert bk.all(nan_mask == nan_mask[0]), (
+                        "NaNs must be at the same indices across all batch elements "
+                        "when keep_batch_dim=True and keepnans=False"
+                    )
+                    flattened_list.append(S_flat[:, ~nan_mask[0]])
+            else:
+                flattened_list.append(S_flat)
 
         # Concatenate all statistics into a single 1D vector
         st_flatten = (
@@ -589,18 +597,21 @@ class ST_Statistics:
         # Optional mask after nan-removal
         if mask_st is not None:
             mask_st = bk.as_tensor(mask_st, dtype=bk.bool, device=st_flatten.device)
-            if not keep_batch_dim and mask_st.numel() != st_flatten.numel():
-                raise ValueError(
-                    f"mask_st length ({mask_st.numel()}) does not match "
-                    f"flattened statistic length ({st_flatten.numel()})."
-                )
 
-            elif keep_batch_dim:
-                raise ValueError(
-                    "mask_st is not supported when keep_batch_dim=True, since it would flatten the batch dimension."
-                )
+            if not keep_batch_dim:
+                if mask_st.numel() != st_flatten.numel():
+                    raise ValueError(
+                        f"mask_st length ({mask_st.numel()}) does not match "
+                        f"flattened statistic length ({st_flatten.numel()})."
+                    )
+                st_flatten = st_flatten[mask_st]
 
-            st_flatten = st_flatten[mask_st]
+            else:
+                assert bk.all(mask_st == mask_st[0]), (
+                    "mask_st must be identical across all batch elements "
+                    "when keep_batch_dim=True"
+                )
+                st_flatten = st_flatten[:, mask_st[0]]
 
         self.st_flatten = st_flatten
 
