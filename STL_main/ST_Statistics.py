@@ -83,15 +83,14 @@ class ST_Statistics:
     ########################################
     def __init__(
         self,
-        DT,
+        DataClass,
         N0,  ######################################## not used?
-        J,  ######################################## not used?
-        L,  ######################################## not used?
-        WType,  ######################################## not used?
-        SC,
         Nb,
         Nc,
         wavelet_op,
+        SC,
+        has_fewer_convolutions,
+        compute_cross_matrix,
         compute_PS,
     ):
         """
@@ -99,39 +98,37 @@ class ST_Statistics:
         """
 
         # Main parameters
-        self.DT = DT
+        self.DataClass = DataClass
         self.N0 = N0  ######################################## not used?
-
-        # Wavelet operator
-        self.wavelet_op = wavelet_op
+        self.Nb = Nb
+        self.Nc = Nc
 
         # Wavelet transform related parameters
         self.wavelet_op = wavelet_op
         self.J = self.wavelet_op.J
         self.L = self.wavelet_op.L
         self.WType = self.wavelet_op.WType
+        self.mask_full_res = self.wavelet_op.mask_full_res
 
         # Scattering transform related parameters
         self.SC = SC
+        self.S2_ref_sqrt_chan_diag = None
+        self.has_fewer_convolutions = has_fewer_convolutions
+        self.compute_cross_matrix = compute_cross_matrix
 
-        # Data related parameters
-        self.Nb = Nb
-        self.Nc = Nc
+        # Power spectrum computation
+        self.compute_PS = compute_PS
+        self.PS_ref_sqrt_chan_diag = None
 
         # Additional transform/compression related parameters. While put to
         # False/None for the initialization, their value are modified if these
         # methods are called by the scattering operator, or independently.
         self.norm = False
-        self.S2_ref_sqrt_chan_diag = None
         self.iso = False
         self.angular_ft = False
         self.scale_ft = False
         self.flatten = False
         self.mask_st = None  # Not used in flatten method for now
-
-        # Power spectrum computation
-        self.compute_PS = compute_PS
-        self.PS_ref_sqrt_chan_diag = None
 
     @staticmethod
     def _get_sqrt_chan_diag(stat_ref):

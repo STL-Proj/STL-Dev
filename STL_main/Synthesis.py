@@ -1,18 +1,17 @@
+# optimize_scattering_core
+# optimize_from_maps
+# optimize_from_stats
+
 import time
 
 import numpy as np
 import torch
-from torch import nn
+import torch.nn as nn
+from torch import device, nn
 from torch.optim import LBFGS
 
-# Suppose:
-# - DataClass is your data wrapper class (e.g. STL_2D_Kernel_Torch or STL_2D_FFT_Torch)
-# - st_op is an operator such that st_op.apply(DC).to_flatten()
-#   returns a 1D tensor of scattering coefficients.
-# - target.array is your reference map of shape (1,1,128,128)
-#   and target_stats is the corresponding scattering vector.
 
-
+# === Learnable field model ===
 class ScatteringMatchModel(nn.Module):
     def __init__(
         self,
@@ -20,88 +19,160 @@ class ScatteringMatchModel(nn.Module):
         DataClass,
         pbc,
         init_shape,
-        compute_cross_matrix,
-        compute_PS,
-        mean_field,
+        init_map,
         device,
         dtype,
+        has_fewer_convolutions,
+        compute_cross_matrix,
+        compute_PS,
+        keep_batch_dim,
+        mean_field,
     ):
         super().__init__()
+
+        # === Field configuration ===
         self.st_op = st_op
         self.DataClass = DataClass
         self.pbc = pbc
         self.init_shape = init_shape
-        self.mask_full_res = st_op.wavelet_op.mask_full_res
+        self.init_map = init_map
+        self.device = device
+        self.dtype = dtype
+
+        # === Stats configuration ===
+        self.has_fewer_convolutions = has_fewer_convolutions
         self.compute_cross_matrix = compute_cross_matrix
         self.compute_PS = compute_PS
+        self.keep_batch_dim = keep_batch_dim
         self.mean_field = mean_field
 
-        # Learnable field u
-        self.u = torch.randn(
-            init_shape, device=device, dtype=dtype
-        )  # WARNING: if filtered to match PS constraints in the future, think about sampling non PBC fields when asked!!!
-
-        # for security put large values which should raise abberant values if actually used
-        if self.mask_full_res is not None:
-            self.u[..., self.mask_full_res.array] = (
-                1e10  ##################################### IMPORTANT TO KEEP IN MIND
+        # === Initialize learnable field u ===
+        if self.init_map is None:
+            self.u = torch.randn(init_shape, device=device, dtype=dtype)
+        else:
+            self.u = (
+                torch.tensor(self.init_map)
+                .to(device=device, dtype=dtype)
+                .expand(init_shape)
             )
+
+        # === Apply mask constraints ===
+        self.mask_full_res = st_op.wavelet_op.mask_full_res
+        if self.mask_full_res is not None:
+            self.u[..., self.mask_full_res.array] = 1e10
 
         self.u.requires_grad_()
 
-        if False:  # self.mask_full_res is not None:
+        if self.mask_full_res is not None:
 
             def freeze_hook(grad):
                 return grad * (~self.mask_full_res.array)
 
             self.u.register_hook(freeze_hook)
+
             print(
                 "NaN detected in the running synthesis mask, the synthesis takes it into account"
             )
 
     def forward(self):
+        # === Build data class ===
         DC_u = self.DataClass(self.u, pbc=self.pbc)
+
+        # === Compute scattering statistics ===
         st_u = self.st_op.apply(
             DC_u,
+            has_fewer_convolutions=self.has_fewer_convolutions,
             compute_cross_matrix=self.compute_cross_matrix,
             compute_PS=self.compute_PS,
             norm="load_ref",
-            norm_batch_mean=self.mean_field,
         )
-        s_flat_u = st_u.to_flatten(mean_along_batch=self.mean_field, keepnans=True)
+
+        # === Flatten statistics ===
+        s_flat_u = st_u.to_flatten(
+            keep_batch_dim=self.keep_batch_dim,
+            mean_along_batch=self.mean_field,
+            keepnans=False,
+        )
+
         return s_flat_u
 
 
-def optimize_scattering_LBFGS(
+# === LBFGS optimization (low level)===
+def optimize_lbfgs(model, loss_fn, lr, max_iter, history_size, verbose, print_iter):
+    optimizer = LBFGS(
+        [model.u],
+        lr=lr,
+        max_iter=max_iter,
+        history_size=history_size,
+        line_search_fn="strong_wolfe",
+        tolerance_grad=1e-12,
+        tolerance_change=1e-15,
+    )
+
+    loss_history = []
+
+    def closure():
+        optimizer.zero_grad()
+
+        output = model()
+        loss = loss_fn(output)
+
+        loss.backward()
+        loss_history.append(loss.item())
+
+        if verbose and len(loss_history) % print_iter == 0:
+            print(f"[LBFGS] iter {len(loss_history)}, loss = {loss.item():.6e}")
+
+        return loss
+
+    start = time.perf_counter()
+    optimizer.step(closure)
+    end = time.perf_counter()
+
+    torch.cuda.empty_cache() if model.device.type == "cuda" else None
+
+    print(f"{len(loss_history)} iterations of synthesis.")
+    print(f"Execution time: {end - start:.3f} s")
+
+    u_opt = model.u.detach()
+
+    return u_opt
+
+
+# === Optimization function for synthesis from target maps (mild level) ===
+def optimize_from_maps(
     target,
     st_op_target,
     st_op_running,
     pbc_running=True,
     running_shape=None,
+    has_fewer_convolutions=False,
     compute_cross_matrix=None,
     compute_PS=False,
     nbatch=1,
     mean_field=True,
-    max_iter=100,
+    init_running=None,
     lr=1.0,
+    max_iter=100,
     history_size=50,
     print_iter=10,
     verbose=True,
     seed=None,
 ):
+    # Set random seed
+    torch.manual_seed(seed) if seed is not None else None
+
+    # ------- Set homogeneous configuration for device and dtype -------
     device = st_op_running.wavelet_op.device
     dtype = st_op_running.wavelet_op.dtype
     print("Running synthesis on device :", device, "dtype :", dtype)
 
-    torch.manual_seed(seed) if seed is not None else None
-
     if target.array.isnan().any():
         print("NaN detected in the target, the synthesis takes it into account")
 
-    target.array = target.array.to(
-        device=device, dtype=dtype
-    )  # dtype is now float64 on cuda but was previously float32, if it slows down your synthesis raise us this issue !!!!!
+    target.array = target.array.to(device=device, dtype=dtype)
 
+    # ------- Determine initial shape for u (from target) -------
     input_dim = target.array.ndim
 
     if input_dim == 2:
@@ -136,10 +207,9 @@ def optimize_scattering_LBFGS(
             "If mean_field is False, target and running batch sizes should match"
         )
 
-    # Reference scattering
     with torch.no_grad():
 
-        # Standardize target before computing stats
+        # ------- Standardize target -------
         l_target = target.copy(empty=False)
 
         l_target.array = l_target.array.reshape(target_shape)
@@ -147,8 +217,10 @@ def optimize_scattering_LBFGS(
             l_target, mean_field=mean_field, inplace=True
         )
 
+        # ------- Compute target stats -------
         target_stats = st_op_target.apply(
             l_target,
+            has_fewer_convolutions=has_fewer_convolutions,
             compute_cross_matrix=compute_cross_matrix,
             compute_PS=compute_PS,
             norm="store_ref",
@@ -160,85 +232,43 @@ def optimize_scattering_LBFGS(
     target_stats = target_stats[target_coeffs_mask]
     print("Synthesis on {:} ST coefficients".format(target_coeffs_mask.sum().item()))
 
-    # reference to running normalization
+    # ------- Transfer reference normalization from target to running operator -------
     st_op_running.S2_ref_sqrt_chan_diag = st_op_target.S2_ref_sqrt_chan_diag
     st_op_running.var_ref = st_op_target.var_ref
     if compute_PS:
         st_op_running.PS_ref_sqrt_chan_diag = st_op_target.PS_ref_sqrt_chan_diag
 
-    # Model with learnable u
+    # ------- Build model -------
     model = ScatteringMatchModel(
         st_op=st_op_running,
         DataClass=target.__class__,
         pbc=pbc_running,
         init_shape=init_shape,
+        init_map=init_running,
+        has_fewer_convolutions=has_fewer_convolutions,
         compute_cross_matrix=compute_cross_matrix,
         compute_PS=compute_PS,
+        keep_batch_dim=False,
         mean_field=mean_field,
         device=device,
         dtype=dtype,
     )
 
-    optimizer = LBFGS(
-        [model.u],
+    # ------- Launch optimization -------
+    loss_fn = lambda s_flat_u: ((s_flat_u - target_stats).abs() ** 2).sum()
+
+    u_opt = optimize_lbfgs(
+        model=model,
+        loss_fn=loss_fn,
         lr=lr,
-        max_iter=max_iter,  # <-- le nombre d'itérations internes LBFGS
+        max_iter=max_iter,
         history_size=history_size,
-        line_search_fn="strong_wolfe",
-        tolerance_grad=1e-12,
-        tolerance_change=1e-15,
+        verbose=verbose,
+        print_iter=print_iter,
     )
 
-    loss_history = []
-
-    def closure():
-        optimizer.zero_grad()
-        s_flat_u = model()  # forward pass (call model.forward())
-        # assert not torch.any(s_flat_u[target_coeffs_mask].isnan()) ####################### sanity check that can be removed
-        loss = ((s_flat_u[target_coeffs_mask] - target_stats).abs() ** 2).sum()
-        loss.backward()
-
-        if len(loss_history) < 2:
-            if False:  ####################### set to True to debug backprop
-                import matplotlib.pyplot as plt
-
-                plt.imshow(model.u[0, 0].detach().cpu().numpy()), plt.title(
-                    "running u"
-                ), plt.colorbar(), plt.show()
-                plt.imshow(model.u.grad[0, 0].cpu().numpy()), plt.title(
-                    "running u grad"
-                ), plt.colorbar(), plt.show()
-                plt.imshow(model.u.grad[0, 0].cpu().numpy() == 0), plt.title(
-                    "running u grad == 0"
-                ), plt.colorbar(), plt.show()
-
-        # assert model.u.grad.isnan().sum().cpu().item() == 0 ####################### sanity check that can be removed
-
-        # Log à chaque appel interne
-        loss_val = loss.item()
-        loss_history.append(loss_val)
-        if verbose:
-            if len(loss_history) % print_iter == 0:
-                print(f"[LBFGS] inner iter {len(loss_history)}, loss = {loss_val:.6e}")
-
-        return loss
-
-    start = time.perf_counter()
-    # Un seul appel : toutes les itérations LBFGS internes sont faites ici
-    optimizer.step(closure)
-    end = time.perf_counter()
-
-    print(
-        "{:} iterations of synthesis done with nbatch={:} and {:} ST coefficients".format(
-            len(loss_history), nbatch, target_coeffs_mask.sum().item()
-        )
-    )
-    print(f"Execution time: {end - start:.3f} s")
-
-    u_opt = model.u.detach()
-
-    # Unstandardize u_opt with the computed mean and std of the target
-    DC_u_opt = target.__class__(u_opt, pbc=pbc_running)
+    # ------- Post-process optimized u: unstandardize, apply mask constraints, reshape -------
+    DC_u_opt = target.__class__(array=u_opt, pbc=pbc_running)
     st_op_running.wavelet_op.unstandardize(
         DC_u_opt, mean=mean_target, std=std_target, inplace=True
     )
@@ -252,7 +282,106 @@ def optimize_scattering_LBFGS(
     if nbatch == 1:
         u_opt = u_opt[0]  # remove batch dim
 
-    return u_opt, loss_history
+    return u_opt
+
+
+# === Optimization function for synthesis from target stats (mild level) ===
+def optimize_from_stats(
+    target_stats,
+    st_op_running,
+    mean_target=None,
+    std_target=None,
+    pbc_running=True,
+    init_running=None,
+    lr=1.0,
+    max_iter=100,
+    history_size=50,
+    print_iter=10,
+    verbose=True,
+    seed=None,
+):
+    """
+    Notes:
+    - Since the loss function is computed on a per-map basis.
+        - The number of maps (Nb) to be synthesized must match the number of maps in the target statistics,
+        - mean_field (comparing averaged over batch dimension statistics to handle synthesis with different batch sizes) is not relevant anymore.
+    - Since statistics are already computed, one can not specify a running shape different from the target shape
+    """
+    # Set random seed
+    torch.manual_seed(seed) if seed is not None else None
+
+    # ------- Set homogeneous configuration for device and dtype -------
+    device = st_op_running.wavelet_op.device
+    dtype = st_op_running.wavelet_op.dtype
+    print("Running synthesis on device :", device, "dtype :", dtype)
+
+    target_stats_flat = target_stats.to_flatten(
+        keep_batch_dim=True, mean_along_batch=False
+    )  # [Nb, n_stats]
+    target_stats_flat = target_stats_flat.to(device=device, dtype=dtype)
+
+    # ------- Determine initial shape for u (from target stats) -------
+    Nb, Nc, N, M = target_stats.Nb, target_stats.Nc, *target_stats.N0
+    init_shape = (Nb, Nc, N, M)
+
+    print(f"Initial shape for u: {init_shape}")
+
+    # ------- Transfer reference normalization from target stats to running operator -------
+    # Those reference normalization attributes have been stored during normalisation of the target stats.
+    assert (
+        target_stats.S2_ref_sqrt_chan_diag is not None
+    ), "target_stats should be normalized to perform reference normalization attributes transfer"
+    st_op_running.S2_ref_sqrt_chan_diag = target_stats.S2_ref_sqrt_chan_diag
+    st_op_running.var_ref = target_stats.var_ref
+    if st_op_running.compute_PS:
+        st_op_running.PS_ref_sqrt_chan_diag = target_stats.PS_ref_sqrt_chan_diag
+
+    # ------- Build model -------
+    model = ScatteringMatchModel(
+        st_op=st_op_running,
+        DataClass=target_stats.DataClass,
+        pbc=pbc_running,
+        init_shape=init_shape,
+        init_map=init_running,
+        has_fewer_convolutions=target_stats.has_fewer_convolutions,
+        compute_cross_matrix=target_stats.compute_cross_matrix,
+        compute_PS=st_op_running.compute_PS,
+        keep_batch_dim=True,
+        mean_field=False,
+        device=device,
+        dtype=dtype,
+    )
+
+    # ------- Launch optimization -------
+    loss_fn = lambda s_flat_u: ((s_flat_u - target_stats_flat).abs() ** 2).sum() / Nb
+
+    u_opt = optimize_lbfgs(
+        model=model,
+        loss_fn=loss_fn,
+        lr=lr,
+        max_iter=max_iter,
+        history_size=history_size,
+        verbose=verbose,
+        print_iter=print_iter,
+    )
+
+    # ------- Post-process optimized u: unstandardize, apply mask constraints -------
+    if mean_target is not None and std_target is not None:
+        DC_u_opt = target_stats.DataClass(u_opt, pbc=pbc_running)
+        st_op_running.wavelet_op.unstandardize(
+            DC_u_opt, mean=mean_target, std=std_target, inplace=True
+        )
+        u_opt = DC_u_opt.array
+
+    if st_op_running.wavelet_op.mask_full_res is not None:
+        u_opt[..., st_op_running.wavelet_op.mask_full_res.array] = torch.nan
+
+    if Nc == 1:
+        u_opt = u_opt[:, 0, ...]  # remove channel dim
+    if Nb == 1:
+        u_opt = u_opt[0]  # remove batch dim
+
+    return u_opt
 
 
 #######################################################################################
@@ -293,12 +422,14 @@ def apply_nyquist_filter(tensor):
     return tensor_filtered
 
 
+# === User-friendly wrapper for synthesis from target maps (high level) ===
 def synthesize_from_maps(
     data_target,
     pbc_running,
     nbatch,
     running_shape=None,
     running_mask=None,
+    init_running=None,
     mean_field=True,
     compute_cross_matrix=None,
     has_fewer_convolutions=False,
@@ -357,8 +488,8 @@ def synthesize_from_maps(
 
     st_op_running = data_running.get_ST_op(
         J=J,
-        has_fewer_convolutions=has_fewer_convolutions,
         n_bins=n_bins,
+        has_fewer_convolutions=has_fewer_convolutions,
         replace_nan_value=None,
     )
 
@@ -381,16 +512,88 @@ def synthesize_from_maps(
     optim_params.update(optim_kwargs)
 
     # Run optimization
-    u_opt, _ = optimize_scattering_LBFGS(
+    u_opt = optimize_from_maps(
         target=data_target,
         st_op_target=st_op_target,
         st_op_running=st_op_running,
         running_shape=running_shape,
+        init_running=init_running,
         pbc_running=pbc_running,
+        has_fewer_convolutions=has_fewer_convolutions,
         compute_cross_matrix=compute_cross_matrix,
         compute_PS=compute_PS,
         nbatch=nbatch,
         mean_field=mean_field,
+        **optim_params,
+    )
+
+    u_opt = apply_nyquist_filter(u_opt)
+
+    return u_opt
+
+
+# === User-friendly wrapper for synthesis from target statistics (high level) ===
+def synthesize_from_stats(
+    target_stats,
+    pbc_running,
+    init_running=None,
+    running_mask=None,
+    mean_target=None,
+    std_target=None,
+    **optim_kwargs,
+):
+    """
+    notes
+        - Parameters such as `compute_cross_matrix` and `has_fewer_convolutions` are not specified as arguments of this wrapper,
+    but rather during the computation of the target statistics.
+    """
+    if running_mask is None:
+        array = (
+            np.zeros(target_stats.N0)
+            if target_stats.mask_full_res is None
+            else target_stats.mask_full_res.boolean()
+        )
+        data_running = target_stats.DataClass(array=array, pbc=pbc_running)
+    else:
+        if running_mask.shape != target_stats.N0:
+            raise ValueError("running_mask shape should match target_stats N0")
+        data_running = target_stats.DataClass(array=running_mask, pbc=pbc_running)
+
+    running_has_nan = data_running.array.isnan().any()
+
+    if not target_stats.compute_PS or running_has_nan:
+        print(
+            "⚠️ Warning: Power spectrum optimization is disabled because it is not implemented for NaN values in any dataclass"
+            " and/or because Power spectrum computation has not been included in target_stats.\n"
+        )
+
+        # Remove power spectrum from target_stats if not optimizable on the running side
+        if target_stats.compute_PS:
+            target_stats.compute_PS = False
+
+    compute_PS = target_stats.compute_PS and not running_has_nan
+
+    # Get scattering operator for running data
+    st_op_running = data_running.get_ST_op(
+        has_fewer_convolutions=target_stats.has_fewer_convolutions,
+        compute_PS=compute_PS,
+        replace_nan_value=None,
+    )
+
+    # Set default optimization parameters and update with user-provided values
+    optim_params = dict(
+        max_iter=50, lr=1.0, history_size=50, print_iter=10, verbose=True, seed=26
+    )
+    optim_params.update(optim_kwargs)
+
+    # Run optimization
+    u_opt = optimize_from_stats(
+        target_stats=target_stats,
+        st_op_running=st_op_running,
+        pbc_running=pbc_running,
+        init_running=init_running,
+        mean_target=mean_target,
+        std_target=std_target,
         **optim_params,
     )
 

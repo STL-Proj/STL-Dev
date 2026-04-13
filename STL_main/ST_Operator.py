@@ -387,15 +387,14 @@ class ST_Operator:
 
         # Create a ST_statistics instance
         data_st = ST_Statistics(
-            self.DT,
+            data.__class__,
             N0,
-            J,
-            L,
-            WType,
-            SC,
             Nb,
             Nc,
             self.wavelet_op,
+            SC,
+            has_fewer_convolutions,
+            compute_cross_matrix,
             compute_PS,
         )
 
