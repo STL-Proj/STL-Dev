@@ -109,6 +109,8 @@ class ST_Statistics:
         self.L = self.wavelet_op.L
         self.WType = self.wavelet_op.WType
         self.mask_full_res = self.wavelet_op.mask_full_res
+        self.device = self.wavelet_op.device
+        self.dtype = self.wavelet_op.dtype
 
         # Scattering transform related parameters
         self.SC = SC

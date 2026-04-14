@@ -144,14 +144,14 @@ def optimize_from_maps(
     target,
     st_op_target,
     st_op_running,
+    nbatch=1,
     pbc_running=True,
     running_shape=None,
+    init_running=None,
     has_fewer_convolutions=False,
     compute_cross_matrix=None,
     compute_PS=False,
-    nbatch=1,
     mean_field=True,
-    init_running=None,
     lr=1.0,
     max_iter=100,
     history_size=50,
@@ -425,14 +425,14 @@ def apply_nyquist_filter(tensor):
 # === User-friendly wrapper for synthesis from target maps (high level) ===
 def synthesize_from_maps(
     data_target,
-    pbc_running,
     nbatch,
+    pbc_running,
     running_shape=None,
-    running_mask=None,
     init_running=None,
-    mean_field=True,
-    compute_cross_matrix=None,
+    running_mask=None,
     has_fewer_convolutions=False,
+    compute_cross_matrix=None,
+    mean_field=True,
     **optim_kwargs,
 ):
     """
@@ -451,6 +451,9 @@ def synthesize_from_maps(
         Default is True. Default value allows one to perform synthesis between N target samples and M running samples (with N different from or
         equal to M) while matching statistics computed from the batch-averaged field.
 
+    Notes
+    -----
+    - Power Spectrum is optimized by default when possible (i.e. when no NaN values are present in the target and running data)
     """
 
     if running_mask is None:
@@ -483,7 +486,7 @@ def synthesize_from_maps(
 
     # Get scattering operators for target and running data with selected J
     st_op_target = data_target.get_ST_op(
-        J=J, has_fewer_convolutions=has_fewer_convolutions, n_bins=n_bins
+        J=J, n_bins=n_bins, has_fewer_convolutions=has_fewer_convolutions
     )
 
     st_op_running = data_running.get_ST_op(
@@ -516,18 +519,21 @@ def synthesize_from_maps(
         target=data_target,
         st_op_target=st_op_target,
         st_op_running=st_op_running,
+        nbatch=nbatch,
+        pbc_running=pbc_running,
         running_shape=running_shape,
         init_running=init_running,
-        pbc_running=pbc_running,
+        mean_field=mean_field,
         has_fewer_convolutions=has_fewer_convolutions,
         compute_cross_matrix=compute_cross_matrix,
         compute_PS=compute_PS,
-        nbatch=nbatch,
-        mean_field=mean_field,
         **optim_params,
     )
 
-    u_opt = apply_nyquist_filter(u_opt)
+    if u_opt.isnan().any():
+        print("NaN detected in the optimized field, cannot apply Nyquist filter")
+    else:
+        u_opt = apply_nyquist_filter(u_opt)
 
     return u_opt
 
@@ -548,11 +554,12 @@ def synthesize_from_stats(
     but rather during the computation of the target statistics.
     """
     if running_mask is None:
-        array = (
-            np.zeros(target_stats.N0)
-            if target_stats.mask_full_res is None
-            else target_stats.mask_full_res.boolean()
-        )
+        if target_stats.mask_full_res is None:
+            array = np.zeros(target_stats.N0)
+        else:
+            array = torch.where(target_stats.mask_full_res.array, torch.nan, 0.0)
+        array = array.to(device=target_stats.device, dtype=target_stats.dtype)
+
         data_running = target_stats.DataClass(array=array, pbc=pbc_running)
     else:
         if running_mask.shape != target_stats.N0:
@@ -597,6 +604,9 @@ def synthesize_from_stats(
         **optim_params,
     )
 
-    u_opt = apply_nyquist_filter(u_opt)
+    if u_opt.isnan().any():
+        print("NaN detected in the optimized field, cannot apply Nyquist filter")
+    else:
+        u_opt = apply_nyquist_filter(u_opt)
 
     return u_opt

@@ -802,7 +802,7 @@ class WaveletOperator2Dkernel_torch:
 
         mean = self.mean(l_data)  # [Nb,Nc]
         if mean_field:
-            mean = mean.mean(dim=0)  # [Nc]
+            mean = mean.mean(dim=0, keepdim=True)  # [1,Nc]
 
         l_data.array = (
             l_data.array - mean[..., None, None]
@@ -810,7 +810,7 @@ class WaveletOperator2Dkernel_torch:
 
         var = self.cov(l_data, l_data)
         if mean_field:
-            var = var.mean(dim=0)  # [Nc]
+            var = var.mean(dim=0, keepdim=True)  # [1,Nc]
 
         std = torch.sqrt(var)
 
