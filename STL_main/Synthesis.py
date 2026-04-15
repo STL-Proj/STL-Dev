@@ -165,12 +165,10 @@ def optimize_from_maps(
     # ------- Set homogeneous configuration for device and dtype -------
     device = st_op_running.wavelet_op.device
     dtype = st_op_running.wavelet_op.dtype
-    print("Running synthesis on device :", device, "dtype :", dtype)
+    print("Running synthesis on device:", device, "dtype:", dtype)
 
     if target.array.isnan().any():
         print("NaN detected in the target, the synthesis takes it into account")
-
-    target.array = target.array.to(device=device, dtype=dtype)
 
     # ------- Determine initial shape for u (from target) -------
     input_dim = target.array.ndim
@@ -313,7 +311,7 @@ def optimize_from_stats(
     # ------- Set homogeneous configuration for device and dtype -------
     device = st_op_running.wavelet_op.device
     dtype = st_op_running.wavelet_op.dtype
-    print("Running synthesis on device :", device, "dtype :", dtype)
+    print("Running synthesis on device:", device, "dtype:", dtype)
 
     target_stats_flat = target_stats.to_flatten(
         keep_batch_dim=True, mean_along_batch=False
@@ -453,7 +451,11 @@ def synthesize_from_maps(
 
     Notes
     -----
-    - Power Spectrum is optimized by default when possible (i.e. when no NaN values are present in the target and running data)
+    -   The Power Spectrum is optimized by default whenever possible (i.e., when no NaN values are present in either the target or the running data).
+
+    -   Within this user-level wrapper, an ST operator is created for both the target and the running map, and then passed to the mid-level wrapper.
+        This is particularly useful for syntheses involving NaN values, as it allows the use of two distinct masks: one for the target and one for the running map.
+        For other types of syntheses, the same ST operator is used for both.
     """
 
     if running_mask is None:
@@ -510,7 +512,7 @@ def synthesize_from_maps(
 
     # Set default optimization parameters and update with user-provided values
     optim_params = dict(
-        max_iter=50, lr=1.0, history_size=50, print_iter=10, verbose=True, seed=26
+        max_iter=100, lr=1.0, history_size=50, print_iter=10, verbose=True, seed=26
     )
     optim_params.update(optim_kwargs)
 
@@ -555,7 +557,7 @@ def synthesize_from_stats(
     """
     if running_mask is None:
         if target_stats.mask_full_res is None:
-            array = np.zeros(target_stats.N0)
+            array = torch.zeros(target_stats.N0)
         else:
             array = torch.where(target_stats.mask_full_res.array, torch.nan, 0.0)
         array = array.to(device=target_stats.device, dtype=target_stats.dtype)
@@ -589,7 +591,7 @@ def synthesize_from_stats(
 
     # Set default optimization parameters and update with user-provided values
     optim_params = dict(
-        max_iter=50, lr=1.0, history_size=50, print_iter=10, verbose=True, seed=26
+        max_iter=100, lr=1.0, history_size=50, print_iter=10, verbose=True, seed=26
     )
     optim_params.update(optim_kwargs)
 
