@@ -220,6 +220,7 @@ class ST_Operator:
     def apply(
         self,
         data,
+        precomputed_W_data=False,
         SC=None,
         has_fewer_convolutions=None,
         norm=None,
@@ -256,8 +257,11 @@ class ST_Operator:
         Parameters
         ----------
         # Data
-        - data : StlData with MR=False, dim (N) or (Nc, N) or (Nb, Nc, N)
-            data, Nc number of channel, Nb batch size. Should have dg=0.
+        data : StlData or Dict of StlData
+            - If precomputed_W_data=False : StlData raw data
+            - If precomputed_W_data=True  : Dictionary with integer keys/scale j in [0, J-1] and values StlData wavelet transform at resolution j_to_dg[j]
+        - precomputed_W_data : bool, default False
+            If True, data refers to precomputed wavelet transform dictionary W_data instead of raw data.
 
         # Scattering Transform
         - SC : str
@@ -324,6 +328,19 @@ class ST_Operator:
         L = self.L
         WType = self.wavelet_op.WType
 
+        # Optional precomputed first-order wavelet transform dictionary W_data
+        if precomputed_W_data:
+            if not isinstance(data, dict):
+                raise TypeError(
+                    "data must be a dictionary if precomputed_W_data is True."
+                )
+            if len(data) != J:
+                raise ValueError(f"data must have {J} keys/scales.")
+            for j in range(J):
+                if j not in data:
+                    raise ValueError(f"Scale {j} is missing in data.")
+            W_data = data
+
         # Local value for the scattering transform parameters
         SC = self.SC if SC is None else SC
         has_fewer_convolutions = (
@@ -358,7 +375,11 @@ class ST_Operator:
         flatten = self.flatten if flatten is None else flatten
         mask_st = self.mask_st if mask_st is None else mask_st
 
-        compute_PS = self.compute_PS if compute_PS is None else compute_PS
+        if precomputed_W_data:  # If W_data is provided, PS is not computed
+            compute_PS = False if compute_PS is None else compute_PS
+        else:
+            compute_PS = self.compute_PS if compute_PS is None else compute_PS
+
         PS_ref_sqrt_chan_diag = (
             self.PS_ref_sqrt_chan_diag
             if PS_ref_sqrt_chan_diag is None
@@ -400,7 +421,10 @@ class ST_Operator:
 
         # Initialize ST statistics values
         # Add readability w.r.t. having it in the ST statistics initilization
-        l_data = data.copy()
+        if not precomputed_W_data:
+            l_data = data.copy()
+        else:
+            l_W_data = {j: data[j].copy() for j in range(J)}
 
         # Systematic statistics (data supposed to be real)
         assert (
@@ -466,7 +490,10 @@ class ST_Operator:
 
         for j3 in range(J):
             # Compute first convolution and modulus
-            data_l1 = self.wavelet_op.apply(l_data, j=j3)  # (Nb,Nc,L,N3)
+            if precomputed_W_data:
+                data_l1 = l_W_data[j3]
+            else:
+                data_l1 = self.wavelet_op.apply(l_data, j=j3)  # (Nb,Nc,L,N3)
             data_l1m[j3] = data_l1.modulus(inplace=False)  # (Nb,Nc,L,N3)
 
             if False and self.wavelet_op.mask_full_res is not None:
@@ -608,12 +635,13 @@ class ST_Operator:
             # Downsample at Nj3
             if j3 < J - 1:
 
-                self.wavelet_op.downsample(
-                    data=l_data,
-                    dg_out=self.wavelet_op.j_to_dg[j3 + 1],
-                    inplace=True,
-                    replace_nan_value=self.replace_nan_value,
-                )  # (Nb,Nc,j3+1,L,N3)
+                if not precomputed_W_data:
+                    self.wavelet_op.downsample(
+                        data=l_data,
+                        dg_out=self.wavelet_op.j_to_dg[j3 + 1],
+                        inplace=True,
+                        replace_nan_value=self.replace_nan_value,
+                    )  # (Nb,Nc,j3+1,L,N3)
 
                 for j2 in range(j3 + 1):
                     self.wavelet_op.downsample(
