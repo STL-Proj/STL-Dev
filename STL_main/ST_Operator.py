@@ -257,9 +257,9 @@ class ST_Operator:
         Parameters
         ----------
         # Data
-        data : StlData or Dict of StlData
+        data : StlData or or tuple (StlData, Dict of StlData)
             - If precomputed_W_data=False : StlData raw data
-            - If precomputed_W_data=True  : Dictionary with integer keys/scale j in [0, J-1] and values StlData wavelet transform at resolution j_to_dg[j]
+            - If precomputed_W_data=True  : Tuple of StlData raw data and Dictionary with integer keys/scale j in [0, J-1] and values StlData wavelet transform at resolution j_to_dg[j]
         - precomputed_W_data : bool, default False
             If True, data refers to precomputed wavelet transform dictionary W_data instead of raw data.
 
@@ -323,23 +323,22 @@ class ST_Operator:
         #     )
 
         # Local value for the wavelet transform parameters
+        if precomputed_W_data:
+            data, W_data = data  # unpack data tuple
         N0 = data.N0
         J = self.J
         L = self.L
         WType = self.wavelet_op.WType
 
-        # Optional precomputed first-order wavelet transform dictionary W_data
+        # checks for first-order wavelet transform dictionary W_data
         if precomputed_W_data:
-            if not isinstance(data, dict):
+            if not isinstance(W_data, dict):
                 raise TypeError(
-                    "data must be a dictionary if precomputed_W_data is True."
+                    "W_data must be a dictionary if precomputed_W_data is True."
                 )
-            if len(data) != J:
-                raise ValueError(f"data must have {J} keys/scales.")
             for j in range(J):
-                if j not in data:
-                    raise ValueError(f"Scale {j} is missing in data.")
-            W_data = data
+                if j not in W_data:
+                    raise ValueError(f"Scale {j} is missing in W_data.")
 
         # Local value for the scattering transform parameters
         SC = self.SC if SC is None else SC
@@ -374,11 +373,8 @@ class ST_Operator:
         scale_ft = self.scale_ft if scale_ft is None else scale_ft
         flatten = self.flatten if flatten is None else flatten
         mask_st = self.mask_st if mask_st is None else mask_st
-
-        if precomputed_W_data:  # If W_data is provided, PS is not computed
-            compute_PS = False if compute_PS is None else compute_PS
-        else:
-            compute_PS = self.compute_PS if compute_PS is None else compute_PS
+        compute_PS = False if compute_PS is None else compute_PS
+        compute_PS = self.compute_PS if compute_PS is None else compute_PS
 
         PS_ref_sqrt_chan_diag = (
             self.PS_ref_sqrt_chan_diag
@@ -421,10 +417,9 @@ class ST_Operator:
 
         # Initialize ST statistics values
         # Add readability w.r.t. having it in the ST statistics initilization
-        if not precomputed_W_data:
-            l_data = data.copy()
-        else:
-            l_W_data = {j: data[j].copy() for j in range(J)}
+        l_data = data.copy()
+        if precomputed_W_data:
+            l_W_data = {j: W_data[j].copy() for j in range(J)}
 
         # Systematic statistics (data supposed to be real)
         assert (
@@ -494,6 +489,7 @@ class ST_Operator:
                 data_l1 = l_W_data[j3]
             else:
                 data_l1 = self.wavelet_op.apply(l_data, j=j3)  # (Nb,Nc,L,N3)
+
             data_l1m[j3] = data_l1.modulus(inplace=False)  # (Nb,Nc,L,N3)
 
             if False and self.wavelet_op.mask_full_res is not None:

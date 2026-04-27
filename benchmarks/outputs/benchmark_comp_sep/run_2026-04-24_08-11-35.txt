@@ -1,0 +1,226 @@
+2026-04-24T08:11:37+02:00
+Running benchmark_comp_sep.py
+Run on (36 X 2600 MHz CPU s)
+CPU Caches:
+  L1 Data 32 KiB (x36)
+  L1 Instruction 32 KiB (x36)
+  L2 Unified 1024 KiB (x36)
+  L3 Unified 25344 KiB (x2)
+Load Average: 1.02, 0.50, 0.22
+------------------------------------------------------------------------------------------------------------------------------
+Benchmark                                              Time             CPU   Iterations     Memory Time_per_contamination_map
+------------------------------------------------------------------------------------------------------------------------------
+Kernel_Baseline/10/manual_time                      25.4 s          9.79 s             1   2.68758G                   2.53797s
+Kernel_Baseline/10/manual_time                      25.6 s          9.96 s             1   2.68758G                   2.55852s
+Kernel_Baseline/10/manual_time                      25.7 s          10.1 s             1   2.68758G                   2.57353s
+Kernel_Baseline/10/manual_time_mean                 25.6 s          9.94 s             3   2.68758G                   2.55667s
+Kernel_Baseline/10/manual_time_median               25.6 s          9.96 s             3   2.68758G                   2.55852s
+Kernel_Baseline/10/manual_time_stddev              0.178 s         0.144 s             3          0                 0.0178498s
+Kernel_Baseline/10/manual_time_cv                   0.70 %          1.45 %             3      0.00%                      0.70%
+Kernel_Baseline/20/manual_time                      37.9 s          12.8 s             1    5.3705G                   1.89346s
+Kernel_Baseline/20/manual_time                      38.2 s          13.1 s             1    5.3705G                   1.90758s
+Kernel_Baseline/20/manual_time                      37.9 s          12.8 s             1    5.3705G                   1.89274s
+Kernel_Baseline/20/manual_time_mean                 38.0 s          12.9 s             3    5.3705G                   1.89793s
+Kernel_Baseline/20/manual_time_median               37.9 s          12.8 s             3    5.3705G                   1.89346s
+Kernel_Baseline/20/manual_time_stddev              0.167 s         0.179 s             3          0                  8.36726ms
+Kernel_Baseline/20/manual_time_cv                   0.44 %          1.39 %             3      0.00%                      0.44%
+Kernel_Baseline/50/manual_time                      76.4 s          21.4 s             1   13.4159G                    1.5276s
+Kernel_Baseline/50/manual_time                      77.0 s          21.9 s             1   13.4159G                   1.54005s
+Kernel_Baseline/50/manual_time                      76.9 s          21.9 s             1   13.4159G                   1.53829s
+Kernel_Baseline/50/manual_time_mean                 76.8 s          21.8 s             3   13.4159G                   1.53532s
+Kernel_Baseline/50/manual_time_median               76.9 s          21.9 s             3   13.4159G                   1.53829s
+Kernel_Baseline/50/manual_time_stddev              0.337 s         0.298 s             3          0                  6.73924ms
+Kernel_Baseline/50/manual_time_cv                   0.44 %          1.37 %             3      0.00%                      0.44%
+Kernel_Baseline/80/manual_time                       117 s          30.9 s             1   21.4629G                   1.46059s
+Kernel_Baseline/80/manual_time                       117 s          30.7 s             1   21.4629G                   1.45794s
+Kernel_Baseline/80/manual_time                       117 s          30.7 s             1   21.4629G                   1.45776s
+Kernel_Baseline/80/manual_time_mean                  117 s          30.8 s             3   21.4629G                   1.45876s
+Kernel_Baseline/80/manual_time_median                117 s          30.7 s             3   21.4629G                   1.45794s
+Kernel_Baseline/80/manual_time_stddev              0.127 s         0.127 s             3          0                  1.58209ms
+Kernel_Baseline/80/manual_time_cv                   0.11 %          0.41 %             3      0.00%                      0.11%
+----------------------------------------------------------------------------------------
+Benchmark                                              Time             CPU   Iterations
+----------------------------------------------------------------------------------------
+Kernel_Baseline/manual_time_BigO                    1.51 N          0.42 N    
+Kernel_Baseline/manual_time_RMS                       11 %            21 %    
+------------------------------------------------------------------------------------------------------------------------------
+Benchmark                                              Time             CPU   Iterations     Memory Time_per_contamination_map
+------------------------------------------------------------------------------------------------------------------------------
+Kernel_Precomp_Wavelets/10/manual_time              25.4 s          9.75 s             1   2.89927G                   2.53794s
+Kernel_Precomp_Wavelets/10/manual_time              25.5 s          9.86 s             1   2.89927G                   2.54772s
+Kernel_Precomp_Wavelets/10/manual_time              25.4 s          9.77 s             1   2.89927G                   2.53925s
+Kernel_Precomp_Wavelets/10/manual_time_mean         25.4 s          9.79 s             3   2.89927G                   2.54164s
+Kernel_Precomp_Wavelets/10/manual_time_median       25.4 s          9.77 s             3   2.89927G                   2.53925s
+Kernel_Precomp_Wavelets/10/manual_time_stddev      0.053 s         0.062 s             3          0                  5.31012ms
+Kernel_Precomp_Wavelets/10/manual_time_cv           0.21 %          0.63 %             3      0.00%                      0.21%
+Kernel_Precomp_Wavelets/20/manual_time              37.1 s          12.3 s             1   5.77392G                   1.85381s
+Kernel_Precomp_Wavelets/20/manual_time              37.2 s          12.3 s             1   5.77392G                   1.85782s
+Kernel_Precomp_Wavelets/20/manual_time              37.0 s          12.3 s             1   5.77392G                   1.85226s
+Kernel_Precomp_Wavelets/20/manual_time_mean         37.1 s          12.3 s             3   5.77392G                   1.85463s
+Kernel_Precomp_Wavelets/20/manual_time_median       37.1 s          12.3 s             3   5.77392G                   1.85381s
+Kernel_Precomp_Wavelets/20/manual_time_stddev      0.057 s         0.023 s             3          0                  2.87252ms
+Kernel_Precomp_Wavelets/20/manual_time_cv           0.15 %          0.18 %             3      0.00%                      0.15%
+Kernel_Precomp_Wavelets/50/manual_time              73.1 s          19.8 s             1   14.4017G                   1.46138s
+Kernel_Precomp_Wavelets/50/manual_time              73.0 s          19.7 s             1   14.4017G                   1.45907s
+Kernel_Precomp_Wavelets/50/manual_time              72.8 s          19.5 s             1   14.4017G                   1.45585s
+Kernel_Precomp_Wavelets/50/manual_time_mean         72.9 s          19.7 s             3   14.4017G                   1.45876s
+Kernel_Precomp_Wavelets/50/manual_time_median       73.0 s          19.7 s             3   14.4017G                   1.45907s
+Kernel_Precomp_Wavelets/50/manual_time_stddev      0.139 s         0.117 s             3          0                  2.77823ms
+Kernel_Precomp_Wavelets/50/manual_time_cv           0.19 %          0.60 %             3      0.00%                      0.19%
+Kernel_Precomp_Wavelets/80/manual_time               110 s          27.4 s             1   23.0284G                   1.37846s
+Kernel_Precomp_Wavelets/80/manual_time               111 s          27.6 s             1   23.0284G                   1.38153s
+Kernel_Precomp_Wavelets/80/manual_time               110 s          27.3 s             1   23.0284G                   1.37787s
+Kernel_Precomp_Wavelets/80/manual_time_mean          110 s          27.4 s             3   23.0284G                   1.37929s
+Kernel_Precomp_Wavelets/80/manual_time_median        110 s          27.4 s             3   23.0284G                   1.37846s
+Kernel_Precomp_Wavelets/80/manual_time_stddev      0.157 s         0.144 s             3          0                  1.96153ms
+Kernel_Precomp_Wavelets/80/manual_time_cv           0.14 %          0.53 %             3      0.00%                      0.14%
+----------------------------------------------------------------------------------------
+Benchmark                                              Time             CPU   Iterations
+----------------------------------------------------------------------------------------
+Kernel_Precomp_Wavelets/manual_time_BigO            1.43 N          0.37 N    
+Kernel_Precomp_Wavelets/manual_time_RMS               12 %            24 %    
+------------------------------------------------------------------------------------------------------------------------------
+Benchmark                                              Time             CPU   Iterations     Memory Time_per_contamination_map
+------------------------------------------------------------------------------------------------------------------------------
+FFT_Baseline/10/manual_time                         23.7 s          9.33 s             1   2.33855G                   2.37011s
+FFT_Baseline/10/manual_time                         23.8 s          9.42 s             1   2.33855G                   2.38485s
+FFT_Baseline/10/manual_time                         22.9 s          9.00 s             1   2.33855G                   2.28966s
+FFT_Baseline/10/manual_time_mean                    23.5 s          9.25 s             3   2.33855G                   2.34821s
+FFT_Baseline/10/manual_time_median                  23.7 s          9.33 s             3   2.33855G                   2.37011s
+FFT_Baseline/10/manual_time_stddev                 0.512 s         0.223 s             3          0                 0.0512357s
+FFT_Baseline/10/manual_time_cv                      2.18 %          2.41 %             3      0.00%                      2.18%
+FFT_Baseline/20/manual_time                         34.0 s          11.6 s             1   4.66486G                   1.69795s
+FFT_Baseline/20/manual_time                         34.9 s          11.8 s             1   4.66486G                   1.74563s
+FFT_Baseline/20/manual_time                         35.1 s          11.9 s             1   4.66486G                    1.7541s
+FFT_Baseline/20/manual_time_mean                    34.7 s          11.8 s             3   4.66486G                   1.73256s
+FFT_Baseline/20/manual_time_median                  34.9 s          11.8 s             3   4.66486G                   1.74563s
+FFT_Baseline/20/manual_time_stddev                 0.605 s         0.161 s             3          0                 0.0302678s
+FFT_Baseline/20/manual_time_cv                      1.75 %          1.36 %             3      0.00%                      1.75%
+FFT_Baseline/50/manual_time                         70.1 s          19.6 s             1   11.6417G                   1.40237s
+FFT_Baseline/50/manual_time                         72.9 s          20.7 s             1   11.6417G                    1.4586s
+FFT_Baseline/50/manual_time                         72.7 s          20.5 s             1   11.6417G                   1.45338s
+FFT_Baseline/50/manual_time_mean                    71.9 s          20.3 s             3   11.6417G                   1.43812s
+FFT_Baseline/50/manual_time_median                  72.7 s          20.5 s             3   11.6417G                   1.45338s
+FFT_Baseline/50/manual_time_stddev                  1.55 s         0.576 s             3          0                 0.0310663s
+FFT_Baseline/50/manual_time_cv                      2.16 %          2.84 %             3      0.00%                      2.16%
+FFT_Baseline/80/manual_time                          111 s          28.9 s             1   18.6196G                   1.39058s
+FFT_Baseline/80/manual_time                          111 s          28.9 s             1   18.6196G                   1.39091s
+FFT_Baseline/80/manual_time                          111 s          28.9 s             1   18.6196G                    1.3903s
+FFT_Baseline/80/manual_time_mean                     111 s          28.9 s             3   18.6196G                    1.3906s
+FFT_Baseline/80/manual_time_median                   111 s          28.9 s             3   18.6196G                   1.39058s
+FFT_Baseline/80/manual_time_stddev                 0.024 s         0.021 s             3          0                  305.192us
+FFT_Baseline/80/manual_time_cv                      0.02 %          0.07 %             3      0.00%                      0.02%
+----------------------------------------------------------------------------------------
+Benchmark                                              Time             CPU   Iterations
+----------------------------------------------------------------------------------------
+FFT_Baseline/manual_time_BigO                       1.43 N          0.39 N    
+FFT_Baseline/manual_time_RMS                          10 %            20 %    
+------------------------------------------------------------------------------------------------------------------------------
+Benchmark                                              Time             CPU   Iterations     Memory Time_per_contamination_map
+------------------------------------------------------------------------------------------------------------------------------
+FFT_Precomp_Wavelets/10/manual_time                 24.0 s          9.63 s             1   3.35982G                   2.40345s
+FFT_Precomp_Wavelets/10/manual_time                 24.7 s          9.76 s             1   3.35982G                   2.46551s
+FFT_Precomp_Wavelets/10/manual_time                 24.7 s          9.52 s             1   3.35982G                   2.47269s
+FFT_Precomp_Wavelets/10/manual_time_mean            24.5 s          9.64 s             3   3.35982G                   2.44722s
+FFT_Precomp_Wavelets/10/manual_time_median          24.7 s          9.63 s             3   3.35982G                   2.46551s
+FFT_Precomp_Wavelets/10/manual_time_stddev         0.381 s         0.119 s             3          0                 0.0380698s
+FFT_Precomp_Wavelets/10/manual_time_cv              1.56 %          1.24 %             3      0.00%                      1.56%
+FFT_Precomp_Wavelets/20/manual_time                 34.8 s          12.0 s             1   6.70668G                   1.74199s
+FFT_Precomp_Wavelets/20/manual_time                 36.0 s          12.5 s             1   6.70668G                   1.80059s
+FFT_Precomp_Wavelets/20/manual_time                 35.8 s          12.3 s             1   6.70668G                   1.79219s
+FFT_Precomp_Wavelets/20/manual_time_mean            35.6 s          12.3 s             3   6.70668G                   1.77825s
+FFT_Precomp_Wavelets/20/manual_time_median          35.8 s          12.3 s             3   6.70668G                   1.79219s
+FFT_Precomp_Wavelets/20/manual_time_stddev         0.634 s         0.228 s             3          0                 0.0316837s
+FFT_Precomp_Wavelets/20/manual_time_cv              1.78 %          1.86 %             3      0.00%                      1.78%
+FFT_Precomp_Wavelets/50/manual_time                 69.9 s          19.5 s             1    16.747G                   1.39882s
+FFT_Precomp_Wavelets/50/manual_time                 72.2 s          20.1 s             1    16.747G                   1.44311s
+FFT_Precomp_Wavelets/50/manual_time                 73.3 s          20.3 s             1    16.747G                   1.46697s
+FFT_Precomp_Wavelets/50/manual_time_mean            71.8 s          20.0 s             3    16.747G                    1.4363s
+FFT_Precomp_Wavelets/50/manual_time_median          72.2 s          20.1 s             3    16.747G                   1.44311s
+FFT_Precomp_Wavelets/50/manual_time_stddev          1.73 s         0.385 s             3          0                 0.0345813s
+FFT_Precomp_Wavelets/50/manual_time_cv              2.41 %          1.93 %             3      0.00%                      2.41%
+FFT_Precomp_Wavelets/80/manual_time                  111 s          28.7 s             1   26.7853G                   1.38814s
+FFT_Precomp_Wavelets/80/manual_time                  112 s          28.5 s             1   26.7853G                   1.39762s
+FFT_Precomp_Wavelets/80/manual_time                  112 s          28.5 s             1   26.7853G                   1.39845s
+FFT_Precomp_Wavelets/80/manual_time_mean             112 s          28.5 s             3   26.7853G                   1.39474s
+FFT_Precomp_Wavelets/80/manual_time_median           112 s          28.5 s             3   26.7853G                   1.39762s
+FFT_Precomp_Wavelets/80/manual_time_stddev         0.458 s         0.093 s             3          0                  5.72807ms
+FFT_Precomp_Wavelets/80/manual_time_cv              0.41 %          0.33 %             3      0.00%                      0.41%
+----------------------------------------------------------------------------------------
+Benchmark                                              Time             CPU   Iterations
+----------------------------------------------------------------------------------------
+FFT_Precomp_Wavelets/manual_time_BigO               1.43 N          0.39 N    
+FFT_Precomp_Wavelets/manual_time_RMS                  10 %            22 %    
+--------------------------------------------------------------------------------------------------------------------------
+Benchmark                                          Time             CPU   Iterations     Memory Time_per_contamination_map
+--------------------------------------------------------------------------------------------------------------------------
+Kernel_Biais_Method/10/manual_time              15.8 s          7.82 s             1   879.092M                   1.58241s
+Kernel_Biais_Method/10/manual_time              16.2 s          7.94 s             1   879.092M                   1.61589s
+Kernel_Biais_Method/10/manual_time              15.4 s          7.67 s             1   879.092M                   1.54474s
+Kernel_Biais_Method/10/manual_time_mean         15.8 s          7.81 s             3   879.092M                   1.58101s
+Kernel_Biais_Method/10/manual_time_median       15.8 s          7.82 s             3   879.092M                   1.58241s
+Kernel_Biais_Method/10/manual_time_stddev      0.356 s         0.139 s             3          0                  0.035596s
+Kernel_Biais_Method/10/manual_time_cv           2.25 %          1.78 %             3      0.00%                      2.25%
+Kernel_Biais_Method/20/manual_time              15.9 s          7.94 s             1   1.74868G                  0.796733s
+Kernel_Biais_Method/20/manual_time              15.3 s          7.77 s             1   1.74868G                  0.765923s
+Kernel_Biais_Method/20/manual_time              15.2 s          7.64 s             1   1.74868G                  0.758837s
+Kernel_Biais_Method/20/manual_time_mean         15.5 s          7.78 s             3   1.74868G                  0.773831s
+Kernel_Biais_Method/20/manual_time_median       15.3 s          7.77 s             3   1.74868G                  0.765923s
+Kernel_Biais_Method/20/manual_time_stddev      0.403 s         0.149 s             3          0                 0.0201478s
+Kernel_Biais_Method/20/manual_time_cv           2.60 %          1.92 %             3      0.00%                      2.60%
+Kernel_Biais_Method/50/manual_time              16.3 s          8.35 s             1   4.36058G                  0.326419s
+Kernel_Biais_Method/50/manual_time              15.6 s          8.10 s             1   4.36058G                   0.31255s
+Kernel_Biais_Method/50/manual_time              15.6 s          8.10 s             1   4.36058G                  0.312292s
+Kernel_Biais_Method/50/manual_time_mean         15.9 s          8.18 s             3   4.36058G                  0.317087s
+Kernel_Biais_Method/50/manual_time_median       15.6 s          8.10 s             3   4.36058G                   0.31255s
+Kernel_Biais_Method/50/manual_time_stddev      0.404 s         0.146 s             3          0                  8.08269ms
+Kernel_Biais_Method/50/manual_time_cv           2.55 %          1.79 %             3      0.00%                      2.55%
+Kernel_Biais_Method/80/manual_time              15.7 s          8.41 s             1   6.97229G                  0.196368s
+Kernel_Biais_Method/80/manual_time              16.1 s          8.54 s             1   6.97229G                  0.200781s
+Kernel_Biais_Method/80/manual_time              16.4 s          8.69 s             1   6.97229G                  0.205585s
+Kernel_Biais_Method/80/manual_time_mean         16.1 s          8.55 s             3   6.97229G                  0.200911s
+Kernel_Biais_Method/80/manual_time_median       16.1 s          8.54 s             3   6.97229G                  0.200781s
+Kernel_Biais_Method/80/manual_time_stddev      0.369 s         0.142 s             3          0                  4.60998ms
+Kernel_Biais_Method/80/manual_time_cv           2.29 %          1.66 %             3      0.00%                      2.29%
+------------------------------------------------------------------------------------
+Benchmark                                          Time             CPU   Iterations
+------------------------------------------------------------------------------------
+Kernel_Biais_Method/manual_time_BigO            0.27 N          0.14 N    
+Kernel_Biais_Method/manual_time_RMS               56 %            53 %    
+--------------------------------------------------------------------------------------------------------------------------
+Benchmark                                          Time             CPU   Iterations     Memory Time_per_contamination_map
+--------------------------------------------------------------------------------------------------------------------------
+FFT_Biais_Method/10/manual_time                 13.8 s          7.11 s             1   925.094M                    1.3784s
+FFT_Biais_Method/10/manual_time                 13.9 s          7.21 s             1   925.094M                   1.38843s
+FFT_Biais_Method/10/manual_time                 13.5 s          6.98 s             1   925.094M                   1.34594s
+FFT_Biais_Method/10/manual_time_mean            13.7 s          7.10 s             3   925.094M                   1.37092s
+FFT_Biais_Method/10/manual_time_median          13.8 s          7.11 s             3   925.094M                    1.3784s
+FFT_Biais_Method/10/manual_time_stddev         0.222 s         0.114 s             3          0                 0.0222082s
+FFT_Biais_Method/10/manual_time_cv              1.62 %          1.60 %             3      0.00%                      1.62%
+FFT_Biais_Method/20/manual_time                 13.6 s          7.13 s             1   1.83502G                  0.680655s
+FFT_Biais_Method/20/manual_time                 13.6 s          7.13 s             1   1.83502G                  0.680395s
+FFT_Biais_Method/20/manual_time                 16.4 s          8.21 s             1   1.83502G                   0.82034s
+FFT_Biais_Method/20/manual_time_mean            14.5 s          7.49 s             3   1.83502G                   0.72713s
+FFT_Biais_Method/20/manual_time_median          13.6 s          7.13 s             3   1.83502G                  0.680655s
+FFT_Biais_Method/20/manual_time_stddev          1.61 s         0.627 s             3          0                 0.0807224s
+FFT_Biais_Method/20/manual_time_cv             11.10 %          8.37 %             3      0.00%                     11.10%
+FFT_Biais_Method/50/manual_time                 14.3 s          7.67 s             1   4.56478G                  0.286959s
+FFT_Biais_Method/50/manual_time                 14.3 s          7.66 s             1   4.56478G                  0.286633s
+FFT_Biais_Method/50/manual_time                 14.3 s          7.66 s             1   4.56478G                  0.286578s
+FFT_Biais_Method/50/manual_time_mean            14.3 s          7.66 s             3   4.56478G                  0.286723s
+FFT_Biais_Method/50/manual_time_median          14.3 s          7.66 s             3   4.56478G                  0.286633s
+FFT_Biais_Method/50/manual_time_stddev         0.010 s         0.009 s             3          0                  205.907us
+FFT_Biais_Method/50/manual_time_cv              0.07 %          0.12 %             3      0.00%                      0.07%
+FFT_Biais_Method/80/manual_time                 15.1 s          8.23 s             1   7.29455G                  0.188778s
+FFT_Biais_Method/80/manual_time                 14.6 s          8.09 s             1   7.29455G                  0.182303s
+FFT_Biais_Method/80/manual_time                 14.5 s          7.98 s             1   7.29455G                  0.180877s
+FFT_Biais_Method/80/manual_time_mean            14.7 s          8.10 s             3   7.29455G                  0.183986s
+FFT_Biais_Method/80/manual_time_median          14.6 s          8.09 s             3   7.29455G                  0.182303s
+FFT_Biais_Method/80/manual_time_stddev         0.337 s         0.123 s             3          0                  4.21071ms
+FFT_Biais_Method/80/manual_time_cv              2.29 %          1.52 %             3      0.00%                      2.29%
+------------------------------------------------------------------------------------
+Benchmark                                          Time             CPU   Iterations
+------------------------------------------------------------------------------------
+FFT_Biais_Method/manual_time_BigO               0.25 N          0.13 N    
+FFT_Biais_Method/manual_time_RMS                  55 %            53 %    
+
