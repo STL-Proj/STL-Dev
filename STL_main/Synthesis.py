@@ -213,7 +213,7 @@ def optimize_from_maps(
         l_target.array = l_target.array.reshape(target_shape)
         l_target, mean_target, std_target = st_op_target.wavelet_op.standardize(
             l_target, mean_field=mean_field, inplace=True
-        )
+        )  # [Nb, Nc] if mean_field else [1, Nc]
 
         # ------- Compute target stats -------
         target_stats = st_op_target.apply(
@@ -223,7 +223,9 @@ def optimize_from_maps(
             compute_PS=compute_PS,
             norm="store_ref",
             norm_batch_mean=mean_field,
-        ).to_flatten(mean_along_batch=mean_field, keepnans=True)
+        ).to_flatten(
+            mean_along_batch=mean_field, keepnans=True
+        )  # [n_stats] if mean_field else [Nb, n_stats]
 
     target_stats = target_stats.detach()
     target_coeffs_mask = ~target_stats.isnan()
@@ -287,10 +289,11 @@ def optimize_from_maps(
 def optimize_from_stats(
     target_stats,
     st_op_running,
-    mean_target=None,
-    std_target=None,
+    nbatch,
+    running_shape=None,
     pbc_running=True,
     init_running=None,
+    mean_field=True,
     lr=1.0,
     max_iter=100,
     history_size=50,
@@ -313,16 +316,35 @@ def optimize_from_stats(
     dtype = st_op_running.wavelet_op.dtype
     print("Running synthesis on device:", device, "dtype:", dtype)
 
-    target_stats_flat = target_stats.to_flatten(
-        keep_batch_dim=True, mean_along_batch=False
-    )  # [Nb, n_stats]
-    target_stats_flat = target_stats_flat.to(device=device, dtype=dtype)
-
     # ------- Determine initial shape for u (from target stats) -------
     Nb, Nc, N, M = target_stats.Nb, target_stats.Nc, *target_stats.N0
-    init_shape = (Nb, Nc, N, M)
+
+    if nbatch != Nb and not mean_field:
+        raise ValueError(
+            f"If mean_field is False, target batch size (Nb={Nb}) should match running batch size (nbatch={nbatch})"
+        )
+
+    if running_shape is not None:
+        init_shape = (nbatch, Nc, *running_shape)
+    else:
+        init_shape = (nbatch, Nc, N, M)
 
     print(f"Initial shape for u: {init_shape}")
+
+    # ------- Target stats Processing -------
+    target_stats_flat = target_stats.to_flatten(
+        keep_batch_dim=True, mean_along_batch=mean_field
+    )  # [1, n_stats] if mean_field else [Nb, n_stats]
+
+    # Average pre-standardization stats over batch if mean_field is True (for unstandardization)
+    target_stats.mean_pre_std = (
+        target_stats.mean_pre_std.mean(dim=0)
+        if mean_field
+        else target_stats.mean_pre_std
+    )  # [1, Nc] if mean_field else [Nc]
+    target_stats.std_pre_std = (
+        target_stats.std_pre_std.mean(dim=0) if mean_field else target_stats.std_pre_std
+    )  # [1, Nc] if mean_field else [Nc]
 
     # ------- Transfer reference normalization from target stats to running operator -------
     # Those reference normalization attributes have been stored during normalisation of the target stats.
@@ -345,13 +367,15 @@ def optimize_from_stats(
         compute_cross_matrix=target_stats.compute_cross_matrix,
         compute_PS=st_op_running.compute_PS,
         keep_batch_dim=True,
-        mean_field=False,
+        mean_field=mean_field,
         device=device,
         dtype=dtype,
     )
 
     # ------- Launch optimization -------
-    loss_fn = lambda s_flat_u: ((s_flat_u - target_stats_flat).abs() ** 2).sum() / Nb
+    def loss_fn(s_flat_u):
+        loss = ((s_flat_u - target_stats_flat).abs() ** 2).sum()
+        return loss if not mean_field else loss / Nb
 
     u_opt = optimize_lbfgs(
         model=model,
@@ -364,10 +388,13 @@ def optimize_from_stats(
     )
 
     # ------- Post-process optimized u: unstandardize, apply mask constraints -------
-    if mean_target is not None and std_target is not None:
+    if target_stats.standardized:
         DC_u_opt = target_stats.DataClass(u_opt, pbc=pbc_running)
         st_op_running.wavelet_op.unstandardize(
-            DC_u_opt, mean=mean_target, std=std_target, inplace=True
+            DC_u_opt,
+            mean=target_stats.mean_pre_std,
+            std=target_stats.std_pre_std,
+            inplace=True,
         )
         u_opt = DC_u_opt.array
 
@@ -376,7 +403,7 @@ def optimize_from_stats(
 
     if Nc == 1:
         u_opt = u_opt[:, 0, ...]  # remove channel dim
-    if Nb == 1:
+    if nbatch == 1:
         u_opt = u_opt[0]  # remove batch dim
 
     return u_opt
@@ -543,11 +570,12 @@ def synthesize_from_maps(
 # === User-friendly wrapper for synthesis from target statistics (high level) ===
 def synthesize_from_stats(
     target_stats,
+    nbatch,
     pbc_running,
+    running_shape=None,
     init_running=None,
     running_mask=None,
-    mean_target=None,
-    std_target=None,
+    mean_field=True,
     **optim_kwargs,
 ):
     """
@@ -556,10 +584,13 @@ def synthesize_from_stats(
     but rather during the computation of the target statistics.
     """
     if running_mask is None:
-        if target_stats.mask_full_res is None:
-            array = torch.zeros(target_stats.N0)
+        if running_shape is not None:
+            array = torch.zeros(running_shape)
         else:
-            array = torch.where(target_stats.mask_full_res.array, torch.nan, 0.0)
+            if target_stats.mask_full_res is None:
+                array = torch.zeros(target_stats.N0)
+            else:
+                array = torch.where(target_stats.mask_full_res.array, torch.nan, 0.0)
         array = array.to(device=target_stats.device, dtype=target_stats.dtype)
 
         data_running = target_stats.DataClass(array=array, pbc=pbc_running)
@@ -584,6 +615,8 @@ def synthesize_from_stats(
 
     # Get scattering operator for running data
     st_op_running = data_running.get_ST_op(
+        J=target_stats.J,
+        n_bins=target_stats.n_bins,
         has_fewer_convolutions=target_stats.has_fewer_convolutions,
         compute_PS=compute_PS,
         replace_nan_value=None,
@@ -599,10 +632,11 @@ def synthesize_from_stats(
     u_opt = optimize_from_stats(
         target_stats=target_stats,
         st_op_running=st_op_running,
+        nbatch=nbatch,
+        running_shape=running_shape,
         pbc_running=pbc_running,
         init_running=init_running,
-        mean_target=mean_target,
-        std_target=std_target,
+        mean_field=mean_field,
         **optim_params,
     )
 

@@ -220,6 +220,7 @@ class ST_Operator:
     def apply(
         self,
         data,
+        standardize=False,
         SC=None,
         has_fewer_convolutions=None,
         norm=None,
@@ -385,6 +386,18 @@ class ST_Operator:
             else compute_cross_matrix.to(device=data.device)
         )
 
+        # Initialize ST statistics values
+        # Add readability w.r.t. having it in the ST statistics initilization
+        if standardize:
+            standardized = True
+            l_data, mean_pre_std, std_pre_std = self.wavelet_op.standardize(
+                data, mean_field=False, inplace=False
+            )
+        else:
+            l_data = data.copy()
+            standardized = False
+            mean_pre_std, std_pre_std = None, None
+
         # Create a ST_statistics instance
         data_st = ST_Statistics(
             data.__class__,
@@ -396,11 +409,11 @@ class ST_Operator:
             has_fewer_convolutions,
             compute_cross_matrix,
             compute_PS,
+            self.n_bins,
+            standardized,
+            mean_pre_std,
+            std_pre_std,
         )
-
-        # Initialize ST statistics values
-        # Add readability w.r.t. having it in the ST statistics initilization
-        l_data = data.copy()
 
         # Systematic statistics (data supposed to be real)
         assert (
@@ -416,7 +429,7 @@ class ST_Operator:
             )
 
         if SC == "ScatCov":
-            #            data_st.S1 = bk.zeros((Nb, Nc, J, L)) + bk.nan
+            # data_st.S1 = bk.zeros((Nb, Nc, J, L)) + bk.nan
             data_st.S1 = (
                 bk.zeros((Nb, Nc, Nc, J, L), dtype=bk._DEFAULT_COMPLEX_DTYPE) + bk.nan
             )

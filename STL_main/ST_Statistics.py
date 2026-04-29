@@ -92,6 +92,10 @@ class ST_Statistics:
         has_fewer_convolutions,
         compute_cross_matrix,
         compute_PS,
+        n_bins,
+        standardized,
+        mean_pre_std,
+        std_pre_std,
     ):
         """
         Constructor, see details above.
@@ -120,7 +124,13 @@ class ST_Statistics:
 
         # Power spectrum computation
         self.compute_PS = compute_PS
+        self.n_bins = n_bins
         self.PS_ref_sqrt_chan_diag = None
+
+        # Mean and variance of data if standardization is applied
+        self.standardized = standardized
+        self.mean_pre_std = mean_pre_std
+        self.std_pre_std = std_pre_std
 
         # Additional transform/compression related parameters. While put to
         # False/None for the initialization, their value are modified if these
@@ -554,8 +564,7 @@ class ST_Statistics:
             stats_names += ["PS"]
 
         if mean_along_batch:
-            stats = [bk.mean(s, 0) for s in stats]
-
+            stats = [bk.mean(s, dim=0, keepdim=True) for s in stats]
         # Flatten each, remove NaNs, concat
         flattened_list = []
         for S, S_name in zip(stats, stats_names):
@@ -586,7 +595,7 @@ class ST_Statistics:
             else:
                 flattened_list.append(S_flat)
 
-        # Concatenate all statistics into a single 1D vector
+        # Concatenate all statistics into a single 1D vector (or 2D if keep_batch_dim is True)
         st_flatten = (
             bk.cat(flattened_list, dim=0)
             if not keep_batch_dim
