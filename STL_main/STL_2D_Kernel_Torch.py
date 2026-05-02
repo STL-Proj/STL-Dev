@@ -1595,3 +1595,205 @@ class PS_operator_2D_Kernel_torch:
         plt.title("Radial Power Spectrum")
         plt.grid(True, which="both", ls="-", alpha=0.5)
         plt.legend()
+
+
+###############################################################################
+# Minkowski functionals — internal helpers (self-contained, no external dep)
+###############################################################################
+
+def _mink2d_as_threshold(threshold, img: torch.Tensor) -> torch.Tensor:
+    """Cast threshold to a tensor broadcastable on img [B, N, N]."""
+    B = img.shape[0]
+    t = (threshold if isinstance(threshold, torch.Tensor)
+         else torch.tensor(threshold, dtype=img.dtype, device=img.device))
+    if t.ndim == 1 and t.shape[0] == B:   # [B] → [B, 1, 1]
+        t = t[:, None, None]
+    torch.broadcast_shapes(t.shape, img.shape)  # raises if incompatible
+    return t
+
+
+def _mink2d_functionals(
+    img: torch.Tensor,
+    threshold=None,
+    temperature: float = 20.0,
+) -> "dict[str, torch.Tensor]":
+    """
+    Three 2D Minkowski functionals for a batch of square images [B, N, N].
+
+    Returns {'W0': [B], 'W1': [B], 'W2': [B]}, fully differentiable.
+    """
+    B, N, M = img.shape
+    if threshold is not None:
+        img = torch.sigmoid(temperature * (img - _mink2d_as_threshold(threshold, img)))
+
+    W0 = img.mean(dim=(-2, -1))
+
+    dh = (img[:, :,  1:] - img[:, :, :-1]).abs()
+    dv = (img[:, 1:, :]  - img[:, :-1, :]).abs()
+    W1 = (dh.sum(dim=(-2, -1)) + dv.sum(dim=(-2, -1))) / (N * N)
+
+    Q1 = img.sum(dim=(-2, -1))
+    Qh = (img[:, :,  :-1] * img[:, :,  1:]).sum(dim=(-2, -1))
+    Qv = (img[:, :-1, :]  * img[:, 1:, :] ).sum(dim=(-2, -1))
+    Qf = (img[:, :-1, :-1] * img[:, :-1, 1:]
+        * img[:,  1:, :-1] * img[:,  1:,  1:]).sum(dim=(-2, -1))
+    W2 = (Q1 - Qh - Qv + Qf) / (N * N)
+
+    return {"W0": W0, "W1": W1, "W2": W2}
+
+
+def _mink2d_curves(
+    img: torch.Tensor,
+    thresholds: torch.Tensor,
+    temperature: float = 20.0,
+) -> "dict[str, torch.Tensor]":
+    """
+    Minkowski functionals at multiple thresholds for [B, N, N].
+
+    thresholds : [T] or [B, T].  Returns {'W0','W1','W2'} each [B, T].
+    """
+    B, N, _ = img.shape
+    t = thresholds
+    if t.ndim == 1:
+        t = t.unsqueeze(0).expand(B, t.shape[0])
+    T = t.shape[1]
+    soft = torch.sigmoid(temperature * (img.unsqueeze(1) - t.view(B, T, 1, 1)))
+    mf = _mink2d_functionals(soft.view(B * T, N, N))
+    return {k: v.view(B, T) for k, v in mf.items()}
+
+
+###############################################################################
+class MinkowskiOperator2D:
+    """
+    Minkowski functional operator for 2D planar STL data.
+
+    Computes the three 2D Minkowski functionals — area (W0), perimeter (W1),
+    and Euler characteristic (W2) — in a differentiable manner via soft
+    sigmoid thresholding.
+
+    Follows the same interface as ``PS_operator_2D_Kernel_torch``:
+    build the operator once, then call ``minkowski()`` on any compatible
+    ``STL_2D_Kernel_Torch`` instance.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Spatial shape ``(Nx, Ny)`` of the input maps.  Must match ``data.N0``.
+    thresholds : Tensor [T], Tensor [B, T], or None
+        Default threshold levels used when ``minkowski()`` is called without
+        an explicit ``thresholds`` argument.
+
+        - ``None``      – no thresholding; pixel values used as soft membership.
+        - ``Tensor [T]``    – same threshold grid for every map in the batch.
+        - ``Tensor [B, T]`` – one threshold grid per map (e.g. learned thresholds).
+    temperature : float
+        Default sigmoid sharpness.  Higher → closer to hard binary thresholding.
+    device : device
+    dtype  : dtype
+
+    Examples
+    --------
+    >>> op = MinkowskiOperator2D(shape=(64, 64))
+    >>> mf = op.minkowski(data)           # {'W0','W1','W2'} each [Nb, Nc]
+
+    >>> t = torch.linspace(0.1, 0.9, 16)
+    >>> op = MinkowskiOperator2D(shape=(64, 64), thresholds=t)
+    >>> curves = op.minkowski(data)       # {'W0','W1','W2'} each [Nb, Nc, 16]
+    """
+
+    def __init__(
+        self,
+        shape,
+        thresholds=None,
+        temperature: float = 20.0,
+        device=_DEFAULT_DEVICE,
+        dtype=_DEFAULT_DTYPE,
+    ):
+        self.shape = shape
+        self.thresholds = thresholds
+        self.temperature = temperature
+        self.device = _get_device(torch.device(device))
+        self.dtype = _get_dtype(dtype=dtype, device=self.device)
+
+    ###########################################################################
+    def minkowski(
+        self,
+        data,
+        thresholds=None,
+        temperature: float = None,
+    ) -> "dict[str, torch.Tensor]":
+        """
+        Compute the three Minkowski functionals of 2D planar data.
+
+        Parameters
+        ----------
+        data : STL_2D_Kernel_Torch
+            Input data with array of shape ``[..., Nx, Ny]``.
+            Complex arrays are reduced to their modulus before computation.
+        thresholds : Tensor [T] | Tensor [B, T] | Tensor [Nb*Nc, T] | None
+            Overrides the operator-level default if provided.
+
+            - ``None``          → no thresholding; output shape ``[Nb, Nc]``.
+            - ``Tensor [T]``    → output shape ``[Nb, Nc, T]``.
+            - ``Tensor [B, T]`` → output shape ``[Nb, Nc, T]`` (B = Nb*Nc).
+        temperature : float or None
+            Overrides the operator-level default if provided.
+
+        Returns
+        -------
+        dict[str, Tensor]
+            Keys ``'W0'``, ``'W1'``, ``'W2'``.
+
+            - Without thresholds : each of shape ``[Nb, Nc]``
+            - With thresholds    : each of shape ``[Nb, Nc, T]``
+
+            All outputs are differentiable w.r.t. ``data.array`` and,
+            when applicable, w.r.t. ``thresholds``.
+        """
+        # ── Input validation ─────────────────────────────────────────────────
+        if not isinstance(data, STL_2D_Kernel_Torch):
+            raise TypeError(
+                f"data must be a STL_2D_Kernel_Torch instance, got {type(data)}"
+            )
+        if self.shape != data.N0:
+            raise ValueError(
+                f"Operator shape {self.shape} does not match data.N0 {data.N0}"
+            )
+
+        thresholds  = thresholds  if thresholds  is not None else self.thresholds
+        temperature = temperature if temperature is not None else self.temperature
+
+        # ── Prepare array ────────────────────────────────────────────────────
+        arr = data.array
+        if torch.is_complex(arr):
+            arr = arr.abs()
+
+        if arr.ndim == 2:
+            arr = arr[None, None, :, :]    # → [1, 1, Nx, Ny]
+        elif arr.ndim == 3:
+            arr = arr[None, :, :, :]       # → [1, Nc, Nx, Ny]
+        # arr is now [Nb, Nc, Nx, Ny]
+
+        Nb, Nc, Nx, Ny = arr.shape
+        flat = arr.reshape(Nb * Nc, Nx, Ny)   # [B, Nx, Ny]
+
+        # ── Compute ──────────────────────────────────────────────────────────
+        if thresholds is None:
+            mf = _mink2d_functionals(flat, temperature=temperature)
+            return {k: v.view(Nb, Nc) for k, v in mf.items()}
+
+        t = torch.as_tensor(thresholds, dtype=flat.dtype, device=flat.device)
+
+        # Allow [T] or [B, T] (B = Nb*Nc); normalise to [B, T]
+        if t.ndim == 1:
+            T = t.shape[0]
+            t = t.unsqueeze(0).expand(Nb * Nc, T)   # [B, T]
+        elif t.ndim == 2:
+            assert t.shape[0] == Nb * Nc, (
+                f"thresholds first dim ({t.shape[0]}) must equal Nb*Nc ({Nb*Nc})")
+            T = t.shape[1]
+        else:
+            raise ValueError(f"thresholds must be 1-D or 2-D, got {t.ndim}-D")
+
+        curves = _mink2d_curves(flat, t, temperature=temperature)
+        return {k: v.view(Nb, Nc, T) for k, v in curves.items()}
