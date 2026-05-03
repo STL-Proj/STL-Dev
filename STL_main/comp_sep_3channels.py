@@ -53,6 +53,7 @@ def save_comp_sep(d_U, d_Q, s_U_opt_noisy, s_Q_opt_noisy, output_dir_name):
     plt.close()
 
 
+# Optional warm-up phase (3-channel phase)
 def baseline_comp_sep(DATA_TEST_PATH, N, STL_DataClass):
 
     # Load target map
