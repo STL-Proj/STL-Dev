@@ -24,6 +24,8 @@ import torch
 import torch.nn.functional as F
 
 from STL_main.Base_DataClass import Base_DataClass
+# STL_2D_FFT_Torch is imported lazily inside __init__ to avoid
+# circular-import issues at module load time.
 from STL_main.ST_Operator import ST_Operator
 from STL_main.torch_backend import (
     _DEFAULT_DEVICE,
@@ -133,6 +135,7 @@ class STL_2D_Kernel_Torch(Base_DataClass):
 
         return WaveletOperator2Dkernel_torch(
             J=J,
+            N0=self.N0,
             DT=self.DT,
             device=self.device,
             dtype=self.dtype,
@@ -163,10 +166,10 @@ class WaveletOperator2Dkernel_torch:
 
     @staticmethod
     def _conv2d_circular(
-        x: torch.Tensor, w: torch.Tensor, padding_mode: str
+        x: torch.Tensor, w: torch.Tensor, padding_mode: str, dilation: int = 1
     ) -> torch.Tensor:
         """
-        Backend-style 2D convolution mirroring FoCUS/BkTorch strategy.
+        Backend-style 2D convolution with optional à-trous dilation.
 
         Parameters
         ----------
@@ -174,6 +177,8 @@ class WaveletOperator2Dkernel_torch:
             Input tensor of shape [..., Nx, Ny].
         w : torch.Tensor
             Kernel tensor of shape [O_c, wx, wy].
+        dilation : int
+            Dilation factor (1 = standard, 2**j = à-trous at scale j).
 
         Returns
         -------
@@ -188,17 +193,17 @@ class WaveletOperator2Dkernel_torch:
         x4d = x.reshape(B, 1, Nx, Ny)
 
         weight = w[:, None, :, :]
-        pad_x = wx // 2
-        pad_y = wy // 2
+        pad_x = (wx // 2) * dilation
+        pad_y = (wy // 2) * dilation
 
         x_padded = F.pad(x4d, (pad_y, pad_y, pad_x, pad_x), mode=padding_mode)
-        y = F.conv2d(x_padded, weight)
+        y = F.conv2d(x_padded, weight, dilation=dilation)
 
         return y.reshape(*leading_dims, O_c, Nx, Ny)
 
     @classmethod
     def _semicomplex_conv2d_circular(
-        cls, x: torch.Tensor, w: torch.Tensor, padding_mode: str
+        cls, x: torch.Tensor, w: torch.Tensor, padding_mode: str, dilation: int = 1
     ) -> torch.Tensor:
         """
         Perform a 2D convolution with a real input and complex kernel.
@@ -236,12 +241,8 @@ class WaveletOperator2Dkernel_torch:
         wr = torch.real(w)  # if torch.is_complex(w) else w
         wi = torch.imag(w)  # if torch.is_complex(w) else torch.zeros_like(wr)
 
-        real_part = cls._conv2d_circular(
-            x, wr, padding_mode=padding_mode
-        )  # - cls._conv2d_circular(xi, wi)
-        imag_part = cls._conv2d_circular(
-            x, wi, padding_mode=padding_mode
-        )  # + cls._conv2d_circular(xi, wr)
+        real_part = cls._conv2d_circular(x, wr, padding_mode=padding_mode, dilation=dilation)
+        imag_part = cls._conv2d_circular(x, wi, padding_mode=padding_mode, dilation=dilation)
 
         return torch.complex(real_part, imag_part)
 
@@ -295,8 +296,10 @@ class WaveletOperator2Dkernel_torch:
     def __init__(
         self,
         J,
+        N0=None,
         L=None,
         kernel_size=None,
+        WType="Bump-Steerable",
         DT="Planar2D_kernel_torch",
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
@@ -304,12 +307,41 @@ class WaveletOperator2Dkernel_torch:
         sigma_smooth=1.0,
         downsample_nan_weight_threshold=0.33,
         get_crop_border_size_method=None,
+        calibrate=True,
+        eps_wiener=1e-2,
     ):
+        """
+        Parameters
+        ----------
+        J : int
+            Number of wavelet scales.
+        N0 : tuple of int or None
+            Spatial size of the input maps, e.g. ``(128, 128)``.
+            Required when ``calibrate=True``.
+        L : int
+            Number of orientations (default 4).
+        kernel_size : int
+            Spatial kernel width in pixels (default 5).  Larger values give
+            a more accurate approximation of the FFT wavelet.
+        WType : str
+            Wavelet type used by the internal FFT reference operator for
+            calibration — ``"Bump-Steerable"`` (default) or ``"Gaussian"``.
+        calibrate : bool
+            If ``True`` (default) and ``N0`` is provided, automatically
+            derive the per-scale kernels from an internal FFT wavelet operator
+            via Wiener deconvolution.  The pipeline (downsampling + NaN
+            handling) is unchanged; only the kernel weights are adjusted.
+        eps_wiener : float
+            Wiener regularisation parameter (fraction of the peak
+            downsampling-filter power).  Increase if kernels look noisy;
+            decrease for sharper deconvolution.  Default 1e-2.
+        """
         if J is None:
             raise ValueError(
                 "J must be specified for WaveletOperator2Dkernel_torch class."
             )
         self.J = J
+        self.N0 = N0
         self.L = L if L is not None else 4
         self.KERNELSZ = kernel_size if kernel_size is not None else 5
         self.DT = DT
@@ -320,11 +352,9 @@ class WaveletOperator2Dkernel_torch:
         self.sigma_smooth = (
             sigma_smooth  # to build smoothing kernel used in downsampling
         )
-        #simag_smooth should be defined before build wavelet kernel for dg=0
-        self._wav_kernel,self._wav_kernel_0 = self._build_wavelet_kernel()
-        # raise
-        # build low pass kernel?
-        self.WType = "simple"
+        #sigma_smooth should be defined before build wavelet kernel for dg=0
+        self._wav_kernel, self._wav_kernel_0 = self._build_wavelet_kernel()
+        self.WType = WType
 
         # PBC dependant parameters
         if get_crop_border_size_method is not None:
@@ -346,6 +376,24 @@ class WaveletOperator2Dkernel_torch:
             self._layer2_mask,
         ) = self._build_reweighting_maps_and_scattering_layer_masks()
         self.j_to_dg = range(J)
+
+        # ── Auto-calibrate kernels from FFT reference ─────────────────────────
+        if calibrate and N0 is not None:
+            # Local import avoids circular dependency at module load time.
+            from STL_main.STL_2D_FFT_Torch import WaveletOperator2D_FFT_torch
+            _fft_op = WaveletOperator2D_FFT_torch(
+                N0=N0, J=J, L=self.L, WType=WType,
+                device=device, dtype=dtype,
+            )
+            self.build_decimated_kernel_from_fft_wavelet_op(_fft_op, eps=eps_wiener)
+        elif calibrate and N0 is None:
+            import warnings
+            warnings.warn(
+                "calibrate=True but N0 is not provided — kernels are NOT "
+                "calibrated against the FFT reference.  Pass N0=(Nx, Ny) to "
+                "enable automatic calibration.",
+                stacklevel=2,
+            )
 
     def _build_reweighting_maps_and_scattering_layer_masks(self):
         if self.mask_full_res is None:
@@ -857,50 +905,279 @@ class WaveletOperator2Dkernel_torch:
                         )
         return
 
-    def apply(self, data, j):
+    def build_decimated_kernel_from_fft_wavelet_op(
+        self, fft_wavelet_op, eps: float = 1e-2
+    ):
         """
-        Apply the convolution kernel to data.array [..., Nx, Ny]
-        and return cdata [..., L, Nx, Ny].
+        Derive per-scale spatial kernels for the **decimated** (downsampling)
+        pipeline so that ``apply(data_dg_j, j)`` matches the FFT approach.
+
+        Problem
+        -------
+        In the decimated pipeline the data at scale j has been through j
+        successive Gaussian smooth+stride-2 operations.  The effective filter
+        seen by the kernel is therefore K * G_ds^j, not just K.  The kernel
+        must compensate for G_ds^j to reproduce the FFT wavelet response.
+
+        Solution — Wiener deconvolution per scale
+        ------------------------------------------
+        For each j:
+
+        1. Propagate an impulse through j steps of ``_downsample_tensor``
+           (same Gaussian used in the actual pipeline) → impulse response
+           at the Nj = N0/2^j resolution.
+        2. FFT → G_j  (downsampling transfer function in standard FFT basis).
+        3. Wiener deconvolution::
+
+               K̂_j(ω) = Ψ_j(ω) · conj(G_j(ω))
+                         ───────────────────────────
+                            |G_j(ω)|² + ε
+
+           where Ψ_j = ``fft_wavelet_op.wavelet_array_MR[j]`` (fftshifted).
+        4. IFFT + fftshift → spatial kernel at Nj resolution.
+        5. Crop to ``KERNELSZ × KERNELSZ`` centred patch with Hann window.
+        6. Renormalise to preserve energy.
+
+        At j=0 G_0 = 1 (no downsampling), so K_0 = IFFT(Ψ_0) directly —
+        this replaces the empirical ``_wav_kernel_0`` and eliminates the
+        discontinuity between j=0 and j>0.
+
+        After calling this method ``apply(data, j)`` (with ``data.dg == j``)
+        uses ``_decimated_kernels[j]`` instead of the generic
+        ``_wav_kernel`` / ``_wav_kernel_0``.
 
         Parameters
         ----------
-        data : object
-            Object with an attribute `array` storing the data as a tensor
-            or numpy array with shape [..., Nx, Ny].
+        fft_wavelet_op : WaveletOperator2D_FFT_torch
+            Fully built FFT wavelet operator with the same J, L, N0.
+        eps : float
+            Wiener regularisation floor (fraction of max |G_j|²).
+            Increase if kernels look noisy; decrease for sharper deconvolution.
+        """
+        assert fft_wavelet_op.J == self.J, "J must match"
+        assert fft_wavelet_op.L == self.L, "L must match"
+        assert fft_wavelet_op.N0 == self.N0, "N0 must match"
+
+        K       = self.KERNELSZ
+        kernels = []
+
+        smooth_kernel = self._gaussian_kernel_5x5(
+            device=self.device, dtype=self.dtype
+        )
+        # Use real dtype for the impulse (downsampling is real-valued)
+        rdtype = (
+            torch.float32 if self.dtype in (torch.complex64,  torch.float32)
+            else torch.float64
+        )
+
+        N0x, N0y = self.N0
+
+        for j in range(self.J):
+            # ── 1. Downsampling transfer function G_j ─────────────────────
+            if j == 0:
+                # Identity: G_0(ω) = 1 everywhere
+                Njx, Njy = N0x, N0y
+                g_j_fftshift = torch.ones(
+                    Njx, Njy, device=self.device, dtype=torch.complex64
+                )
+            else:
+                # Impulse at (0,0) in standard FFT convention
+                impulse = torch.zeros(N0x, N0y, device=self.device, dtype=rdtype)
+                impulse[0, 0] = 1.0
+
+                # Propagate through j Gaussian+stride-2 steps (circular)
+                imp_ds = self.__class__._downsample_tensor(
+                    impulse, smooth_kernel.real if self.dtype in
+                    (torch.complex64, torch.complex128) else smooth_kernel,
+                    dg_inc=j,
+                    padding_mode="circular",
+                )   # [Njx, Njy]
+                Njx, Njy = imp_ds.shape[-2:]
+
+                # FFT → standard convention, then fftshift to match wavelet_array_MR
+                g_j_fftshift = torch.fft.fftshift(
+                    torch.fft.fft2(imp_ds, norm="ortho"),
+                    dim=(-2, -1),
+                ).to(torch.complex64)   # [Njx, Njy]
+
+            # ── 2. Target FFT wavelet at scale j (fftshifted, Nj res) ─────
+            psi_j = fft_wavelet_op.wavelet_array_MR[j].to(
+                device=self.device, dtype=torch.complex64
+            )   # [L, Njx, Njy]
+
+            # ── 3. Wiener deconvolution ────────────────────────────────────
+            g2     = g_j_fftshift.abs().pow(2)          # [Njx, Njy]
+            reg    = eps * g2.max()                      # scalar regulariser
+            k_fft  = psi_j * g_j_fftshift.conj() / (g2 + reg)   # [L, Njx, Njy]
+
+            # ── 4. Back to pixel space (fftshifted → standard → IFFT) ─────
+            kernel_spatial = torch.fft.fftshift(
+                torch.fft.ifft2(
+                    torch.fft.ifftshift(k_fft, dim=(-2, -1)),
+                    norm="ortho",
+                ),
+                dim=(-2, -1),
+            )   # [L, Njx, Njy], complex
+
+            # ── 5. Hann-windowed crop to K×K ──────────────────────────────
+            cx, cy = Njx // 2, Njy // 2
+            half   = K // 2
+
+            hann   = torch.hann_window(K, periodic=False,
+                                       device=self.device, dtype=torch.float32)
+            hann2d = (hann[:, None] * hann[None, :]).to(torch.complex64)
+
+            patch = kernel_spatial[
+                :, cx - half : cx - half + K,
+                   cy - half : cy - half + K
+            ].clone()   # [L, K, K]
+            patch = patch * hann2d
+
+            # ── 6. Renormalise (preserve impulse-response energy) ─────────
+            full_e  = kernel_spatial.abs().pow(2).sum(dim=(-2,-1), keepdim=True).sqrt()
+            patch_e = patch.abs().pow(2).sum(dim=(-2,-1), keepdim=True).sqrt().clamp(1e-12)
+            patch   = patch * (full_e / patch_e)
+
+            kernels.append(patch.reshape(1, self.L, K, K))
+
+        self._decimated_kernels = kernels   # list[J] of [1, L, K, K]
+        self._use_decimated     = True
+        print(
+            f"Decimated kernels built: J={self.J}, K={K}×{K}, eps={eps:.0e}."
+        )
+
+    def build_kernel_from_fft_wavelet_op(self, fft_wavelet_op):
+        """
+        Derive à-trous spatial kernels from a FFT wavelet operator so that
+        ``apply(data, j)`` on full-resolution data (dg=0) is equivalent to
+        the FFT approach.
+
+        For each scale j:
+          1. IFFT(ifftshift(wavelet_array[j]))  →  full-size impulse response
+          2. fftshift so the peak is at the array centre
+          3. Crop to KERNELSZ × KERNELSZ with a 2-D Hann window
+          4. Rescale to preserve energy
+
+        After calling this, ``apply(data, j)`` uses à-trous dilation 2**j
+        on full-resolution data (data.dg must be 0).
+
+        Parameters
+        ----------
+        fft_wavelet_op : WaveletOperator2D_FFT_torch
+            Built FFT wavelet operator with same J, L, and spatial size.
+        """
+        assert fft_wavelet_op.J == self.J, "J must match"
+        assert fft_wavelet_op.L == self.L, "L must match"
+
+        K = self.KERNELSZ
+        kernels = []
+
+        for j in range(self.J):
+            wav_fft = fft_wavelet_op.wavelet_array[j].to(
+                device=self.device, dtype=torch.complex64
+            )   # [L, Nx, Ny]  (fftshifted Fourier-space wavelet)
+
+            # Full spatial impulse response
+            wav_spatial = torch.fft.fftshift(
+                torch.fft.ifft2(
+                    torch.fft.ifftshift(wav_fft, dim=(-2, -1)),
+                    norm="ortho",
+                ),
+                dim=(-2, -1),
+            )   # [L, Nx, Ny]
+
+            Nx, Ny = wav_spatial.shape[-2:]
+            cx, cy = Nx // 2, Ny // 2
+            half   = K // 2
+
+            # 2-D Hann window (reduces truncation ringing)
+            hann = torch.hann_window(K, periodic=False, device=self.device, dtype=torch.float32)
+            hann2d = (hann[:, None] * hann[None, :]).to(torch.complex64)
+
+            patch = wav_spatial[:, cx - half : cx - half + K,
+                                    cy - half : cy - half + K].clone()   # [L, K, K]
+            patch = patch * hann2d
+
+            # Preserve energy of the full impulse response
+            full_energy  = wav_spatial.abs().pow(2).sum(dim=(-2, -1), keepdim=True).sqrt()
+            patch_energy = patch.abs().pow(2).sum(dim=(-2, -1), keepdim=True).sqrt().clamp(1e-12)
+            patch = patch * (full_energy / patch_energy)
+
+            kernels.append(patch.reshape(1, self.L, K, K))
+
+        self._atrous_kernels = kernels
+        self._use_atrous     = True
+        print(f"À-trous kernels built: J={self.J}, K={K}×{K}.")
+
+    ###########################################################################
+    def apply(self, data, j):
+        """
+        Apply the wavelet kernel to data.array [..., Nx, Ny].
+
+        Standard mode (default, backward-compatible)
+            Requires data.dg == j.  Uses _wav_kernel_0 (j=0) or
+            _wav_kernel (j>0) on the already-downsampled data.
+
+        À-trous mode (activated by build_kernel_from_fft_wavelet_op)
+            Requires data.dg == 0.  Uses _atrous_kernels[j] with
+            dilation=2**j — no downsampling needed, matches FFT approach.
+
+        Parameters
+        ----------
+        data : STL_2D_Kernel_Torch
+        j    : int  — scale index
 
         Returns
         -------
-        torch.Tensor
-            Convolved data with shape [..., L, Nx, Ny].
+        STL_2D_Kernel_Torch  shape [..., L, Nx, Ny]
         """
-        # Check coherence of input data.
         if not isinstance(data, STL_2D_Kernel_Torch):
             raise Exception("Data should be a STL_2D_Kernel_Torch instance")
         if self.DT != data.DT:
             raise Exception("Data and wavelet transform should have same DT")
 
+        x = torch.as_tensor(data.array, device=self._wav_kernel.device)
+        padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
+
+        # ── À-trous mode ─────────────────────────────────────────────────────
+        if getattr(self, "_use_atrous", False):
+            if data.dg != 0:
+                raise ValueError(
+                    "À-trous mode requires full-resolution data (dg=0)."
+                )
+            weight   = self._atrous_kernels[j].squeeze(0)   # [L, K, K]
+            dilation = 2 ** j
+            convolved = self.__class__._semicomplex_conv2d_circular(
+                x, weight, padding_mode=padding_mode, dilation=dilation
+            )
+            return STL_2D_Kernel_Torch(
+                convolved, dg=0, N0=data.N0, pbc=data.pbc,
+                conv_history=data.conv_history + [j],
+            )
+
+        # ── Corrected decimated mode (build_decimated_kernel_from_fft_wavelet_op) ─
+        if getattr(self, "_use_decimated", False):
+            if j != data.dg:
+                raise ValueError("j is not equal to dg, convolution not possible")
+            weight    = self._decimated_kernels[j].squeeze(0)   # [L, K, K]
+            convolved = self.__class__._semicomplex_conv2d_circular(
+                x, weight, padding_mode=padding_mode
+            )
+            return STL_2D_Kernel_Torch(
+                convolved, dg=data.dg, N0=data.N0, pbc=data.pbc,
+                conv_history=data.conv_history + [j],
+            )
+
+        # ── Standard (decimated) mode — original kernels ──────────────────────
         if j != data.dg:
             raise ValueError("j is not equal to dg, convolution not possible")
 
-        x = data.array  # [..., Nx, Ny]
-
-        # Ensure x is a torch tensor on the same device as the _wav_kernel
-        x = torch.as_tensor(x, device=self._wav_kernel.device)
-
-        if j==0:
-            weight = self._wav_kernel_0.squeeze(0)  # [L, K, K]
-        else:
-            weight = self._wav_kernel.squeeze(0)  # [L, K, K]
-
+        weight = (self._wav_kernel_0 if j == 0 else self._wav_kernel).squeeze(0)
         convolved = self.__class__._semicomplex_conv2d_circular(
-            x, weight, padding_mode=self.__class__._get_padding_mode(pbc=data.pbc)
+            x, weight, padding_mode=padding_mode
         )
-
         return STL_2D_Kernel_Torch(
-            convolved,
-            dg=data.dg,
-            N0=data.N0,
-            pbc=data.pbc,
+            convolved, dg=data.dg, N0=data.N0, pbc=data.pbc,
             conv_history=data.conv_history + [j],
         )
 
