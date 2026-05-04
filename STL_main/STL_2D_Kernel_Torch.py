@@ -961,14 +961,20 @@ class WaveletOperator2Dkernel_torch:
         K       = self.KERNELSZ
         kernels = []
 
+        # Derive consistent dtypes from self.dtype
+        if self.dtype in (torch.complex64, torch.float32):
+            cdtype = torch.complex64
+            rdtype = torch.float32
+        else:
+            cdtype = torch.complex128
+            rdtype = torch.float64
+
         smooth_kernel = self._gaussian_kernel_5x5(
             device=self.device, dtype=self.dtype
         )
-        # Use real dtype for the impulse (downsampling is real-valued)
-        rdtype = (
-            torch.float32 if self.dtype in (torch.complex64,  torch.float32)
-            else torch.float64
-        )
+        smooth_real = (smooth_kernel.real
+                       if torch.is_complex(smooth_kernel)
+                       else smooth_kernel).to(rdtype)
 
         N0x, N0y = self.N0
 
@@ -984,7 +990,7 @@ class WaveletOperator2Dkernel_torch:
                 # Identity: G_0(ω) = 1 everywhere
                 Njx, Njy = N0x, N0y
                 g_j_fftshift = torch.ones(
-                    Njx, Njy, device=self.device, dtype=torch.complex64
+                    Njx, Njy, device=self.device, dtype=cdtype
                 )
             else:
                 # Impulse at (0,0) in standard FFT convention
@@ -992,9 +998,6 @@ class WaveletOperator2Dkernel_torch:
                 impulse[0, 0] = 1.0
 
                 # Propagate through dg_j Gaussian+stride-2 steps (circular)
-                smooth_real = (smooth_kernel.real
-                               if self.dtype in (torch.complex64, torch.complex128)
-                               else smooth_kernel)
                 imp_ds = self.__class__._downsample_tensor(
                     impulse, smooth_real, dg_inc=dg_j, padding_mode="circular",
                 )   # [Njx, Njy]
@@ -1004,11 +1007,11 @@ class WaveletOperator2Dkernel_torch:
                 g_j_fftshift = torch.fft.fftshift(
                     torch.fft.fft2(imp_ds, norm="ortho"),
                     dim=(-2, -1),
-                ).to(torch.complex64)   # [Njx, Njy]
+                ).to(cdtype)   # [Njx, Njy]
 
             # ── 2. Target FFT wavelet at scale j (fftshifted, Nj res) ─────
             psi_j = fft_wavelet_op.wavelet_array_MR[j].to(
-                device=self.device, dtype=torch.complex64
+                device=self.device, dtype=cdtype
             )   # [L, Njx, Njy]
 
             # ── 3. Wiener deconvolution ────────────────────────────────────
@@ -1030,8 +1033,8 @@ class WaveletOperator2Dkernel_torch:
             half   = K // 2
 
             hann   = torch.hann_window(K, periodic=False,
-                                       device=self.device, dtype=torch.float32)
-            hann2d = (hann[:, None] * hann[None, :]).to(torch.complex64)
+                                       device=self.device, dtype=rdtype)
+            hann2d = (hann[:, None] * hann[None, :]).to(cdtype)
 
             patch = kernel_spatial[
                 :, cx - half : cx - half + K,
@@ -1082,9 +1085,13 @@ class WaveletOperator2Dkernel_torch:
         K = self.KERNELSZ
         kernels = []
 
+        cdtype = (torch.complex64 if self.dtype in
+                  (torch.complex64, torch.float32) else torch.complex128)
+        rdtype = torch.float32 if cdtype == torch.complex64 else torch.float64
+
         for j in range(self.J):
             wav_fft = fft_wavelet_op.wavelet_array[j].to(
-                device=self.device, dtype=torch.complex64
+                device=self.device, dtype=cdtype
             )   # [L, Nx, Ny]  (fftshifted Fourier-space wavelet)
 
             # Full spatial impulse response
@@ -1101,8 +1108,8 @@ class WaveletOperator2Dkernel_torch:
             half   = K // 2
 
             # 2-D Hann window (reduces truncation ringing)
-            hann = torch.hann_window(K, periodic=False, device=self.device, dtype=torch.float32)
-            hann2d = (hann[:, None] * hann[None, :]).to(torch.complex64)
+            hann = torch.hann_window(K, periodic=False, device=self.device, dtype=rdtype)
+            hann2d = (hann[:, None] * hann[None, :]).to(cdtype)
 
             patch = wav_spatial[:, cx - half : cx - half + K,
                                     cy - half : cy - half + K].clone()   # [L, K, K]
