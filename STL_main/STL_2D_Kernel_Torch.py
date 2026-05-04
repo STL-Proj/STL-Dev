@@ -974,7 +974,13 @@ class WaveletOperator2Dkernel_torch:
 
         for j in range(self.J):
             # ── 1. Downsampling transfer function G_j ─────────────────────
-            if j == 0:
+            # dg_j: actual downsampling level used by the FFT op at scale j.
+            # It is capped at dg_max = int(log2(min(N0)) - 4) so that the
+            # working resolution never drops below 16×16.  We must match this
+            # cap when computing G_j so that its shape equals wavelet_array_MR[j].
+            dg_j = fft_wavelet_op.j_to_dg[j]
+
+            if dg_j == 0:
                 # Identity: G_0(ω) = 1 everywhere
                 Njx, Njy = N0x, N0y
                 g_j_fftshift = torch.ones(
@@ -985,12 +991,12 @@ class WaveletOperator2Dkernel_torch:
                 impulse = torch.zeros(N0x, N0y, device=self.device, dtype=rdtype)
                 impulse[0, 0] = 1.0
 
-                # Propagate through j Gaussian+stride-2 steps (circular)
+                # Propagate through dg_j Gaussian+stride-2 steps (circular)
+                smooth_real = (smooth_kernel.real
+                               if self.dtype in (torch.complex64, torch.complex128)
+                               else smooth_kernel)
                 imp_ds = self.__class__._downsample_tensor(
-                    impulse, smooth_kernel.real if self.dtype in
-                    (torch.complex64, torch.complex128) else smooth_kernel,
-                    dg_inc=j,
-                    padding_mode="circular",
+                    impulse, smooth_real, dg_inc=dg_j, padding_mode="circular",
                 )   # [Njx, Njy]
                 Njx, Njy = imp_ds.shape[-2:]
 
@@ -1042,8 +1048,12 @@ class WaveletOperator2Dkernel_torch:
 
         self._decimated_kernels = kernels   # list[J] of [1, L, K, K]
         self._use_decimated     = True
+        # Align j_to_dg with the FFT op so that apply(data, j) correctly
+        # requires data.dg == j_to_dg[j] (the capped downsampling level).
+        self.j_to_dg = fft_wavelet_op.j_to_dg
         print(
-            f"Decimated kernels built: J={self.J}, K={K}×{K}, eps={eps:.0e}."
+            f"Decimated kernels built: J={self.J}, K={K}×{K}, eps={eps:.0e}, "
+            f"j_to_dg={list(fft_wavelet_op.j_to_dg)}."
         )
 
     def build_kernel_from_fft_wavelet_op(self, fft_wavelet_op):
@@ -1157,8 +1167,12 @@ class WaveletOperator2Dkernel_torch:
 
         # ── Corrected decimated mode (build_decimated_kernel_from_fft_wavelet_op) ─
         if getattr(self, "_use_decimated", False):
-            if j != data.dg:
-                raise ValueError("j is not equal to dg, convolution not possible")
+            expected_dg = self.j_to_dg[j]
+            if data.dg != expected_dg:
+                raise ValueError(
+                    f"À-trous-decimated mode: scale j={j} expects data.dg="
+                    f"{expected_dg}, got {data.dg}."
+                )
             weight    = self._decimated_kernels[j].squeeze(0)   # [L, K, K]
             convolved = self.__class__._semicomplex_conv2d_circular(
                 x, weight, padding_mode=padding_mode
