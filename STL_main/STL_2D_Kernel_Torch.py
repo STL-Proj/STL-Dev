@@ -1598,8 +1598,68 @@ class PS_operator_2D_Kernel_torch:
 
 
 ###############################################################################
-# Minkowski functionals — internal helpers (self-contained, no external dep)
+# Minkowski / Peak / Betti — internal helpers (self-contained, no external dep)
 ###############################################################################
+
+# ── Gaussian wavelet helpers ──────────────────────────────────────────────────
+
+def _gaussian_kernel_2d(
+    sigma: float,
+    truncate: float = 3.5,
+    device=None,
+    dtype=None,
+) -> torch.Tensor:
+    """Return a [1, 1, K, K] isotropic Gaussian kernel."""
+    radius = max(1, int(truncate * sigma + 0.5))
+    size   = 2 * radius + 1
+    coords = torch.arange(size, device=device, dtype=dtype) - radius
+    g = torch.exp(-0.5 * (coords / sigma) ** 2)
+    g = g / g.sum()
+    kernel = g[:, None] * g[None, :]     # [K, K]
+    return kernel[None, None]            # [1, 1, K, K]
+
+
+def _gaussian_filter_2d(
+    img: torch.Tensor,
+    sigma: float,
+    padding_mode: str = "circular",
+) -> torch.Tensor:
+    """Gaussian-filter a [B, N, M] image batch; returns same shape."""
+    B, N, M = img.shape
+    kernel = _gaussian_kernel_2d(sigma, device=img.device, dtype=img.dtype)
+    radius = kernel.shape[-1] // 2
+    x = F.pad(img.unsqueeze(1), [radius] * 4, mode=padding_mode)
+    return F.conv2d(x, kernel).squeeze(1)   # [B, N, M]
+
+
+def _extract_scale_flat(
+    flat: torch.Tensor,
+    j: int,
+    pbc: bool = True,
+    wavelet_op=None,
+) -> torch.Tensor:
+    """
+    Return the wavelet band at dyadic scale j for a [B, N, M] batch.
+
+    With ``wavelet_op=None`` (default) a Difference-of-Gaussians (DoG) is used:
+        band_j = |Gauss(sigma=2^j) − Gauss(sigma=2^(j+1))|
+
+    With a custom ``wavelet_op`` the band is the orientation-averaged
+    Morlet modulus at scale j (reserved for future use).
+    """
+    padding_mode = "circular" if pbc else "replicate"
+    if wavelet_op is None:
+        sigma_lo = 2.0 ** j
+        sigma_hi = 2.0 ** (j + 1)
+        g_lo = _gaussian_filter_2d(flat, sigma_lo, padding_mode=padding_mode)
+        g_hi = _gaussian_filter_2d(flat, sigma_hi, padding_mode=padding_mode)
+        return (g_lo - g_hi).abs()
+    raise NotImplementedError(
+        "Custom wavelet_op is not yet implemented. Use wavelet_op=None (DoG)."
+    )
+
+
+# ── Minkowski helpers ─────────────────────────────────────────────────────────
 
 def _mink2d_as_threshold(threshold, img: torch.Tensor) -> torch.Tensor:
     """Cast threshold to a tensor broadcastable on img [B, N, N]."""
@@ -1680,14 +1740,21 @@ class MinkowskiOperator2D:
     shape : tuple of int
         Spatial shape ``(Nx, Ny)`` of the input maps.  Must match ``data.N0``.
     thresholds : Tensor [T], Tensor [B, T], or None
-        Default threshold levels used when ``minkowski()`` is called without
-        an explicit ``thresholds`` argument.
-
-        - ``None``      – no thresholding; pixel values used as soft membership.
-        - ``Tensor [T]``    – same threshold grid for every map in the batch.
-        - ``Tensor [B, T]`` – one threshold grid per map (e.g. learned thresholds).
+        Default threshold levels.  ``None`` = no thresholding.
     temperature : float
-        Default sigmoid sharpness.  Higher → closer to hard binary thresholding.
+        Sigmoid sharpness.  Higher → closer to hard binary thresholding.
+    J : int
+        Number of dyadic scales.
+
+        - ``J=1`` (default) — works at full resolution.
+        - ``J>1`` — applies a Difference-of-Gaussians (DoG) bandpass filter
+          at each scale j=0..J-1 (finest to coarsest) and stacks results
+          along a new leading ``J`` dimension.
+
+          Output shape becomes ``[Nb, Nc, J]`` (no thresholds) or
+          ``[Nb, Nc, J, T]`` (with thresholds).
+    wavelet_op : callable or None
+        Reserved for future use.  Pass ``None`` to use the default DoG filter.
     device : device
     dtype  : dtype
 
@@ -1697,8 +1764,8 @@ class MinkowskiOperator2D:
     >>> mf = op.minkowski(data)           # {'W0','W1','W2'} each [Nb, Nc]
 
     >>> t = torch.linspace(0.1, 0.9, 16)
-    >>> op = MinkowskiOperator2D(shape=(64, 64), thresholds=t)
-    >>> curves = op.minkowski(data)       # {'W0','W1','W2'} each [Nb, Nc, 16]
+    >>> op = MinkowskiOperator2D(shape=(64, 64), thresholds=t, J=3)
+    >>> curves = op.minkowski(data)       # {'W0','W1','W2'} each [Nb, Nc, 3, 16]
     """
 
     def __init__(
@@ -1706,12 +1773,16 @@ class MinkowskiOperator2D:
         shape,
         thresholds=None,
         temperature: float = 20.0,
+        J: int = 1,
+        wavelet_op=None,
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
     ):
         self.shape = shape
         self.thresholds = thresholds
         self.temperature = temperature
+        self.J = J
+        self.wavelet_op = wavelet_op
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
@@ -1730,12 +1801,8 @@ class MinkowskiOperator2D:
         data : STL_2D_Kernel_Torch
             Input data with array of shape ``[..., Nx, Ny]``.
             Complex arrays are reduced to their modulus before computation.
-        thresholds : Tensor [T] | Tensor [B, T] | Tensor [Nb*Nc, T] | None
+        thresholds : Tensor [T] | Tensor [B, T] | None
             Overrides the operator-level default if provided.
-
-            - ``None``          → no thresholding; output shape ``[Nb, Nc]``.
-            - ``Tensor [T]``    → output shape ``[Nb, Nc, T]``.
-            - ``Tensor [B, T]`` → output shape ``[Nb, Nc, T]`` (B = Nb*Nc).
         temperature : float or None
             Overrides the operator-level default if provided.
 
@@ -1744,59 +1811,66 @@ class MinkowskiOperator2D:
         dict[str, Tensor]
             Keys ``'W0'``, ``'W1'``, ``'W2'``.
 
-            - Without thresholds : each of shape ``[Nb, Nc]``
-            - With thresholds    : each of shape ``[Nb, Nc, T]``
-
-            All outputs are differentiable w.r.t. ``data.array`` and,
-            when applicable, w.r.t. ``thresholds``.
+            - J=1, no thresholds : ``[Nb, Nc]``
+            - J=1, thresholds T  : ``[Nb, Nc, T]``
+            - J>1, no thresholds : ``[Nb, Nc, J]``
+            - J>1, thresholds T  : ``[Nb, Nc, J, T]``
         """
-        # ── Input validation ─────────────────────────────────────────────────
         if not isinstance(data, STL_2D_Kernel_Torch):
             raise TypeError(
-                f"data must be a STL_2D_Kernel_Torch instance, got {type(data)}"
+                f"data must be STL_2D_Kernel_Torch, got {type(data)}"
             )
         if self.shape != data.N0:
             raise ValueError(
-                f"Operator shape {self.shape} does not match data.N0 {data.N0}"
+                f"Operator shape {self.shape} != data.N0 {data.N0}"
             )
 
         thresholds  = thresholds  if thresholds  is not None else self.thresholds
         temperature = temperature if temperature is not None else self.temperature
 
-        # ── Prepare array ────────────────────────────────────────────────────
         arr = data.array
         if torch.is_complex(arr):
             arr = arr.abs()
-
         if arr.ndim == 2:
-            arr = arr[None, None, :, :]    # → [1, 1, Nx, Ny]
+            arr = arr[None, None, :, :]
         elif arr.ndim == 3:
-            arr = arr[None, :, :, :]       # → [1, Nc, Nx, Ny]
-        # arr is now [Nb, Nc, Nx, Ny]
-
+            arr = arr[None, :, :, :]
         Nb, Nc, Nx, Ny = arr.shape
         flat = arr.reshape(Nb * Nc, Nx, Ny)   # [B, Nx, Ny]
+        pbc  = getattr(data, "pbc", True)
 
-        # ── Compute ──────────────────────────────────────────────────────────
-        if thresholds is None:
-            mf = _mink2d_functionals(flat, temperature=temperature)
-            return {k: v.view(Nb, Nc) for k, v in mf.items()}
-
-        t = torch.as_tensor(thresholds, dtype=flat.dtype, device=flat.device)
-
-        # Allow [T] or [B, T] (B = Nb*Nc); normalise to [B, T]
-        if t.ndim == 1:
-            T = t.shape[0]
-            t = t.unsqueeze(0).expand(Nb * Nc, T)   # [B, T]
-        elif t.ndim == 2:
-            assert t.shape[0] == Nb * Nc, (
-                f"thresholds first dim ({t.shape[0]}) must equal Nb*Nc ({Nb*Nc})")
+        def _compute_one(band: torch.Tensor):
+            """Return mink dict for a single [B, N, M] band."""
+            if thresholds is None:
+                mf = _mink2d_functionals(band, temperature=temperature)
+                return {k: v.view(Nb, Nc) for k, v in mf.items()}
+            t = torch.as_tensor(thresholds, dtype=band.dtype, device=band.device)
+            if t.ndim == 1:
+                t = t.unsqueeze(0).expand(Nb * Nc, t.shape[0])
+            elif t.ndim == 2:
+                assert t.shape[0] == Nb * Nc, (
+                    f"thresholds dim-0 ({t.shape[0]}) must equal Nb*Nc ({Nb*Nc})"
+                )
+            else:
+                raise ValueError(f"thresholds must be 1-D or 2-D, got {t.ndim}-D")
             T = t.shape[1]
-        else:
-            raise ValueError(f"thresholds must be 1-D or 2-D, got {t.ndim}-D")
+            curves = _mink2d_curves(band, t, temperature=temperature)
+            return {k: v.view(Nb, Nc, T) for k, v in curves.items()}
 
-        curves = _mink2d_curves(flat, t, temperature=temperature)
-        return {k: v.view(Nb, Nc, T) for k, v in curves.items()}
+        if self.J == 1:
+            return _compute_one(flat)
+
+        # ── Multi-scale ──────────────────────────────────────────────────────
+        scale_results = [
+            _compute_one(_extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op))
+            for j in range(self.J)
+        ]
+        # stack along J dimension (inserted after Nc)
+        return {
+            k: torch.stack([sr[k] for sr in scale_results], dim=2)
+            for k in scale_results[0]
+        }
+
 
 
 ###############################################################################
@@ -1810,80 +1884,91 @@ def _neighborhood_extrema(
     padding_mode: str = "replicate",
 ) -> torch.Tensor:
     """
-    Max or min over the local K-connectivity neighborhood, **excluding center**.
+    Max or min over the local K-connectivity neighborhood, excluding center.
 
     img          : [B, N, M]
     mode         : 'max' or 'min'
     connectivity : 4 (N/E/S/W) or 8 (+ diagonals)
-    Returns [B, N, M]
+    Returns      : [B, N, M]
     """
     B, N, M = img.shape
     padded = F.pad(img.unsqueeze(1), (1, 1, 1, 1), mode=padding_mode).squeeze(1)
 
     shifts = [(-1, -1), (-1, 0), (-1, 1),
-              ( 0, -1),           ( 0, 1),
+              ( 0, -1),          ( 0, 1),
               ( 1, -1), ( 1, 0), ( 1, 1)]
     if connectivity == 4:
         shifts = [(-1, 0), (0, -1), (0, 1), (1, 0)]
 
     neighbors = torch.stack(
         [padded[:, 1+di:1+di+N, 1+dj:1+dj+M] for di, dj in shifts], dim=0
-    )  # [K, B, N, M]
+    )   # [K, B, N, M]
 
-    return neighbors.max(dim=0).values if mode == "max" else neighbors.min(dim=0).values
+    return neighbors.amax(dim=0) if mode == "max" else neighbors.amin(dim=0)
 
 
-def _soft_peaks(img: torch.Tensor, temperature: float, connectivity: int = 8,
-                padding_mode: str = "replicate") -> torch.Tensor:
+def _soft_peaks(
+    img: torch.Tensor,
+    temperature: float,
+    connectivity: int = 8,
+    padding_mode: str = "replicate",
+) -> torch.Tensor:
     """
-    Soft local-maximum indicator map.
-    is_peak[i] ≈ σ(τ*(f_i − max_neighbor_i))  ∈ [0, 1].
-    img : [B, N, M].  Returns [B, N, M].
+    Soft local-maximum indicator.
+    is_peak[i] = σ(τ * (f_i − max_neighbor_i)).  Returns [B, N, M].
     """
     max_nbr = _neighborhood_extrema(img, "max", connectivity, padding_mode)
     return torch.sigmoid(temperature * (img - max_nbr))
 
 
-def _soft_valleys(img: torch.Tensor, temperature: float, connectivity: int = 8,
-                  padding_mode: str = "replicate") -> torch.Tensor:
+def _soft_valleys(
+    img: torch.Tensor,
+    temperature: float,
+    connectivity: int = 8,
+    padding_mode: str = "replicate",
+) -> torch.Tensor:
     """
-    Soft local-minimum indicator map.
-    is_valley[i] ≈ σ(τ*(min_neighbor_i − f_i))  ∈ [0, 1].
-    img : [B, N, M].  Returns [B, N, M].
+    Soft local-minimum indicator.
+    is_valley[i] = σ(τ * (min_neighbor_i − f_i)).  Returns [B, N, M].
     """
     min_nbr = _neighborhood_extrema(img, "min", connectivity, padding_mode)
     return torch.sigmoid(temperature * (min_nbr - img))
 
 
 def _threshold_weighted_sum(
-    img: torch.Tensor,         # [B, N, M]
-    indicator: torch.Tensor,   # [B, N, M]  soft binary mask (peaks, valleys…)
-    thresholds: torch.Tensor,  # [B, T]
+    img: torch.Tensor,          # [B, N, M]
+    indicator: torch.Tensor,    # [B, N, M]  soft binary mask (peaks / valleys)
+    thresholds: torch.Tensor,   # [B, T]
     temperature: float,
-    above: bool = True,        # True → count pixels ABOVE t, False → BELOW t
-) -> torch.Tensor:             # [B, T]
+    above: bool = True,         # True → count pixels ABOVE t, False → BELOW t
+) -> torch.Tensor:              # [B, T]
     """
-    Weighted sum: for each threshold t, sum indicator over pixels active at t.
-    Returns normalised count (divided by N*M).
+    Weighted sum: for each threshold t, accumulate indicator over active pixels.
+    Active = soft excursion-set mask.  Result is normalised by N*M.
     """
     B, N, M = img.shape
     T = thresholds.shape[1]
     sign = 1.0 if above else -1.0
-    # active[b,t,i,j] = σ(±τ*(f_{i,j} − t))
     active = torch.sigmoid(
         sign * temperature * (img.unsqueeze(1) - thresholds.view(B, T, 1, 1))
-    )  # [B, T, N, M]
-    return (active * indicator.unsqueeze(1)).sum(dim=(-2, -1)) / (N * M)  # [B, T]
+    )   # [B, T, N, M]
+    return (active * indicator.unsqueeze(1)).sum(dim=(-2, -1)) / (N * M)
 
 
-def _normalise_thresholds(thresholds: torch.Tensor, B: int,
-                          device, dtype) -> torch.Tensor:
-    """Cast thresholds to [B, T] on the right device/dtype."""
+def _normalise_thresholds(
+    thresholds,
+    B: int,
+    device,
+    dtype,
+) -> torch.Tensor:
+    """Cast thresholds to [B, T] on the correct device/dtype."""
     t = torch.as_tensor(thresholds, dtype=dtype, device=device)
     if t.ndim == 1:
         t = t.unsqueeze(0).expand(B, t.shape[0])
-    assert t.ndim == 2 and t.shape[0] == B, \
-        f"thresholds must be [T] or [B={B}, T], got {t.shape}"
+    if t.ndim != 2 or t.shape[0] != B:
+        raise ValueError(
+            f"thresholds must be shape [T] or [B={B}, T], got {tuple(t.shape)}"
+        )
     return t
 
 
@@ -1892,38 +1977,38 @@ class PeakCountOperator2D:
     """
     Soft local-extrema count operator for 2D planar STL data.
 
-    A pixel i is a **soft local maximum** (peak) when it exceeds all its
-    K-connectivity neighbours:
-
-    .. math::
-
-        \\text{is\\_peak}_i = \\sigma\\!\\left(\\tau\\,(f_i - \\max_{j\\in N(i)} f_j)\\right)
-
-    **Peak count at threshold t** (normalised):
-
-    .. math::
-
-        P(t) = \\frac{1}{N^2}\\sum_i \\sigma(\\tau(f_i-t))\\cdot\\text{is\\_peak}_i
-
-    This approximates β₀(t) (number of connected components above t)
-    under the assumption that each component has exactly one local maximum
-    (valid for dilute / well-separated structures).
-
-    Valley count is the symmetric quantity for the background (β₁ proxy).
+    Detects peaks (local maxima) and valleys (local minima) using a
+    differentiable sigmoid approximation, optionally conditioned on
+    intensity thresholds and evaluated at multiple dyadic scales.
 
     Parameters
     ----------
-    shape        : tuple (Nx, Ny) — must match data.N0
-    thresholds   : Tensor [T] or [B, T] — default threshold grid
-    temperature  : float — sigmoid sharpness
-    connectivity : 4 or 8 — neighbourhood for peak/valley detection
+    shape : tuple of int
+        Spatial shape ``(Nx, Ny)`` matching ``data.N0``.
+    thresholds : Tensor [T] | Tensor [B, T] | None
+        Default threshold grid.  ``None`` = unconditional count.
+    temperature : float
+        Sigmoid sharpness.
+    connectivity : int
+        4 (cardinal) or 8 (incl. diagonals).
+    J : int
+        Number of dyadic scales.
+
+        - ``J=1`` (default) — full resolution.
+        - ``J>1`` — DoG band-pass at each scale j=0..J-1, results stacked
+          along a new ``J`` dimension.
+    wavelet_op : callable or None
+        Reserved for future custom wavelet.  Use ``None`` (DoG).
+    device, dtype
 
     Examples
     --------
-    >>> op = PeakCountOperator2D(shape=(128, 128),
-    ...                          thresholds=torch.linspace(0.1, 0.9, 16))
-    >>> out = op.peaks(data)           # {'peaks': [Nb, Nc, 16]}
-    >>> out = op.valleys(data)         # {'valleys': [Nb, Nc, 16]}
+    >>> t  = torch.linspace(0.1, 0.9, 16)
+    >>> op = PeakCountOperator2D(shape=(128, 128), thresholds=t)
+    >>> out = op.peaks(data)    # {'peaks': [Nb, Nc, 16]}
+
+    >>> op3 = PeakCountOperator2D(shape=(128, 128), thresholds=t, J=3)
+    >>> out3 = op3.peaks(data)  # {'peaks': [Nb, Nc, 3, 16]}
     """
 
     def __init__(
@@ -1932,6 +2017,8 @@ class PeakCountOperator2D:
         thresholds=None,
         temperature: float = 20.0,
         connectivity: int = 8,
+        J: int = 1,
+        wavelet_op=None,
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
     ):
@@ -1939,13 +2026,14 @@ class PeakCountOperator2D:
         self.thresholds   = thresholds
         self.temperature  = temperature
         self.connectivity = connectivity
+        self.J            = J
+        self.wavelet_op   = wavelet_op
         self.device = _get_device(torch.device(device))
         self.dtype  = _get_dtype(dtype=dtype, device=self.device)
 
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    def _prepare(self, data) -> "tuple[torch.Tensor, int, int]":
-        """Validate + return (flat [B,Nx,Ny], Nb, Nc)."""
+    # ------------------------------------------------------------------
+    def _prepare(self, data):
+        """Validate data, return (flat [B, Nx, Ny], padding_mode, Nb, Nc)."""
         if not isinstance(data, STL_2D_Kernel_Torch):
             raise TypeError(f"Expected STL_2D_Kernel_Torch, got {type(data)}")
         if self.shape != data.N0:
@@ -1956,105 +2044,125 @@ class PeakCountOperator2D:
         elif arr.ndim == 3:
             arr = arr[None]
         Nb, Nc, Nx, Ny = arr.shape
-        padding_mode = WaveletOperator2Dkernel_torch._get_padding_mode(
-            pbc=data.pbc if data.pbc is not None else False
-        )
-        flat = arr.reshape(Nb * Nc, Nx, Ny)
-        return flat, padding_mode, Nb, Nc
+        pbc  = getattr(data, "pbc", True)
+        pmode = "circular" if pbc else "replicate"
+        return arr.reshape(Nb * Nc, Nx, Ny), pmode, Nb, Nc
 
-    # ── public methods ────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    def _count_one(self, band, mode, thresholds, temperature, pmode, Nb, Nc):
+        """Compute count dict for a single [B, N, M] band."""
+        B, N, M = band.shape
+        key = "peaks" if mode == "peaks" else "valleys"
+        if mode == "peaks":
+            indicator = _soft_peaks(band, temperature, self.connectivity, pmode)
+            above = True
+        else:
+            indicator = _soft_valleys(band, temperature, self.connectivity, pmode)
+            above = False
 
-    def peaks(self, data, thresholds=None, temperature: float = None):
+        if thresholds is None:
+            count = indicator.mean(dim=(-2, -1))   # [B]
+            return {key: count.view(Nb, Nc)}
+
+        t = _normalise_thresholds(thresholds, B, band.device, band.dtype)
+        T = t.shape[1]
+        counts = _threshold_weighted_sum(band, indicator, t, temperature, above=above)
+        return {key: counts.view(Nb, Nc, T)}
+
+    # ------------------------------------------------------------------
+    def peaks(self, data, thresholds=None, temperature=None):
         """
-        Soft local-maxima count as a function of threshold.
-
-        Parameters
-        ----------
-        data        : STL_2D_Kernel_Torch  — array [..., Nx, Ny]
-        thresholds  : Tensor [T] | [Nb*Nc, T] | None → uses operator default
-        temperature : float | None → uses operator default
+        Soft peak (local-maximum) count, optionally conditioned on threshold.
 
         Returns
         -------
-        dict['peaks']
-            shape [Nb, Nc]    without thresholds
-            shape [Nb, Nc, T] with    thresholds
+        dict['peaks']:
+
+        - J=1, no thresholds : ``[Nb, Nc]``
+        - J=1, thresholds T  : ``[Nb, Nc, T]``
+        - J>1, no thresholds : ``[Nb, Nc, J]``
+        - J>1, thresholds T  : ``[Nb, Nc, J, T]``
         """
+        flat, pmode, Nb, Nc = self._prepare(data)
         thresholds  = thresholds  if thresholds  is not None else self.thresholds
         temperature = temperature if temperature is not None else self.temperature
+        pbc = pmode == "circular"
 
+        if self.J == 1:
+            return self._count_one(flat, "peaks", thresholds, temperature, pmode, Nb, Nc)
+
+        scales = [
+            self._count_one(
+                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op),
+                "peaks", thresholds, temperature, pmode, Nb, Nc,
+            )
+            for j in range(self.J)
+        ]
+        return {"peaks": torch.stack([s["peaks"] for s in scales], dim=2)}
+
+    # ------------------------------------------------------------------
+    def valleys(self, data, thresholds=None, temperature=None):
+        """
+        Soft valley (local-minimum) count, optionally conditioned on threshold.
+
+        Same return-shape convention as :meth:`peaks`.
+        """
         flat, pmode, Nb, Nc = self._prepare(data)
-        B, Nx, Ny = flat.shape
-        is_peak = _soft_peaks(flat, temperature, self.connectivity, pmode)
-
-        if thresholds is None:
-            return {"peaks": (is_peak.mean(dim=(-2, -1))).view(Nb, Nc)}
-
-        t = _normalise_thresholds(thresholds, B, flat.device, flat.dtype)
-        T = t.shape[1]
-        counts = _threshold_weighted_sum(flat, is_peak, t, temperature, above=True)
-        return {"peaks": counts.view(Nb, Nc, T)}
-
-    def valleys(self, data, thresholds=None, temperature: float = None):
-        """
-        Soft local-minima count as a function of threshold.
-
-        Counts valleys **below** the threshold (i.e. background holes).
-
-        Returns
-        -------
-        dict['valleys']  — same shape convention as peaks()
-        """
         thresholds  = thresholds  if thresholds  is not None else self.thresholds
         temperature = temperature if temperature is not None else self.temperature
+        pbc = pmode == "circular"
 
-        flat, pmode, Nb, Nc = self._prepare(data)
-        B, Nx, Ny = flat.shape
-        is_valley = _soft_valleys(flat, temperature, self.connectivity, pmode)
+        if self.J == 1:
+            return self._count_one(flat, "valleys", thresholds, temperature, pmode, Nb, Nc)
 
-        if thresholds is None:
-            return {"valleys": (is_valley.mean(dim=(-2, -1))).view(Nb, Nc)}
-
-        t = _normalise_thresholds(thresholds, B, flat.device, flat.dtype)
-        T = t.shape[1]
-        counts = _threshold_weighted_sum(flat, is_valley, t, temperature, above=False)
-        return {"valleys": counts.view(Nb, Nc, T)}
+        scales = [
+            self._count_one(
+                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op),
+                "valleys", thresholds, temperature, pmode, Nb, Nc,
+            )
+            for j in range(self.J)
+        ]
+        return {"valleys": torch.stack([s["valleys"] for s in scales], dim=2)}
 
 
 ###############################################################################
 class BettiCurveOperator2D:
     """
-    Betti curves β₀(t) and β₁(t) for 2D planar STL data.
+    Differentiable Betti curves for 2D planar STL data.
 
-    **Approximation scheme (Morse theory):**
+    Approximates topological Betti numbers as functions of an intensity
+    threshold using soft / differentiable surrogates:
 
-    - β₀(t) ≈ soft peak count above t  (one maximum per connected component)
-    - χ(t)   = Minkowski W₂ pixel-complex formula  (exact for hard binary)
-    - β₁(t)  = β₀(t) − χ(t)           (one minimum per hole)
-
-    All three quantities are fully differentiable w.r.t. ``data.array``.
-
-    **Validity:** The peak-count approximation for β₀ is tight when the
-    excursion set A_t consists of well-separated, simply-connected blobs
-    (no merging saddles above t).  For highly connected or noisy fields
-    the curves are soft proxies — still useful as differentiable loss terms
-    or feature vectors.
+    - **β₀(t)** ≈ soft peak count above t  (Morse theory: one max per component)
+    - **χ(t)**  = Minkowski W2(t)           (exact pixel-complex Euler char.)
+    - **β₁(t)** = β₀(t) − χ(t)
 
     Parameters
     ----------
-    shape        : tuple (Nx, Ny)
-    thresholds   : Tensor [T] — threshold grid (required; Betti curves need it)
-    temperature  : float
-    connectivity : 4 or 8
+    shape : tuple of int
+        Spatial shape ``(Nx, Ny)`` matching ``data.N0``.
+    thresholds : Tensor [T] | Tensor [B, T]
+        Threshold levels (required; there is no single-threshold mode).
+    temperature : float
+        Sigmoid sharpness.
+    connectivity : int
+        4 or 8 — neighbourhood for peak detection.
+    J : int
+        Number of dyadic scales (1 = full resolution; >1 = multi-scale DoG).
+    wavelet_op : callable or None
+        Reserved for custom wavelet.
+    device, dtype
 
     Examples
     --------
-    >>> t  = torch.linspace(0.05, 0.95, 32)
+    >>> t  = torch.linspace(0.1, 0.9, 16)
     >>> op = BettiCurveOperator2D(shape=(128, 128), thresholds=t)
-    >>> bc = op.betti(data)
-    >>> bc['beta0'].shape   # [Nb, Nc, 32]
-    >>> bc['beta1'].shape   # [Nb, Nc, 32]
-    >>> bc['chi'].shape     # [Nb, Nc, 32]  (= W2 Minkowski curve)
+    >>> out = op.betti(data)
+    >>> # out['beta0'].shape == out['beta1'].shape == out['chi'].shape == [Nb, Nc, 16]
+
+    >>> op3 = BettiCurveOperator2D(shape=(128, 128), thresholds=t, J=3)
+    >>> out3 = op3.betti(data)
+    >>> # out3['beta0'].shape == [Nb, Nc, 3, 16]
     """
 
     def __init__(
@@ -2063,6 +2171,8 @@ class BettiCurveOperator2D:
         thresholds,
         temperature: float = 20.0,
         connectivity: int = 8,
+        J: int = 1,
+        wavelet_op=None,
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
     ):
@@ -2070,72 +2180,80 @@ class BettiCurveOperator2D:
         self.thresholds   = thresholds
         self.temperature  = temperature
         self.connectivity = connectivity
+        self.J            = J
+        self.wavelet_op   = wavelet_op
         self.device = _get_device(torch.device(device))
         self.dtype  = _get_dtype(dtype=dtype, device=self.device)
 
-        self._peak_op = PeakCountOperator2D(
-            shape=shape, temperature=temperature,
-            connectivity=connectivity, device=device, dtype=dtype,
-        )
+    # ------------------------------------------------------------------
+    def _betti_one(self, band, thresholds, temperature, pmode, Nb, Nc):
+        """Compute Betti dict for a single [B, N, M] band."""
+        B, N, M = band.shape
+        t = _normalise_thresholds(thresholds, B, band.device, band.dtype)
+        T = t.shape[1]
 
-    def betti(self, data, thresholds=None, temperature: float = None):
+        # β0 : soft peak count above each threshold
+        indicator = _soft_peaks(band, temperature, self.connectivity, pmode)
+        beta0 = _threshold_weighted_sum(band, indicator, t, temperature, above=True)
+
+        # χ : Minkowski W2 curves
+        chi = _mink2d_curves(band, t, temperature=temperature)["W2"]   # [B, T]
+
+        # β1 = β0 − χ
+        beta1 = beta0 - chi
+
+        return {
+            "beta0": beta0.view(Nb, Nc, T),
+            "beta1": beta1.view(Nb, Nc, T),
+            "chi":   chi.view(Nb, Nc, T),
+        }
+
+    # ------------------------------------------------------------------
+    def betti(self, data, thresholds=None, temperature=None):
         """
-        Compute Betti curves β₀(t), β₁(t) and the Euler curve χ(t).
-
-        Parameters
-        ----------
-        data        : STL_2D_Kernel_Torch
-        thresholds  : Tensor [T] | [Nb*Nc, T] | None → uses operator default
-        temperature : float | None
+        Compute Betti curves β₀(t), β₁(t) and Euler characteristic χ(t).
 
         Returns
         -------
-        dict with keys:
+        dict with keys ``'beta0'``, ``'beta1'``, ``'chi'``:
 
-        'beta0' : [Nb, Nc, T]  — connected components (soft peak count)
-        'beta1' : [Nb, Nc, T]  — holes / loops  (= beta0 − chi)
-        'chi'   : [Nb, Nc, T]  — Euler characteristic (= Minkowski W2)
+        - J=1 : each of shape ``[Nb, Nc, T]``
+        - J>1 : each of shape ``[Nb, Nc, J, T]``
 
-        All fully differentiable w.r.t. data.array.
+        All outputs are fully differentiable w.r.t. ``data.array``.
         """
+        if not isinstance(data, STL_2D_Kernel_Torch):
+            raise TypeError(f"Expected STL_2D_Kernel_Torch, got {type(data)}")
+        if self.shape != data.N0:
+            raise ValueError(f"Shape mismatch: {self.shape} vs {data.N0}")
+
+        arr = data.array.abs() if torch.is_complex(data.array) else data.array
+        if arr.ndim == 2:
+            arr = arr[None, None]
+        elif arr.ndim == 3:
+            arr = arr[None]
+        Nb, Nc, Nx, Ny = arr.shape
+        flat = arr.reshape(Nb * Nc, Nx, Ny)
+        pbc  = getattr(data, "pbc", True)
+        pmode = "circular" if pbc else "replicate"
+
         thresholds  = thresholds  if thresholds  is not None else self.thresholds
         temperature = temperature if temperature is not None else self.temperature
 
         if thresholds is None:
             raise ValueError("thresholds must be provided for Betti curves.")
 
-        flat, pmode, Nb, Nc = self._peak_op._prepare(data)
-        B, Nx, Ny = flat.shape
+        if self.J == 1:
+            return self._betti_one(flat, thresholds, temperature, pmode, Nb, Nc)
 
-        t = _normalise_thresholds(thresholds, B, flat.device, flat.dtype)
-        T = t.shape[1]
-
-        # ── β₀ : soft peak count above each threshold ─────────────────────────
-        is_peak = _soft_peaks(flat, temperature, self.connectivity, pmode)  # [B,N,M]
-        beta0 = _threshold_weighted_sum(
-            flat, is_peak, t, temperature, above=True
-        )  # [B, T]
-
-        # ── χ : Minkowski W2 at each threshold (pixel-complex formula) ─────────
-        # Reuse the soft excursion-set images already needed for peak weighting
-        img_exp = flat.unsqueeze(1)                              # [B, 1, N, M]
-        soft    = torch.sigmoid(
-            temperature * (img_exp - t.view(B, T, 1, 1))
-        )  # [B, T, N, M]
-        s = soft.view(B * T, Nx, Ny)                            # [B*T, N, M]
-
-        Q1 = s.sum(dim=(-2, -1))
-        Qh = (s[:, :,  :-1] * s[:, :,  1:]).sum(dim=(-2, -1))
-        Qv = (s[:, :-1, :]  * s[:, 1:, :] ).sum(dim=(-2, -1))
-        Qf = (s[:, :-1, :-1] * s[:, :-1, 1:]
-            * s[:,  1:, :-1] * s[:,  1:,  1:]).sum(dim=(-2, -1))
-        chi = ((Q1 - Qh - Qv + Qf) / (Nx * Ny)).view(B, T)    # [B, T]
-
-        # ── β₁ = β₀ − χ ────────────────────────────────────────────────────────
-        beta1 = beta0 - chi   # can be slightly < 0 due to Morse approximation
-
+        scale_results = [
+            self._betti_one(
+                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op),
+                thresholds, temperature, pmode, Nb, Nc,
+            )
+            for j in range(self.J)
+        ]
         return {
-            "beta0": beta0.view(Nb, Nc, T),
-            "beta1": beta1.view(Nb, Nc, T),
-            "chi":   chi  .view(Nb, Nc, T),
+            k: torch.stack([sr[k] for sr in scale_results], dim=2)
+            for k in scale_results[0]
         }
