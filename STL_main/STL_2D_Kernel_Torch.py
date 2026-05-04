@@ -991,7 +991,7 @@ class WaveletOperator2Dkernel_torch:
                 Njx, Njy = N0x, N0y
                 g_j_fftshift = torch.ones(
                     Njx, Njy, device=self.device, dtype=cdtype
-                )
+                )   # G_0 = 1 in any convention
             else:
                 # Impulse at (0,0) in standard FFT convention
                 impulse = torch.zeros(N0x, N0y, device=self.device, dtype=rdtype)
@@ -1003,30 +1003,30 @@ class WaveletOperator2Dkernel_torch:
                 )   # [Njx, Njy]
                 Njx, Njy = imp_ds.shape[-2:]
 
-                # FFT → standard convention, then fftshift to match wavelet_array_MR
-                g_j_fftshift = torch.fft.fftshift(
-                    torch.fft.fft2(imp_ds, norm="ortho"),
-                    dim=(-2, -1),
-                ).to(cdtype)   # [Njx, Njy]
+                # FFT → standard FFT order (same convention as wavelet_array_MR)
+                # NOTE: do NOT fftshift here — psi_j (wavelet_array_MR[j]) is stored
+                # in standard FFT order (DC at corners), so g_j must also be standard.
+                g_j_fftshift = torch.fft.fft2(
+                    imp_ds, norm="ortho"
+                ).to(cdtype)   # [Njx, Njy]  standard FFT order
 
-            # ── 2. Target FFT wavelet at scale j (fftshifted, Nj res) ─────
+            # ── 2. Target FFT wavelet at scale j (standard FFT order, Nj res) ──
             psi_j = fft_wavelet_op.wavelet_array_MR[j].to(
                 device=self.device, dtype=cdtype
-            )   # [L, Njx, Njy]
+            )   # [L, Njx, Njy]  — standard FFT order (same as wavelet_array)
 
             # ── 3. Wiener deconvolution ────────────────────────────────────
             g2     = g_j_fftshift.abs().pow(2)          # [Njx, Njy]
             reg    = eps * g2.max()                      # scalar regulariser
             k_fft  = psi_j * g_j_fftshift.conj() / (g2 + reg)   # [L, Njx, Njy]
 
-            # ── 4. Back to pixel space (fftshifted → standard → IFFT) ─────
+            # ── 4. Back to pixel space (standard FFT → IFFT → center) ─────
+            # k_fft is in standard FFT order → direct IFFT gives spatial kernel
+            # with peak at corner [0,0]; fftshift re-centers it to [Nj//2, Nj//2].
             kernel_spatial = torch.fft.fftshift(
-                torch.fft.ifft2(
-                    torch.fft.ifftshift(k_fft, dim=(-2, -1)),
-                    norm="ortho",
-                ),
+                torch.fft.ifft2(k_fft, norm="ortho"),
                 dim=(-2, -1),
-            )   # [L, Njx, Njy], complex
+            )   # [L, Njx, Njy], complex — centered at (Nj//2, Nj//2)
 
             # ── 5. Hann-windowed crop to K×K ──────────────────────────────
             cx, cy = Njx // 2, Njy // 2
@@ -1094,12 +1094,11 @@ class WaveletOperator2Dkernel_torch:
                 device=self.device, dtype=cdtype
             )   # [L, Nx, Ny]  (fftshifted Fourier-space wavelet)
 
-            # Full spatial impulse response
+            # Full spatial impulse response.
+            # wavelet_array[j] is in standard FFT order (DC at corners, same as fft2 output).
+            # Direct IFFT → spatial kernel with peak at [0,0]; fftshift re-centers.
             wav_spatial = torch.fft.fftshift(
-                torch.fft.ifft2(
-                    torch.fft.ifftshift(wav_fft, dim=(-2, -1)),
-                    norm="ortho",
-                ),
+                torch.fft.ifft2(wav_fft, norm="ortho"),
                 dim=(-2, -1),
             )   # [L, Nx, Ny]
 
