@@ -1637,26 +1637,40 @@ def _extract_scale_flat(
     j: int,
     pbc: bool = True,
     wavelet_op=None,
+    scale_mode: str = "smooth",
 ) -> torch.Tensor:
     """
-    Return the wavelet band at dyadic scale j for a [B, N, M] batch.
+    Return the scale-j representation of a [B, N, M] batch.
 
-    With ``wavelet_op=None`` (default) a Difference-of-Gaussians (DoG) is used:
-        band_j = |Gauss(sigma=2^j) − Gauss(sigma=2^(j+1))|
-
-    With a custom ``wavelet_op`` the band is the orientation-averaged
-    Morlet modulus at scale j (reserved for future use).
+    Parameters
+    ----------
+    j : int
+        Dyadic scale index (0 = finest).  Gaussian sigma = 2^(j+1).
+    pbc : bool
+        Periodic boundary → circular padding.
+    scale_mode : str
+        ``'smooth'`` (default) — Gaussian low-pass at sigma=2^(j+1).
+            Minkowski / Betti computed on the smoothed field; thresholds
+            retain their physical meaning.
+        ``'dog'`` — Difference-of-Gaussians band-pass |G(σ/2) − G(σ)|.
+            Isolates detail at scale j (wavelet-style).
+    wavelet_op : callable or None
+        Reserved for future custom wavelet.
     """
+    if wavelet_op is not None:
+        raise NotImplementedError(
+            "Custom wavelet_op is not yet implemented. Use wavelet_op=None."
+        )
     padding_mode = "circular" if pbc else "replicate"
-    if wavelet_op is None:
-        sigma_lo = 2.0 ** j
-        sigma_hi = 2.0 ** (j + 1)
-        g_lo = _gaussian_filter_2d(flat, sigma_lo, padding_mode=padding_mode)
-        g_hi = _gaussian_filter_2d(flat, sigma_hi, padding_mode=padding_mode)
+    sigma = 2.0 ** (j + 1)   # sigma = 2, 4, 8, 16, ...
+    if scale_mode == "smooth":
+        return _gaussian_filter_2d(flat, sigma, padding_mode=padding_mode)
+    elif scale_mode == "dog":
+        g_lo = _gaussian_filter_2d(flat, sigma / 2, padding_mode=padding_mode)
+        g_hi = _gaussian_filter_2d(flat, sigma,     padding_mode=padding_mode)
         return (g_lo - g_hi).abs()
-    raise NotImplementedError(
-        "Custom wavelet_op is not yet implemented. Use wavelet_op=None (DoG)."
-    )
+    else:
+        raise ValueError(f"scale_mode must be 'smooth' or 'dog', got '{scale_mode}'")
 
 
 # ── Minkowski helpers ─────────────────────────────────────────────────────────
@@ -1774,6 +1788,7 @@ class MinkowskiOperator2D:
         thresholds=None,
         temperature: float = 20.0,
         J: int = 1,
+        scale_mode: str = "smooth",
         wavelet_op=None,
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
@@ -1782,6 +1797,7 @@ class MinkowskiOperator2D:
         self.thresholds = thresholds
         self.temperature = temperature
         self.J = J
+        self.scale_mode = scale_mode
         self.wavelet_op = wavelet_op
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
@@ -1862,7 +1878,7 @@ class MinkowskiOperator2D:
 
         # ── Multi-scale ──────────────────────────────────────────────────────
         scale_results = [
-            _compute_one(_extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op))
+            _compute_one(_extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op, scale_mode=self.scale_mode))
             for j in range(self.J)
         ]
         # stack along J dimension (inserted after Nc)
@@ -2018,6 +2034,7 @@ class PeakCountOperator2D:
         temperature: float = 20.0,
         connectivity: int = 8,
         J: int = 1,
+        scale_mode: str = "smooth",
         wavelet_op=None,
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
@@ -2027,6 +2044,7 @@ class PeakCountOperator2D:
         self.temperature  = temperature
         self.connectivity = connectivity
         self.J            = J
+        self.scale_mode   = scale_mode
         self.wavelet_op   = wavelet_op
         self.device = _get_device(torch.device(device))
         self.dtype  = _get_dtype(dtype=dtype, device=self.device)
@@ -2093,7 +2111,7 @@ class PeakCountOperator2D:
 
         scales = [
             self._count_one(
-                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op),
+                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op, scale_mode=self.scale_mode),
                 "peaks", thresholds, temperature, pmode, Nb, Nc,
             )
             for j in range(self.J)
@@ -2117,7 +2135,7 @@ class PeakCountOperator2D:
 
         scales = [
             self._count_one(
-                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op),
+                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op, scale_mode=self.scale_mode),
                 "valleys", thresholds, temperature, pmode, Nb, Nc,
             )
             for j in range(self.J)
@@ -2172,6 +2190,7 @@ class BettiCurveOperator2D:
         temperature: float = 20.0,
         connectivity: int = 8,
         J: int = 1,
+        scale_mode: str = "smooth",
         wavelet_op=None,
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
@@ -2181,6 +2200,7 @@ class BettiCurveOperator2D:
         self.temperature  = temperature
         self.connectivity = connectivity
         self.J            = J
+        self.scale_mode   = scale_mode
         self.wavelet_op   = wavelet_op
         self.device = _get_device(torch.device(device))
         self.dtype  = _get_dtype(dtype=dtype, device=self.device)
@@ -2248,7 +2268,7 @@ class BettiCurveOperator2D:
 
         scale_results = [
             self._betti_one(
-                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op),
+                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op, scale_mode=self.scale_mode),
                 thresholds, temperature, pmode, Nb, Nc,
             )
             for j in range(self.J)
