@@ -1006,9 +1006,10 @@ class WaveletOperator2Dkernel_torch:
                 # FFT → standard FFT order (same convention as wavelet_array_MR)
                 # NOTE: do NOT fftshift here — psi_j (wavelet_array_MR[j]) is stored
                 # in standard FFT order (DC at corners), so g_j must also be standard.
-                g_j_fftshift = torch.fft.fft2(
-                    imp_ds, norm="ortho"
-                ).to(cdtype)   # [Njx, Njy]  standard FFT order
+                # Standard DFT (no norm): G_j(0) = 1 for a unit impulse at [0,0].
+                # This matches the convention  DFT_standard(k_j) = Ψ_j / G_j
+                # so that  k_j ⊛ x_j  reproduces  IFFT_ortho(FFT_ortho(x) · Ψ_j).
+                g_j_fftshift = torch.fft.fft2(imp_ds).to(cdtype)   # [Njx, Njy]
 
             # ── 2. Target FFT wavelet at scale j (standard FFT order, Nj res) ──
             psi_j = fft_wavelet_op.wavelet_array_MR[j].to(
@@ -1023,8 +1024,10 @@ class WaveletOperator2Dkernel_torch:
             # ── 4. Back to pixel space (standard FFT → IFFT → center) ─────
             # k_fft is in standard FFT order → direct IFFT gives spatial kernel
             # with peak at corner [0,0]; fftshift re-centers it to [Nj//2, Nj//2].
+            # Standard IDFT (no norm, i.e. 1/N factor) → k_j = IDFT_standard(k_fft)
+            # so that  conv(x_j, k_j)  = x_j ⊛ k_j  matches the FFT op output.
             kernel_spatial = torch.fft.fftshift(
-                torch.fft.ifft2(k_fft, norm="ortho"),
+                torch.fft.ifft2(k_fft),
                 dim=(-2, -1),
             )   # [L, Njx, Njy], complex — centered at (Nj//2, Nj//2)
 
@@ -1097,8 +1100,10 @@ class WaveletOperator2Dkernel_torch:
             # Full spatial impulse response.
             # wavelet_array[j] is in standard FFT order (DC at corners, same as fft2 output).
             # Direct IFFT → spatial kernel with peak at [0,0]; fftshift re-centers.
+            # Standard IDFT (no norm) → ψ_j = IDFT_standard(Ψ_j) so that
+            # conv(x, ψ_j) = IFFT_ortho(FFT_ortho(x) · Ψ_j) (FFT op convention).
             wav_spatial = torch.fft.fftshift(
-                torch.fft.ifft2(wav_fft, norm="ortho"),
+                torch.fft.ifft2(wav_fft),
                 dim=(-2, -1),
             )   # [L, Nx, Ny]
 
