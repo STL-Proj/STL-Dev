@@ -133,16 +133,18 @@ class ST_Statistics:
         self.mask_st = None  # Not used in flatten method for now
 
     @staticmethod
-    def _get_sqrt_chan_diag(stat_ref):
+    def _get_sqrt_chan_diag(stat_ref, norm_batch_mean):
         """
         Prepare S2_ref that has shape [Nb,Nc,Nc,J,L] or PS_ref that has shape [Nb,Nc,Nc,n_bins]
-        by keeping its diagonal and applying sqrt
+        by keeping its diagonal, averaging over the batch dimension if norm_batch_mean is True, and applying sqrt.
         """
         stat_ref_chan_diag = stat_ref.diagonal(dim1=1, dim2=2).movedim(
             -1, 1
         )  # [Nb,Nc,J,L] or [Nb,Nc,n_bins] for S2 or PS
         stat_ref_sqrt_chan_diag = bk.sqrt(
-            stat_ref_chan_diag
+            stat_ref_chan_diag.mean(dim=0, keepdim=True)
+            if norm_batch_mean
+            else stat_ref_chan_diag
         )  # [Nb,Nc,J,L] or [Nb,Nc,n_bins]
         return stat_ref_sqrt_chan_diag
 
@@ -226,45 +228,29 @@ class ST_Statistics:
                 if self.S2_ref_sqrt_chan_diag is None:
                     # prepare self.S2 that has shape [Nb,Nc,Nc,J,L] by keeping its diagonal and applying sqrt
                     # and store as reference
-                    S2_ref_sqrt_chan_diag = self._get_sqrt_chan_diag(self.S2)
-                    self.S2_ref_sqrt_chan_diag = (
-                        S2_ref_sqrt_chan_diag
-                        if not norm_batch_mean
-                        else S2_ref_sqrt_chan_diag.mean(dim=0, keepdim=True)
+                    self.S2_ref_sqrt_chan_diag = self._get_sqrt_chan_diag(
+                        self.S2, norm_batch_mean=norm_batch_mean
                     )
 
             if self.compute_PS:
                 if self.PS_ref_sqrt_chan_diag is None:
-                    # prepare self.S2 that has shape [Nb,Nc,Nc,J,L] by keeping its diagonal and applying sqrt
+                    # prepare self.PS that has shape [Nb,Nc,Nc,J,L] by keeping its diagonal, averaging over the batch dimension if norm_batch_mean is True, and applying sqrt
                     # and store as reference
-                    PS_ref_sqrt_chan_diag = self._get_sqrt_chan_diag(self.PS)
-                    self.PS_ref_sqrt_chan_diag = (
-                        PS_ref_sqrt_chan_diag
-                        if not norm_batch_mean
-                        else PS_ref_sqrt_chan_diag.mean(dim=0, keepdim=True)
+                    self.PS_ref_sqrt_chan_diag = self._get_sqrt_chan_diag(
+                        self.PS, norm_batch_mean=norm_batch_mean
                     )
 
         # Load_ref normalization
         elif norm_type == "from_ref":
 
-            self.var_ref = (
-                var_ref if not norm_batch_mean else var_ref.mean(dim=0, keepdim=True)
-            )
+            self.var_ref = var_ref
 
             if self.SC == "ScatCov":
                 # store as reference
-                self.S2_ref_sqrt_chan_diag = (
-                    S2_ref_sqrt_chan_diag
-                    if not norm_batch_mean
-                    else S2_ref_sqrt_chan_diag.mean(dim=0, keepdim=True)
-                )
+                self.S2_ref_sqrt_chan_diag = S2_ref_sqrt_chan_diag
 
             if self.compute_PS:
-                self.PS_ref_sqrt_chan_diag = (
-                    PS_ref_sqrt_chan_diag
-                    if not norm_batch_mean
-                    else PS_ref_sqrt_chan_diag.mean(dim=0, keepdim=True)
-                )
+                self.PS_ref_sqrt_chan_diag = PS_ref_sqrt_chan_diag
 
         # Perform normalization and store reference
         self.var = self.var / self.var_ref

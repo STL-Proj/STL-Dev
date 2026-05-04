@@ -54,7 +54,7 @@ def save_comp_sep(
         vmax=residual_U.max().item(),
         cmap="viridis",
     )
-    axes[0, 3].set_title("Residual $d_U - \\tilde{s}_U$")
+    axes[0, 3].set_title("$d_U - \\tilde{s}_U$")
 
     # plotting d_Q, s_Q_opt, s_Q_opt_noisy, and residual_Q
     im_Q1 = axes[1, 0].imshow(
@@ -78,7 +78,7 @@ def save_comp_sep(
         vmax=residual_Q.max().item(),
         cmap="viridis",
     )
-    axes[1, 3].set_title("Residual $d_Q - \\tilde{s}_Q$")
+    axes[1, 3].set_title("$d_Q - \\tilde{s}_Q$")
 
     # layout adjustments
     for ax in axes.flat:
@@ -91,7 +91,29 @@ def save_comp_sep(
 
 
 # Full phase (5-channel phase)
-def baseline_comp_sep(DATA_PATH, N, STL_DataClass):
+def baseline_comp_sep(
+    DATA_PATH,
+    N=10,
+    max_iter=25,
+    batch_size=None,
+    resampling_period=None,
+    epoch_period=None,
+    STL_DataClass=STL_2D_FFT_Torch,
+):
+
+    # Set default values for optional parameters
+    if batch_size is None:
+        batch_size = N  # Default to full batch if not specified
+    if resampling_period is None:
+        resampling_period = max_iter  # Default to no resampling if not specified
+    if epoch_period is None:
+        epoch_period = max_iter  # Default to single epoch if not specified
+
+    # Sanity checks
+    assert batch_size <= N, "Stochastic batch size must be less than or equal to N."
+    assert (
+        resampling_period <= max_iter
+    ), "Resampling period must be less than or equal to max iterations."
 
     # Load target map
     s_U, s_Q, d_I = np.load(DATA_TEST_PATH + "/" + "Turb_6.npy")[:3, :, :]
@@ -119,6 +141,8 @@ def baseline_comp_sep(DATA_PATH, N, STL_DataClass):
         dim=1,
     )  # [N, 5, H, W]
 
+    compute_PS = not target_maps.isnan().any()
+
     running_maps = torch.stack([d_U.clone(), d_Q.clone()], dim=0)  # [2, H, W]
     running_maps.requires_grad_(True)
 
@@ -128,7 +152,13 @@ def baseline_comp_sep(DATA_PATH, N, STL_DataClass):
             [False, True, False, False, False],
             [False, False, True, False, True],
             [False, False, False, True, False],
-            [False, False, False, False, False],
+            [
+                False,
+                False,
+                False,
+                False,
+                True,
+            ],  # Auto-stats for ancillary data computed for normalization concerns.
         ],
         dtype=torch.bool,
     )  # [5, 5]
@@ -136,7 +166,7 @@ def baseline_comp_sep(DATA_PATH, N, STL_DataClass):
     optimizer = torch.optim.LBFGS(
         [running_maps],
         lr=1,
-        max_iter=25,
+        max_iter=max_iter,
         tolerance_grad=1e-17,
         tolerance_change=1e-17,
         history_size=100,
@@ -144,40 +174,61 @@ def baseline_comp_sep(DATA_PATH, N, STL_DataClass):
     )
 
     # Utils function to compute stats and flatten them for the loss computation
-    def stats_flatten(data, st_op, norm=None):
+    def stats_flatten(data, st_op, compute_PS, norm=None):
         return st_op.apply(
-            data, norm=norm, compute_cross_matrix=compute_cross_matrix
+            data,
+            norm=norm,
+            norm_batch_mean=True,
+            compute_cross_matrix=compute_cross_matrix,
+            compute_PS=compute_PS,
         ).to_flatten(keep_batch_dim=True)
+
+    # Split total iterations into epoch iterations
+    n_epochs = max_iter // epoch_period
+    n_iter_per_epoch = [epoch_period] * n_epochs + (
+        [max_iter % epoch_period] if max_iter % epoch_period > 0 else []
+    )
 
     loss_history = []
     print_iter = 5
 
-    with torch.no_grad():
-        stl_target_maps = STL_DataClass(target_maps, pbc=True)
-        st_op = stl_target_maps.get_ST_op()
-        stats_target_maps = stats_flatten(
-            stl_target_maps, st_op, norm="store_ref"
-        )  # [N, n_stats]
+    # Use a mutable objects to allow modification inside closure
+    iter_counter = [0]
+    indices = torch.arange(
+        batch_size
+    )  # Initialize randomly, will be updated in closure
 
     def closure():
         optimizer.zero_grad()
 
+        if iter_counter[0] % resampling_period == 0:
+            perm = torch.randperm(N)
+            indices[:] = perm[:batch_size]
+
+        iter_counter[0] += 1
+
         rm = torch.stack(
             [
-                running_maps[0].unsqueeze(0) + c_U[2:],  # [N, H, W]
-                (d_U - running_maps[0]).unsqueeze(0).repeat(N, 1, 1),  # [N, H, W]
-                running_maps[1].unsqueeze(0) + c_Q[2:],  # [N, H, W]
-                (d_Q - running_maps[1]).unsqueeze(0).repeat(N, 1, 1),  # [N, H, W]
-                d_I.unsqueeze(0).repeat(N, 1, 1),  # [N, H, W]
+                running_maps[0].unsqueeze(0) + c_U[2:][indices],  # [batch_size, H, W]
+                (d_U - running_maps[0])
+                .unsqueeze(0)
+                .repeat(batch_size, 1, 1),  # [batch_size, H, W]
+                running_maps[1].unsqueeze(0) + c_Q[2:][indices],  # [batch_size, H, W]
+                (d_Q - running_maps[1])
+                .unsqueeze(0)
+                .repeat(batch_size, 1, 1),  # [batch_size, H, W]
+                d_I.unsqueeze(0).repeat(batch_size, 1, 1),  # [batch_size, H, W]
             ],
             dim=1,
-        )  # [N, 5, H, W]
+        )  # [batch_size, 5, H, W]
 
         stl_rm = STL_DataClass(rm, pbc=True)
 
-        stats_rm = stats_flatten(stl_rm, st_op, norm="load_ref")  # [N, n_stats]
+        stats_rm = stats_flatten(
+            stl_rm, st_op, norm="load_ref", compute_PS=compute_PS
+        )  # [batch_size, n_stats]
 
-        loss = (stats_rm - stats_target_maps).abs().square().sum(dim=1).mean()
+        loss = (stats_rm - stats_target_maps[indices]).abs().square().sum(dim=1).mean()
 
         loss.backward()
         loss_history.append(loss.item())
@@ -188,7 +239,58 @@ def baseline_comp_sep(DATA_PATH, N, STL_DataClass):
         return loss
 
     start = time.perf_counter()
-    optimizer.step(closure)
+
+    with torch.no_grad():
+        stl_target_maps = STL_DataClass(target_maps, pbc=True)
+        st_op = stl_target_maps.get_ST_op()
+        stats_target_maps = stats_flatten(
+            stl_target_maps, st_op, norm="store_ref", compute_PS=compute_PS
+        )  # [N, n_stats]
+
+    for epoch_index, n_iters in enumerate(n_iter_per_epoch):
+        print(
+            f"--- Epoch {epoch_index+1}/{len(n_iter_per_epoch)} ({n_iters} iters) ---"
+        )
+
+        optimizer.param_groups[0]["max_iter"] = n_iters
+
+        # Update normalisation term with the current running maps stats at the beginning of each epoch
+        if epoch_index > 0:
+            with torch.no_grad():
+                stl_current_maps = STL_DataClass(
+                    torch.stack(
+                        [
+                            running_maps[0].unsqueeze(0) + c_U[2:],  # [N, H, W]
+                            (d_U - running_maps[0])
+                            .unsqueeze(0)
+                            .repeat(N, 1, 1),  # [N, H, W]
+                            running_maps[1].unsqueeze(0) + c_Q[2:],  # [N, H, W]
+                            (d_Q - running_maps[1])
+                            .unsqueeze(0)
+                            .repeat(N, 1, 1),  # [N, H, W]
+                            d_I.unsqueeze(0).repeat(N, 1, 1),  # [N, H, W]
+                        ],
+                        dim=1,
+                    ),
+                    pbc=True,
+                )
+                st_op_current = stl_current_maps.get_ST_op()
+                stats_current_maps = st_op_current.apply(
+                    stl_current_maps,
+                    norm="store_ref",
+                    norm_batch_mean=True,
+                    compute_cross_matrix=compute_cross_matrix,
+                    compute_PS=compute_PS,
+                )
+
+                # ------- Transfer reference normalization from current running operator to target operator -------
+                st_op.S2_ref_sqrt_chan_diag = st_op_current.S2_ref_sqrt_chan_diag
+                st_op.var_ref = st_op_current.var_ref
+                if compute_PS:
+                    st_op.PS_ref_sqrt_chan_diag = st_op_current.PS_ref_sqrt_chan_diag
+
+        optimizer.step(closure)
+
     end = time.perf_counter()
 
     print(f"{len(loss_history)} iterations of synthesis.")
@@ -197,12 +299,23 @@ def baseline_comp_sep(DATA_PATH, N, STL_DataClass):
     running_maps = running_maps.detach()
 
     # Compute the optimal noisy maps and the residuals for validation
-    s_U_opt_noisy = running_maps[0] + c_U[2]
-    s_Q_opt_noisy = running_maps[1] + c_Q[2]
-    residual_U = d_U - running_maps[0]
-    residual_Q = d_Q - running_maps[1]
+    s_U_opt = running_maps[0]
+    s_Q_opt = running_maps[1]
+    s_U_opt_noisy = s_U_opt + c_U[2]
+    s_Q_opt_noisy = s_Q_opt + c_Q[2]
+    residual_U = d_U - s_U_opt
+    residual_Q = d_Q - s_Q_opt
 
-    return d_U, d_Q, s_U_opt_noisy, s_Q_opt_noisy, residual_U, residual_Q
+    return (
+        d_U,
+        d_Q,
+        s_U_opt,
+        s_Q_opt,
+        s_U_opt_noisy,
+        s_Q_opt_noisy,
+        residual_U,
+        residual_Q,
+    )
 
 
 if __name__ == "__main__":
@@ -221,14 +334,24 @@ if __name__ == "__main__":
     )
 
     # Full phase (5-channel phase) component separation
-    d_U, d_Q, s_U_opt_noisy, s_Q_opt_noisy, residual_U, residual_Q = baseline_comp_sep(
-        DATA_TEST_PATH, N=10, STL_DataClass=STL_2D_FFT_Torch
+    d_U, d_Q, s_U_opt, s_Q_opt, s_U_opt_noisy, s_Q_opt_noisy, residual_U, residual_Q = (
+        baseline_comp_sep(
+            DATA_TEST_PATH,
+            N=100,
+            max_iter=25,
+            batch_size=10,
+            resampling_period=5,
+            epoch_period=10,
+            STL_DataClass=STL_2D_FFT_Torch,
+        )
     )
     output_dir_name = "comp_sep_5channels_results"
     os.makedirs(output_dir_name, exist_ok=True)
     save_comp_sep(
         d_U,
         d_Q,
+        s_U_opt,
+        s_Q_opt,
         s_U_opt_noisy,
         s_Q_opt_noisy,
         residual_U,
