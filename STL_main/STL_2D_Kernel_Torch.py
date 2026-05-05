@@ -1087,7 +1087,7 @@ class WaveletOperator2Dkernel_torch:
             patch = patch * (full_energy / patch_energy)
 
             kernels.append(patch.reshape(1, self.L, K, K))
-
+            print('W ',patch)
         self._atrous_kernels = kernels
         self._use_atrous     = True
         print(f"À-trous kernels built: J={self.J}, K={K}×{K}.")
@@ -1659,7 +1659,6 @@ class WaveletOperator2Dkernel_torch:
             # --- normalise to sum = 1 ---
             patch = patch / patch.sum()
 
-            print(patch)
             # --- cast to caller's real dtype ---
             if dtype == torch.complex64:
                 rdtype = torch.float32
