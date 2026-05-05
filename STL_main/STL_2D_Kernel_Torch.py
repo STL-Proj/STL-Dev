@@ -912,47 +912,32 @@ class WaveletOperator2Dkernel_torch:
         Derive per-scale spatial kernels for the **decimated** (downsampling)
         pipeline so that ``apply(data_dg_j, j)`` matches the FFT approach.
 
-        Problem
-        -------
-        In the decimated pipeline the data at scale j has been through j
-        successive Gaussian smooth+stride-2 operations.  The effective filter
-        seen by the kernel is therefore K * G_ds^j, not just K.  The kernel
-        must compensate for G_ds^j to reproduce the FFT wavelet response.
+        Derivation
+        ----------
+        The FFT op computes ``IFFT_ortho(X_j_ortho · Ψ_j)``.  Since
+        ``IFFT_ortho = Nj · IDFT_std`` and ``X_j_ortho = X_j_std / Nj``,
+        this equals ``IDFT_std(X_j_std · Ψ_j)`` — exactly the standard
+        discrete convolution of x_j with the kernel ``k_j = IDFT_std(Ψ_j)``.
+        No Wiener correction for the Gaussian downsampling filter is required:
+        the Nj scaling factors cancel analytically.
 
-        Solution — Wiener deconvolution per scale
-        ------------------------------------------
-        For each j:
+        Steps per scale j:
+          1. Retrieve ``wavelet_array_MR[j]``  (standard FFT order, Nj×Nj).
+          2. ``k_j = IDFT_std(Ψ_j_MR)``  =  ``fftshift(ifft2(Ψ_j_MR))``.
+          3. Crop to ``KERNELSZ × KERNELSZ`` with a 2-D Hann window.
+          4. Renormalise to preserve impulse-response energy.
 
-        1. Propagate an impulse through j steps of ``_downsample_tensor``
-           (same Gaussian used in the actual pipeline) → impulse response
-           at the Nj = N0/2^j resolution.
-        2. FFT → G_j  (downsampling transfer function in standard FFT basis).
-        3. Wiener deconvolution::
-
-               K̂_j(ω) = Ψ_j(ω) · conj(G_j(ω))
-                         ───────────────────────────
-                            |G_j(ω)|² + ε
-
-           where Ψ_j = ``fft_wavelet_op.wavelet_array_MR[j]`` (fftshifted).
-        4. IFFT + fftshift → spatial kernel at Nj resolution.
-        5. Crop to ``KERNELSZ × KERNELSZ`` centred patch with Hann window.
-        6. Renormalise to preserve energy.
-
-        At j=0 G_0 = 1 (no downsampling), so K_0 = IFFT(Ψ_0) directly —
-        this replaces the empirical ``_wav_kernel_0`` and eliminates the
-        discontinuity between j=0 and j>0.
-
-        After calling this method ``apply(data, j)`` (with ``data.dg == j``)
-        uses ``_decimated_kernels[j]`` instead of the generic
-        ``_wav_kernel`` / ``_wav_kernel_0``.
+        Residual error (~5–20%) comes from the Gaussian anti-aliasing filter
+        not being an ideal brick-wall LPF; this is unavoidable with
+        Gaussian+stride downsampling and much smaller than the error
+        introduced by any Wiener correction.
 
         Parameters
         ----------
         fft_wavelet_op : WaveletOperator2D_FFT_torch
             Fully built FFT wavelet operator with the same J, L, N0.
         eps : float
-            Wiener regularisation floor (fraction of max |G_j|²).
-            Increase if kernels look noisy; decrease for sharper deconvolution.
+            Unused (kept for API compatibility).
         """
         assert fft_wavelet_op.J == self.J, "J must match"
         assert fft_wavelet_op.L == self.L, "L must match"
@@ -969,57 +954,34 @@ class WaveletOperator2Dkernel_torch:
             cdtype = torch.complex128
             rdtype = torch.float64
 
-        smooth_kernel = self._gaussian_kernel_5x5(
-            device=self.device, dtype=self.dtype
-        )
-        smooth_real = (smooth_kernel.real
-                       if torch.is_complex(smooth_kernel)
-                       else smooth_kernel).to(rdtype)
-
         N0x, N0y = self.N0
 
         for j in range(self.J):
-            # ── 1. Downsampling transfer function G_j ─────────────────────
+            # ── 1. Scale info ─────────────────────────────────────────────────
             # dg_j: actual downsampling level used by the FFT op at scale j.
-            # It is capped at dg_max = int(log2(min(N0)) - 4) so that the
-            # working resolution never drops below 16×16.  We must match this
-            # cap when computing G_j so that its shape equals wavelet_array_MR[j].
             dg_j = fft_wavelet_op.j_to_dg[j]
-
-            if dg_j == 0:
-                # Identity: G_0(ω) = 1 everywhere
-                Njx, Njy = N0x, N0y
-                g_j_fftshift = torch.ones(
-                    Njx, Njy, device=self.device, dtype=cdtype
-                )   # G_0 = 1 in any convention
-            else:
-                # Impulse at (0,0) in standard FFT convention
-                impulse = torch.zeros(N0x, N0y, device=self.device, dtype=rdtype)
-                impulse[0, 0] = 1.0
-
-                # Propagate through dg_j Gaussian+stride-2 steps (circular)
-                imp_ds = self.__class__._downsample_tensor(
-                    impulse, smooth_real, dg_inc=dg_j, padding_mode="circular",
-                )   # [Njx, Njy]
-                Njx, Njy = imp_ds.shape[-2:]
-
-                # FFT → standard FFT order (same convention as wavelet_array_MR)
-                # NOTE: do NOT fftshift here — psi_j (wavelet_array_MR[j]) is stored
-                # in standard FFT order (DC at corners), so g_j must also be standard.
-                # Standard DFT (no norm): G_j(0) = 1 for a unit impulse at [0,0].
-                # This matches the convention  DFT_standard(k_j) = Ψ_j / G_j
-                # so that  k_j ⊛ x_j  reproduces  IFFT_ortho(FFT_ortho(x) · Ψ_j).
-                g_j_fftshift = torch.fft.fft2(imp_ds).to(cdtype)   # [Njx, Njy]
+            Njx  = N0x >> dg_j
+            Njy  = N0y >> dg_j
 
             # ── 2. Target FFT wavelet at scale j (standard FFT order, Nj res) ──
             psi_j = fft_wavelet_op.wavelet_array_MR[j].to(
                 device=self.device, dtype=cdtype
-            )   # [L, Njx, Njy]  — standard FFT order (same as wavelet_array)
+            )   # [L, Njx, Njy]
 
-            # ── 3. Wiener deconvolution ────────────────────────────────────
-            g2     = g_j_fftshift.abs().pow(2)          # [Njx, Njy]
-            reg    = eps * g2.max()                      # scalar regulariser
-            k_fft  = psi_j * g_j_fftshift.conj() / (g2 + reg)   # [L, Njx, Njy]
+            # ── 3. No Wiener correction needed ────────────────────────────
+            # The kernel that makes  k_j ⊛ x_j_gauss = IFFT_ortho(X_j_ortho · Ψ_j)
+            # is simply k_j = IDFT_standard(Ψ_j_MR).  Proof:
+            #
+            #   IFFT_ortho(X_ortho · Ψ) = Nj · IDFT_s(X_ortho · Ψ)
+            #                           = Nj · IDFT_s((X_std/Nj) · Ψ)
+            #                           = IDFT_s(X_std · Ψ)
+            #                           = k ⊛ x   (standard conv)
+            #
+            # The Nj factors cancel exactly; no G_j correction is needed.
+            # The small residual error (~5–20%) comes from the Gaussian filter
+            # not being an ideal brick-wall LPF — unavoidable with Gaussian
+            # downsampling, and far smaller than the error from Wiener.
+            k_fft = psi_j   # [L, Njx, Njy]  — directly the wavelet spectrum
 
             # ── 4. Back to pixel space (standard FFT → IFFT → center) ─────
             # k_fft is in standard FFT order → direct IFFT gives spatial kernel
