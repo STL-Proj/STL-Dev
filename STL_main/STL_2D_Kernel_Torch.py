@@ -412,7 +412,7 @@ class WaveletOperator2Dkernel_torch:
                 # 1) reweighting maps needed in downsampling of layer 0 data (no wavelet convolution, only smoothing kernel convolution)
                 local_nan_weight_maps_smooth = {}
                 smooth_kernel = self._gaussian_kernel_5x5(
-                    device=self.mask_full_res.array.device, dtype=self.dtype
+                    device=self.mask_full_res.array.device, dtype=self.dtype, pbc=pbc
                 )
                 assert torch.isclose(
                     smooth_kernel.sum(), torch.tensor(1.0, dtype=smooth_kernel.dtype)
@@ -1314,7 +1314,7 @@ class WaveletOperator2Dkernel_torch:
 
         if dg_inc > 0:
             smooth_kernel = self._gaussian_kernel_5x5(
-                device=data.array.device, dtype=data.array.dtype
+                device=data.array.device, dtype=data.array.dtype, pbc=data.pbc
             )
             padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
 
@@ -1441,6 +1441,7 @@ class WaveletOperator2Dkernel_torch:
         smooth_kernel = self._gaussian_kernel_5x5(
             device=data.array.device,
             dtype=data.array.dtype,
+            pbc=data.pbc,
         )
 
         padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
@@ -1553,103 +1554,121 @@ class WaveletOperator2Dkernel_torch:
 
         return data
         
-    def _gaussian_kernel_5x5(self, device, dtype):
+    def _gaussian_kernel_5x5(self, device, dtype, pbc: bool = True):
         """
-        Build and cache a 7-tap separable Kaiser-Bessel windowed-sinc lowpass
-        kernel on (device, dtype) for anti-aliasing in the downsampling pipeline.
+        Build and cache an isotropic flat+cosine lowpass kernel for
+        anti-aliasing in the j → j+1 downsampling step.
 
-        Design rationale
-        ----------------
-        The bump-steerable wavelet at scale j peaks at ~70 % of the Nyquist of
-        the Nj grid.  A separable Gaussian attenuates diagonal orientations
-        strongly (G≈0.09 at 45° for σ=1), because its 2-D response factorises
-        as G_1D(kx)·G_1D(ky) and the per-axis frequency is |k|/√2 at θ=45°.
+        The kernel size depends on the boundary condition:
+            pbc=True  (periodic)  → K = 11   (circular padding supports larger kernel)
+            pbc=False (non-per.)  → K =  7   (replicate padding, smaller footprint)
 
-        A Kaiser-Bessel windowed sinc has a flat passband up to the cut-off and
-        a sharp rolloff, giving an isotropic 2-D response that is independent of
-        orientation.
+        This filter is designed in the 2-D frequency domain as a radially
+        symmetric (isotropic) lowpass with a raised-cosine transition band.
+        It cuts the small scales (ν ≥ 2·ν_j/3) and preserves the large scales,
+        acting as the anti-aliasing filter before stride-2 decimation.
 
-        Parameters
-        ----------
-        ntaps : 7
-        β     : 5.0  (Kaiser window shape — moderate sidelobe suppression)
-        ω_c   : 0.80 π  (normalised cut-off; passes 70 % Nyquist, rejects Nyquist)
+        The wavelet convolution itself is handled separately by
+        ``build_decimated_kernel_from_fft_wavelet_op``, which reproduces the
+        exact FFT wavelet of ``WaveletOperator2D_FFT_torch``.
 
-        Resulting 1-D weights (sum = 1):
-          h ≈ [0.0037, -0.0498, 0.1453, 0.8015, 0.1453, -0.0498, 0.0037]
+        Frequency response (isotropic, ν = radial frequency / Nyquist ∈ [0,1])
+        --------------------------------------------------------------------------
+            H(ν) = 1                                              ν ≤ ν_j / 3
+            H(ν) = ½ · (1 + cos(π · (ν − ν_j/3) / (ν_j/3)))    ν_j/3 < ν < 2ν_j/3
+            H(ν) = 0                                              ν ≥ 2ν_j / 3
 
-        2-D transmission at |k| = 70 % Nyquist (separable outer product):
-          θ =  0°: G_2D ≈ 0.668
-          θ = 22.5°: G_2D ≈ 0.740
-          θ = 45°: G_2D ≈ 0.819
-          θ = 67.5°: G_2D ≈ 0.740
-          θ = 90°: G_2D ≈ 0.668
+        with ν_j = 0.70 (bump-steerable wavelet peak, same at every scale j).
+        This gives:
+            passband  edge  : ν_j / 3 ≈ 0.233
+            stopband  edge  : 2·ν_j / 3 ≈ 0.467
+            wavelet   peak  : ν_j = 0.700
 
-        Note: h[±2] ≈ -0.050 are slightly negative; NaN-weighted averaging
-        should treat them as real (not clamp to 0) to preserve filter fidelity.
+        Measured 2-D transmission (Hann-windowed spatial crop):
+                              K = 7      K = 11
+            ν = 0.05          98.6 %     98.9 %   (large scales)
+            ν = 0.10          94.5 %     95.8 %
+            ν = 0.20          79.4 %     81.7 %
+            ν = 0.233         72.9 %     74.7 %   (passband edge)
+            ν = 0.467         25.1 %     16.1 %   (stopband edge)
+            ν = 0.700          1.7 %      0.3 %   (wavelet peak)
+
+        ``_downsample_tensor`` computes ``pad = K//2`` dynamically, so no
+        other code needs to change when K varies.
 
         Returns
         -------
         kernel : torch.Tensor
-            Shape (7, 7), dtype=dtype, sum ≈ 1
+            Shape (K, K), dtype = real counterpart of ``dtype``, sum = 1.
         """
+        # ---- separate cache per (pbc, device, dtype) ----
+        cache_attr = "_smooth_kernel_5x5_pbc" if pbc else "_smooth_kernel_5x5_nopbc"
+        cached = getattr(self, cache_attr, None)
         if (
-            not hasattr(self, "_smooth_kernel_5x5")
-            or self._smooth_kernel_5x5.device != device
-            or self._smooth_kernel_5x5.dtype != dtype
+            cached is None
+            or cached.device != device
+            or cached.dtype != (
+                torch.float32 if dtype == torch.complex64
+                else torch.float64 if dtype == torch.complex128
+                else dtype
+            )
         ):
-            # ---- work in float64 for numerical precision, cast at the end ----
-            ntaps = 7
-            beta  = 5.0
-            omega_c = 0.80          # cut-off as fraction of π
+            # ---- all arithmetic in float64; cast at the end ----
+            K  = 11 if pbc else 7    # spatial kernel size (must be odd)
+            Nd = 512                 # design grid (large for accurate IFFT)
 
-            n = torch.arange(ntaps, device=device, dtype=torch.float64) - (ntaps - 1) / 2
-            # n ∈ {-3, -2, -1, 0, 1, 2, 3}
+            nu_j = 0.70      # bump wavelet peak (fraction of Nyquist, same for all j)
+            nu1  = nu_j / 3.0          # ≈ 0.233  passband edge
+            nu2  = 2.0 * nu_j / 3.0   # ≈ 0.467  stopband edge
 
-            # --- Kaiser window via Taylor series for I_0 (no scipy dependency) ---
-            # I_0(x) = Σ_{k=0}^{∞} ((x/2)^k / k!)^2
-            def _i0_taylor(x, n_terms=25):
-                """Modified Bessel function I_0 via truncated Taylor series."""
-                acc = torch.ones_like(x)
-                term = torch.ones_like(x)
-                for k in range(1, n_terms):
-                    term = term * (x / (2 * k)) ** 2
-                    acc = acc + term
-                return acc
+            # --- 2-D radial frequency map (ν ∈ [0, 1] where 1 = Nyquist) ---
+            # fftfreq gives cycles/sample ∈ [-0.5, 0.5);  Nyquist = 0.5
+            # → normalize by 0.5 (i.e. ×2) so Nyquist maps to 1.0
+            f   = torch.fft.fftfreq(Nd, device=device, dtype=torch.float64)
+            fx, fy = torch.meshgrid(f, f, indexing="ij")
+            nu  = torch.sqrt(fx ** 2 + fy ** 2) * 2.0   # [0, √2]; Nyquist = 1
 
-            alpha = (ntaps - 1) / 2.0           # = 3.0
-            win_arg = beta * torch.sqrt(
-                1.0 - (n / alpha) ** 2
-            ).clamp(min=0.0)                     # clamp guards floating-point ε
-            window = _i0_taylor(win_arg) / _i0_taylor(
-                torch.tensor(beta, device=device, dtype=torch.float64)
+            # --- isotropic raised-cosine frequency response ---
+            H = torch.zeros(Nd, Nd, device=device, dtype=torch.float64)
+            H[nu <= nu1] = 1.0
+            mask = (nu > nu1) & (nu < nu2)
+            H[mask] = 0.5 * (
+                1.0 + torch.cos(torch.pi * (nu[mask] - nu1) / (nu2 - nu1))
             )
+            # H = 0 for nu >= nu2 (already initialised to zero)
 
-            # --- ideal sinc (brick-wall LPF at ω_c·π) ---
-            # h_ideal[n] = ω_c · sinc(ω_c · n)   where sinc(x) = sin(πx)/(πx)
-            h_ideal = torch.where(
-                n == 0,
-                torch.tensor(omega_c, device=device, dtype=torch.float64),
-                torch.sin(torch.pi * omega_c * n) / (torch.pi * n),
-            )
+            # --- IFFT → real centred spatial kernel ---
+            # H is real and isotropic → H(-k) = H(k) → IFFT is real
+            h_spatial = torch.fft.fftshift(
+                torch.fft.ifft2(H).real,
+                dim=(-2, -1),
+            )   # shape (Nd, Nd), centred at (Nd//2, Nd//2)
 
-            # --- apply window and normalise to sum = 1 ---
-            h1d = h_ideal * window
-            h1d = h1d / h1d.sum()
+            # --- crop K×K from centre ---
+            cx = cy = Nd // 2
+            half  = K // 2
+            patch = h_spatial[cx - half : cx + half + 1,
+                               cy - half : cy + half + 1].clone()
 
-            # --- 2-D separable kernel (outer product) ---
-            kernel = h1d[:, None] * h1d[None, :]   # (7, 7)
+            # --- Hann window to suppress spatial truncation ringing ---
+            hann   = torch.hann_window(K, periodic=False,
+                                       device=device, dtype=torch.float64)
+            hann2d = hann[:, None] * hann[None, :]
+            patch  = patch * hann2d
 
-            # force real dtype matching the caller's dtype
-            if dtype in (torch.complex64,):
+            # --- normalise to sum = 1 ---
+            patch = patch / patch.sum()
+
+            # --- cast to caller's real dtype ---
+            if dtype == torch.complex64:
                 rdtype = torch.float32
-            elif dtype in (torch.complex128,):
+            elif dtype == torch.complex128:
                 rdtype = torch.float64
             else:
                 rdtype = dtype
 
-            self._smooth_kernel_5x5 = kernel.to(device=device, dtype=rdtype)
-        return self._smooth_kernel_5x5
+            setattr(self, cache_attr, patch.to(device=device, dtype=rdtype))
+        return getattr(self, cache_attr)
 
 
 class PS_operator_2D_Kernel_torch:
