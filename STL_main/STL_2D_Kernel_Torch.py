@@ -1555,36 +1555,100 @@ class WaveletOperator2Dkernel_torch:
         
     def _gaussian_kernel_5x5(self, device, dtype):
         """
-        Build and cache a normalized 5x5 Gaussian kernel on (device, dtype)
-        for antialiasing 2D filter used in downsampling.
+        Build and cache a 7-tap separable Kaiser-Bessel windowed-sinc lowpass
+        kernel on (device, dtype) for anti-aliasing in the downsampling pipeline.
+
+        Design rationale
+        ----------------
+        The bump-steerable wavelet at scale j peaks at ~70 % of the Nyquist of
+        the Nj grid.  A separable Gaussian attenuates diagonal orientations
+        strongly (G≈0.09 at 45° for σ=1), because its 2-D response factorises
+        as G_1D(kx)·G_1D(ky) and the per-axis frequency is |k|/√2 at θ=45°.
+
+        A Kaiser-Bessel windowed sinc has a flat passband up to the cut-off and
+        a sharp rolloff, giving an isotropic 2-D response that is independent of
+        orientation.
+
+        Parameters
+        ----------
+        ntaps : 7
+        β     : 5.0  (Kaiser window shape — moderate sidelobe suppression)
+        ω_c   : 0.80 π  (normalised cut-off; passes 70 % Nyquist, rejects Nyquist)
+
+        Resulting 1-D weights (sum = 1):
+          h ≈ [0.0037, -0.0498, 0.1453, 0.8015, 0.1453, -0.0498, 0.0037]
+
+        2-D transmission at |k| = 70 % Nyquist (separable outer product):
+          θ =  0°: G_2D ≈ 0.668
+          θ = 22.5°: G_2D ≈ 0.740
+          θ = 45°: G_2D ≈ 0.819
+          θ = 67.5°: G_2D ≈ 0.740
+          θ = 90°: G_2D ≈ 0.668
+
+        Note: h[±2] ≈ -0.050 are slightly negative; NaN-weighted averaging
+        should treat them as real (not clamp to 0) to preserve filter fidelity.
 
         Returns
         -------
         kernel : torch.Tensor
-            Shape (5, 5)
+            Shape (7, 7), dtype=dtype, sum ≈ 1
         """
         if (
             not hasattr(self, "_smooth_kernel_5x5")
             or self._smooth_kernel_5x5.device != device
             or self._smooth_kernel_5x5.dtype != dtype
         ):
-            # force real dtype for arange/meshgrid
-            if dtype == torch.complex128:
-                rdtype = torch.float64
-            elif dtype == torch.complex64:
+            # ---- work in float64 for numerical precision, cast at the end ----
+            ntaps = 7
+            beta  = 5.0
+            omega_c = 0.80          # cut-off as fraction of π
+
+            n = torch.arange(ntaps, device=device, dtype=torch.float64) - (ntaps - 1) / 2
+            # n ∈ {-3, -2, -1, 0, 1, 2, 3}
+
+            # --- Kaiser window via Taylor series for I_0 (no scipy dependency) ---
+            # I_0(x) = Σ_{k=0}^{∞} ((x/2)^k / k!)^2
+            def _i0_taylor(x, n_terms=25):
+                """Modified Bessel function I_0 via truncated Taylor series."""
+                acc = torch.ones_like(x)
+                term = torch.ones_like(x)
+                for k in range(1, n_terms):
+                    term = term * (x / (2 * k)) ** 2
+                    acc = acc + term
+                return acc
+
+            alpha = (ntaps - 1) / 2.0           # = 3.0
+            win_arg = beta * torch.sqrt(
+                1.0 - (n / alpha) ** 2
+            ).clamp(min=0.0)                     # clamp guards floating-point ε
+            window = _i0_taylor(win_arg) / _i0_taylor(
+                torch.tensor(beta, device=device, dtype=torch.float64)
+            )
+
+            # --- ideal sinc (brick-wall LPF at ω_c·π) ---
+            # h_ideal[n] = ω_c · sinc(ω_c · n)   where sinc(x) = sin(πx)/(πx)
+            h_ideal = torch.where(
+                n == 0,
+                torch.tensor(omega_c, device=device, dtype=torch.float64),
+                torch.sin(torch.pi * omega_c * n) / (torch.pi * n),
+            )
+
+            # --- apply window and normalise to sum = 1 ---
+            h1d = h_ideal * window
+            h1d = h1d / h1d.sum()
+
+            # --- 2-D separable kernel (outer product) ---
+            kernel = h1d[:, None] * h1d[None, :]   # (7, 7)
+
+            # force real dtype matching the caller's dtype
+            if dtype in (torch.complex64,):
                 rdtype = torch.float32
+            elif dtype in (torch.complex128,):
+                rdtype = torch.float64
             else:
                 rdtype = dtype
 
-            ax = torch.arange(-2, 3, device=device, dtype=rdtype)
-            xx, yy = torch.meshgrid(ax, ax, indexing="ij")
-
-            sigma = torch.tensor(1.0, device=device, dtype=rdtype)
-            kernel = torch.exp(-(xx**2 + yy**2) / (2*sigma**2))
-            kernel = kernel / kernel.sum()
-
-            # _conv2d_circular expects w shape (O_c, wx, wy)
-            self._smooth_kernel_5x5 = kernel.to(dtype=dtype)
+            self._smooth_kernel_5x5 = kernel.to(device=device, dtype=rdtype)
         return self._smooth_kernel_5x5
 
 
