@@ -1013,6 +1013,7 @@ class WaveletOperator2Dkernel_torch:
             patch   = patch * (full_e / patch_e)
 
             kernels.append(patch.reshape(1, self.L, K, K))
+            print('W1 ',j,patch)
 
         self._decimated_kernels = kernels   # list[J] of [1, L, K, K]
         self._use_decimated     = True
@@ -1087,7 +1088,7 @@ class WaveletOperator2Dkernel_torch:
             patch = patch * (full_energy / patch_energy)
 
             kernels.append(patch.reshape(1, self.L, K, K))
-            print('W ',patch)
+            print('W ',j,patch)
         self._atrous_kernels = kernels
         self._use_atrous     = True
         print(f"À-trous kernels built: J={self.J}, K={K}×{K}.")
