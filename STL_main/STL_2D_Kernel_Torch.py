@@ -1659,6 +1659,7 @@ class WaveletOperator2Dkernel_torch:
             # --- normalise to sum = 1 ---
             patch = patch / patch.sum()
 
+            print(patch)
             # --- cast to caller's real dtype ---
             if dtype == torch.complex64:
                 rdtype = torch.float32
