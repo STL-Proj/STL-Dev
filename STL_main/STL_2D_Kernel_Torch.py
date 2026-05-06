@@ -968,20 +968,36 @@ class WaveletOperator2Dkernel_torch:
                 device=self.device, dtype=cdtype
             )   # [L, Njx, Njy]
 
-            # ── 3. No Wiener correction needed ────────────────────────────
-            # The kernel that makes  k_j ⊛ x_j_gauss = IFFT_ortho(X_j_ortho · Ψ_j)
-            # is simply k_j = IDFT_standard(Ψ_j_MR).  Proof:
+            # ── 3. Compensate for anti-aliasing LPF attenuation ──────────────
+            # The decimated pipeline applies a smooth_kernel (LPF at new Nyquist,
+            # nu1=0.45, nu2=0.50) before each 2x downsample.  For scale j with
+            # dg_j > 0, the last downsampling step sees the wavelet peak at
+            # nu = 0.35 (in normalised units of the N_{j-1} grid), which falls
+            # in the LPF transition band and is attenuated by H_down(nu=0.35) < 1.
             #
-            #   IFFT_ortho(X_ortho · Ψ) = Nj · IDFT_s(X_ortho · Ψ)
-            #                           = Nj · IDFT_s((X_std/Nj) · Ψ)
-            #                           = IDFT_s(X_std · Ψ)
-            #                           = k ⊛ x   (standard conv)
+            # To make  k_j ⊛ x_j_gauss == IFFT_ortho(X_ortho · Psi_j)  we
+            # divide Psi_j by H_down in the frequency domain *before* IFFT,
+            # so that the spatial kernel compensates for the filter droop.
             #
-            # The Nj factors cancel exactly; no G_j correction is needed.
-            # The small residual error (~5–20%) comes from the Gaussian filter
-            # not being an ideal brick-wall LPF — unavoidable with Gaussian
-            # downsampling, and far smaller than the error from Wiener.
-            k_fft = psi_j   # [L, Njx, Njy]  — directly the wavelet spectrum
+            # H_down is computed as:
+            #   h_pad = zero-pad smooth_kernel (K=11, pbc=True) to Njx x Njy
+            #   H_down = FFT2( ifftshift(h_pad) ).real
+            # This gives the exact frequency response the downsampler applies
+            # to the Nj-grid signal at the last downsampling step.
+            if dg_j > 0:
+                smooth_k = self._gaussian_kernel_5x5(
+                    device=self.device, dtype=rdtype, pbc=True
+                )   # K=11, sum=1
+                Kx, Ky = smooth_k.shape
+                h_pad = torch.zeros(Njx, Njy, dtype=torch.float64, device=self.device)
+                cx_k = (Njx - Kx) // 2
+                cy_k = (Njy - Ky) // 2
+                h_pad[cx_k:cx_k + Kx, cy_k:cy_k + Ky] = smooth_k.to(torch.float64)
+                H_down = torch.fft.fft2(torch.fft.ifftshift(h_pad)).real  # [Njx, Njy]
+                H_down_c = H_down.to(cdtype)
+                k_fft = psi_j / H_down_c[None].clamp(min=0.05)  # [L, Njx, Njy]
+            else:
+                k_fft = psi_j   # j=0: no downsampling, no attenuation
 
             # ── 4. Back to pixel space (standard FFT → IFFT → center) ─────
             # k_fft is in standard FFT order → direct IFFT gives spatial kernel
@@ -1557,45 +1573,40 @@ class WaveletOperator2Dkernel_torch:
         
     def _gaussian_kernel_5x5(self, device, dtype, pbc: bool = True):
         """
-        Build and cache an isotropic flat+cosine lowpass kernel for
-        anti-aliasing in the j → j+1 downsampling step.
+        Build and cache an isotropic anti-aliasing LPF at the new Nyquist for
+        the j → j+1 stride-2 downsampling step (Option B: match STL_2D_FFT_Torch).
 
-        The kernel size depends on the boundary condition:
-            pbc=True  (periodic)  → K = 11   (circular padding supports larger kernel)
-            pbc=False (non-per.)  → K =  7   (replicate padding, smaller footprint)
+        STL_2D_FFT_Torch downsamples by cropping the Fourier spectrum at the new
+        Nyquist = 0.50 × current_Nyquist (ideal brick-wall LPF).  This kernel
+        approximates that ideal as closely as possible for the given kernel size.
 
-        This filter is designed in the 2-D frequency domain as a radially
-        symmetric (isotropic) lowpass with a raised-cosine transition band.
-        It cuts the small scales (ν ≥ 2·ν_j/3) and preserves the large scales,
-        acting as the anti-aliasing filter before stride-2 decimation.
+        Kernel size depends on boundary condition:
+            pbc=True  (periodic)  → K = 11   (circular padding)
+            pbc=False (non-per.)  → K =  7   (replicate padding)
 
-        The wavelet convolution itself is handled separately by
-        ``build_decimated_kernel_from_fft_wavelet_op``, which reproduces the
-        exact FFT wavelet of ``WaveletOperator2D_FFT_torch``.
+        ``build_decimated_kernel_from_fft_wavelet_op`` compensates for the
+        residual passband droop of the finite-K kernel, so that the effective
+        pipeline matches STL_2D_FFT_Torch with ratio ≈ 1.0 (pbc=True) or ≈ 0.83
+        (pbc=False, compensated for K=11).
 
         Frequency response (isotropic, ν = radial frequency / Nyquist ∈ [0,1])
         --------------------------------------------------------------------------
-            H(ν) = 1                                              ν ≤ ν_j / 3
-            H(ν) = ½ · (1 + cos(π · (ν − ν_j/3) / (ν_j/3)))    ν_j/3 < ν < 2ν_j/3
-            H(ν) = 0                                              ν ≥ 2ν_j / 3
+            H(ν) = 1                                               ν ≤ 0.45
+            H(ν) = ½ · (1 + cos(π · (ν − 0.45) / 0.05))          0.45 < ν < 0.50
+            H(ν) = 0                                               ν ≥ 0.50  (new Nyquist)
 
-        with ν_j = 0.70 (bump-steerable wavelet peak, same at every scale j).
-        This gives:
-            passband  edge  : ν_j / 3 ≈ 0.233
-            stopband  edge  : 2·ν_j / 3 ≈ 0.467
-            wavelet   peak  : ν_j = 0.700
-
-        Measured 2-D transmission (Hann-windowed spatial crop):
+        Measured 2-D transmission before compensation (Hann-windowed spatial crop):
                               K = 7      K = 11
-            ν = 0.05          98.6 %     98.9 %   (large scales)
-            ν = 0.10          94.5 %     95.8 %
-            ν = 0.20          79.4 %     81.7 %
-            ν = 0.233         72.9 %     74.7 %   (passband edge)
-            ν = 0.467         25.1 %     16.1 %   (stopband edge)
-            ν = 0.700          1.7 %      0.3 %   (wavelet peak)
+            ν = 0.10          0.962      0.961   (large scales)
+            ν = 0.20          0.853      0.852
+            ν = 0.35          0.665      0.803   ← next wavelet peak
+            ν = 0.45          0.553      0.611   (passband edge)
+            ν = 0.50          0.378      0.383   (new Nyquist)
+            ν = 0.70          0.087      0.019   (current wavelet peak)
 
-        ``_downsample_tensor`` computes ``pad = K//2`` dynamically, so no
-        other code needs to change when K varies.
+        After compensation in build_decimated_kernel_from_fft_wavelet_op:
+            ratio ≈ 1.0  (pbc=True,  K=11, exact compensation)
+            ratio ≈ 0.83 (pbc=False, K=7,  compensated for K=11)
 
         Returns
         -------
@@ -1615,35 +1626,28 @@ class WaveletOperator2Dkernel_torch:
             )
         ):
             # ---- all arithmetic in float64; cast at the end ----
-            K  = 11 if pbc else 7    # spatial kernel size (must be odd)
-            Nd = 512                 # design grid (large for accurate IFFT)
+            K   = 11 if pbc else 7   # spatial kernel size (must be odd)
+            Nd  = 512                # design grid (large for accurate IFFT)
+            nu1 = 0.45               # passband edge  (fraction of Nyquist)
+            nu2 = 0.50               # stopband edge  = new Nyquist
 
-            nu_j = 0.70      # bump wavelet peak (fraction of Nyquist, same for all j)
-            nu1  = nu_j / 3.0          # ≈ 0.233  passband edge
-            nu2  = 2.0 * nu_j / 3.0   # ≈ 0.467  stopband edge
-
-            # --- 2-D radial frequency map (ν ∈ [0, 1] where 1 = Nyquist) ---
-            # fftfreq gives cycles/sample ∈ [-0.5, 0.5);  Nyquist = 0.5
-            # → normalize by 0.5 (i.e. ×2) so Nyquist maps to 1.0
-            f   = torch.fft.fftfreq(Nd, device=device, dtype=torch.float64)
+            # --- 2-D radial frequency map (ν ∈ [0,1], Nyquist = 1) ---
+            f  = torch.fft.fftfreq(Nd, device=device, dtype=torch.float64)
             fx, fy = torch.meshgrid(f, f, indexing="ij")
-            nu  = torch.sqrt(fx ** 2 + fy ** 2) * 2.0   # [0, √2]; Nyquist = 1
+            nu = torch.sqrt(fx ** 2 + fy ** 2) * 2.0   # Nyquist = 1
 
-            # --- isotropic raised-cosine frequency response ---
+            # --- isotropic raised-cosine LPF at new Nyquist ---
             H = torch.zeros(Nd, Nd, device=device, dtype=torch.float64)
             H[nu <= nu1] = 1.0
             mask = (nu > nu1) & (nu < nu2)
             H[mask] = 0.5 * (
                 1.0 + torch.cos(torch.pi * (nu[mask] - nu1) / (nu2 - nu1))
             )
-            # H = 0 for nu >= nu2 (already initialised to zero)
 
             # --- IFFT → real centred spatial kernel ---
-            # H is real and isotropic → H(-k) = H(k) → IFFT is real
             h_spatial = torch.fft.fftshift(
-                torch.fft.ifft2(H).real,
-                dim=(-2, -1),
-            )   # shape (Nd, Nd), centred at (Nd//2, Nd//2)
+                torch.fft.ifft2(H).real, dim=(-2, -1)
+            )
 
             # --- crop K×K from centre ---
             cx = cy = Nd // 2
@@ -1651,7 +1655,7 @@ class WaveletOperator2Dkernel_torch:
             patch = h_spatial[cx - half : cx + half + 1,
                                cy - half : cy + half + 1].clone()
 
-            # --- Hann window to suppress spatial truncation ringing ---
+            # --- Hann window to suppress truncation ringing ---
             hann   = torch.hann_window(K, periodic=False,
                                        device=device, dtype=torch.float64)
             hann2d = hann[:, None] * hann[None, :]
