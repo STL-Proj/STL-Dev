@@ -1013,9 +1013,9 @@ class WaveletOperator2Dkernel_torch:
                 cx_k = (Njx - Kx) // 2
                 cy_k = (Njy - Ky) // 2
                 h_pad[cx_k:cx_k + Kx, cy_k:cy_k + Ky] = smooth_k.to(torch.float64)
-                H_down = torch.fft.fft2(torch.fft.ifftshift(h_pad)).real  # [Njx, Njy]
-                H_down_c = H_down.to(cdtype)
-                k_fft = psi_j / H_down_c[None].clamp(min=0.05)  # [L, Njx, Njy]
+                H_down = torch.fft.fft2(torch.fft.ifftshift(h_pad)).real  # [Njx, Njy], real
+                H_down_c = H_down.clamp(min=0.05).to(cdtype)               # clamp before cast
+                k_fft = psi_j / H_down_c[None]                             # [L, Njx, Njy]
             else:
                 k_fft = psi_j   # j=0: no downsampling, no attenuation
 
@@ -1620,13 +1620,18 @@ class WaveletOperator2Dkernel_torch:
         approximates that ideal as closely as possible for the given kernel size.
 
         Kernel size depends on boundary condition:
-            pbc=True  (periodic)  → K = 11   (circular padding)
-            pbc=False (non-per.)  → K =  7   (replicate padding)
+            pbc=True  (periodic)  → design K=11, output  9×9  (circular padding)
+            pbc=False (non-per.)  → design K= 7, output  5×5  (replicate padding)
+
+        The Hann window forces hann[0] = hann[K-1] = 0, so the outer ring of the
+        K×K design is identically zero and carries no information.  The outer ring
+        is stripped before caching, yielding an effective (K-2)×(K-2) kernel that
+        is cheaper to convolve while preserving the exact frequency response.
 
         ``build_decimated_kernel_from_fft_wavelet_op`` compensates for the
         residual passband droop of the finite-K kernel, so that the effective
         pipeline matches STL_2D_FFT_Torch with ratio ≈ 1.0 (pbc=True) or ≈ 0.83
-        (pbc=False, compensated for K=11).
+        (pbc=False, compensated for pbc=True kernel).
 
         Frequency response (isotropic, ν = radial frequency / Nyquist ∈ [0,1])
         --------------------------------------------------------------------------
@@ -1634,23 +1639,21 @@ class WaveletOperator2Dkernel_torch:
             H(ν) = ½ · (1 + cos(π · (ν − 0.45) / 0.05))          0.45 < ν < 0.50
             H(ν) = 0                                               ν ≥ 0.50  (new Nyquist)
 
-        Measured 2-D transmission before compensation (Hann-windowed spatial crop):
-                              K = 7      K = 11
+        Measured 2-D transmission before compensation (effective kernel):
+                              5×5        9×9
             ν = 0.10          0.962      0.961   (large scales)
-            ν = 0.20          0.853      0.852
             ν = 0.35          0.665      0.803   ← next wavelet peak
-            ν = 0.45          0.553      0.611   (passband edge)
             ν = 0.50          0.378      0.383   (new Nyquist)
-            ν = 0.70          0.087      0.019   (current wavelet peak)
 
         After compensation in build_decimated_kernel_from_fft_wavelet_op:
-            ratio ≈ 1.0  (pbc=True,  K=11, exact compensation)
-            ratio ≈ 0.83 (pbc=False, K=7,  compensated for K=11)
+            ratio ≈ 1.0  (pbc=True,  9×9, exact compensation)
+            ratio ≈ 0.83 (pbc=False, 5×5, compensated for 9×9)
 
         Returns
         -------
         kernel : torch.Tensor
-            Shape (K, K), dtype = real counterpart of ``dtype``, sum = 1.
+            Shape (K-2, K-2) = (5,5) or (9,9), dtype = real counterpart of
+            ``dtype``, sum = 1.
         """
         # ---- separate cache per (pbc, device, dtype) ----
         cache_attr = "_smooth_kernel_5x5_pbc" if pbc else "_smooth_kernel_5x5_nopbc"
@@ -1704,6 +1707,11 @@ class WaveletOperator2Dkernel_torch:
 
             # --- normalise to sum = 1 ---
             patch = patch / patch.sum()
+
+            # --- strip zero outer ring (hann[0]=hann[K-1]=0 → outer ring ≡ 0) ---
+            # This removes wasted zero multiplications without changing the
+            # frequency response.  Output shape: (K-2)×(K-2) = 5×5 or 9×9.
+            patch = patch[1:-1, 1:-1].contiguous()
 
             # --- cast to caller's real dtype ---
             if dtype == torch.complex64:
