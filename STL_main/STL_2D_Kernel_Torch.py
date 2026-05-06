@@ -1010,8 +1010,12 @@ class WaveletOperator2Dkernel_torch:
                 )   # K=11, sum=1
                 Kx, Ky = smooth_k.shape
                 h_pad = torch.zeros(Njx, Njy, dtype=torch.float64, device=self.device)
-                cx_k = (Njx - Kx) // 2
-                cy_k = (Njy - Ky) // 2
+                # Center the kernel at (Njx//2, Njy//2) so that ifftshift maps
+                # it to (0,0) → FFT spectrum is real (symmetric kernel, zero phase).
+                # (Njx - Kx)//2 is off by 1 for odd Kx / even Njx → phase rotation
+                # → .real ≈ 0 instead of ≈ 0.7 → ratios ≈ 150 instead of ≈ 1.
+                cx_k = Njx // 2 - Kx // 2
+                cy_k = Njy // 2 - Ky // 2
                 h_pad[cx_k:cx_k + Kx, cy_k:cy_k + Ky] = smooth_k.to(torch.float64)
                 H_down = torch.fft.fft2(torch.fft.ifftshift(h_pad)).real  # [Njx, Njy], real
                 H_down_c = H_down.clamp(min=0.05).to(cdtype)               # clamp before cast
