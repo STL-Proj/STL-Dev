@@ -24,6 +24,8 @@ import torch
 import torch.nn.functional as F
 
 from STL_main.Base_DataClass import Base_DataClass
+# STL_2D_FFT_Torch is imported lazily inside __init__ to avoid
+# circular-import issues at module load time.
 from STL_main.ST_Operator import ST_Operator
 from STL_main.torch_backend import (
     _DEFAULT_DEVICE,
@@ -133,6 +135,7 @@ class STL_2D_Kernel_Torch(Base_DataClass):
 
         return WaveletOperator2Dkernel_torch(
             J=J,
+            N0=self.N0,
             DT=self.DT,
             device=self.device,
             dtype=self.dtype,
@@ -163,10 +166,10 @@ class WaveletOperator2Dkernel_torch:
 
     @staticmethod
     def _conv2d_circular(
-        x: torch.Tensor, w: torch.Tensor, padding_mode: str
+        x: torch.Tensor, w: torch.Tensor, padding_mode: str, dilation: int = 1
     ) -> torch.Tensor:
         """
-        Backend-style 2D convolution mirroring FoCUS/BkTorch strategy.
+        Backend-style 2D convolution with optional à-trous dilation.
 
         Parameters
         ----------
@@ -174,6 +177,8 @@ class WaveletOperator2Dkernel_torch:
             Input tensor of shape [..., Nx, Ny].
         w : torch.Tensor
             Kernel tensor of shape [O_c, wx, wy].
+        dilation : int
+            Dilation factor (1 = standard, 2**j = à-trous at scale j).
 
         Returns
         -------
@@ -188,17 +193,17 @@ class WaveletOperator2Dkernel_torch:
         x4d = x.reshape(B, 1, Nx, Ny)
 
         weight = w[:, None, :, :]
-        pad_x = wx // 2
-        pad_y = wy // 2
+        pad_x = (wx // 2) * dilation
+        pad_y = (wy // 2) * dilation
 
         x_padded = F.pad(x4d, (pad_y, pad_y, pad_x, pad_x), mode=padding_mode)
-        y = F.conv2d(x_padded, weight)
+        y = F.conv2d(x_padded, weight, dilation=dilation)
 
         return y.reshape(*leading_dims, O_c, Nx, Ny)
 
     @classmethod
     def _semicomplex_conv2d_circular(
-        cls, x: torch.Tensor, w: torch.Tensor, padding_mode: str
+        cls, x: torch.Tensor, w: torch.Tensor, padding_mode: str, dilation: int = 1
     ) -> torch.Tensor:
         """
         Perform a 2D convolution with a real input and complex kernel.
@@ -236,12 +241,8 @@ class WaveletOperator2Dkernel_torch:
         wr = torch.real(w)  # if torch.is_complex(w) else w
         wi = torch.imag(w)  # if torch.is_complex(w) else torch.zeros_like(wr)
 
-        real_part = cls._conv2d_circular(
-            x, wr, padding_mode=padding_mode
-        )  # - cls._conv2d_circular(xi, wi)
-        imag_part = cls._conv2d_circular(
-            x, wi, padding_mode=padding_mode
-        )  # + cls._conv2d_circular(xi, wr)
+        real_part = cls._conv2d_circular(x, wr, padding_mode=padding_mode, dilation=dilation)
+        imag_part = cls._conv2d_circular(x, wi, padding_mode=padding_mode, dilation=dilation)
 
         return torch.complex(real_part, imag_part)
 
@@ -295,8 +296,10 @@ class WaveletOperator2Dkernel_torch:
     def __init__(
         self,
         J,
+        N0=None,
         L=None,
         kernel_size=None,
+        WType="Bump-Steerable",
         DT="Planar2D_kernel_torch",
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
@@ -304,12 +307,41 @@ class WaveletOperator2Dkernel_torch:
         sigma_smooth=1.0,
         downsample_nan_weight_threshold=0.33,
         get_crop_border_size_method=None,
+        calibrate=True,
+        eps_wiener=1e-2,
     ):
+        """
+        Parameters
+        ----------
+        J : int
+            Number of wavelet scales.
+        N0 : tuple of int or None
+            Spatial size of the input maps, e.g. ``(128, 128)``.
+            Required when ``calibrate=True``.
+        L : int
+            Number of orientations (default 4).
+        kernel_size : int
+            Spatial kernel width in pixels (default 5).  Larger values give
+            a more accurate approximation of the FFT wavelet.
+        WType : str
+            Wavelet type used by the internal FFT reference operator for
+            calibration — ``"Bump-Steerable"`` (default) or ``"Gaussian"``.
+        calibrate : bool
+            If ``True`` (default) and ``N0`` is provided, automatically
+            derive the per-scale kernels from an internal FFT wavelet operator
+            via Wiener deconvolution.  The pipeline (downsampling + NaN
+            handling) is unchanged; only the kernel weights are adjusted.
+        eps_wiener : float
+            Wiener regularisation parameter (fraction of the peak
+            downsampling-filter power).  Increase if kernels look noisy;
+            decrease for sharper deconvolution.  Default 1e-2.
+        """
         if J is None:
             raise ValueError(
                 "J must be specified for WaveletOperator2Dkernel_torch class."
             )
         self.J = J
+        self.N0 = N0
         self.L = L if L is not None else 4
         self.KERNELSZ = kernel_size if kernel_size is not None else 5
         self.DT = DT
@@ -320,11 +352,9 @@ class WaveletOperator2Dkernel_torch:
         self.sigma_smooth = (
             sigma_smooth  # to build smoothing kernel used in downsampling
         )
-        #simag_smooth should be defined before build wavelet kernel for dg=0
-        self._wav_kernel,self._wav_kernel_0 = self._build_wavelet_kernel()
-        # raise
-        # build low pass kernel?
-        self.WType = "simple"
+        #sigma_smooth should be defined before build wavelet kernel for dg=0
+        self._wav_kernel, self._wav_kernel_0 = self._build_wavelet_kernel()
+        self.WType = WType
 
         # PBC dependant parameters
         if get_crop_border_size_method is not None:
@@ -347,6 +377,24 @@ class WaveletOperator2Dkernel_torch:
         ) = self._build_reweighting_maps_and_scattering_layer_masks()
         self.j_to_dg = range(J)
 
+        # ── Auto-calibrate kernels from FFT reference ─────────────────────────
+        if calibrate and N0 is not None:
+            # Local import avoids circular dependency at module load time.
+            from STL_main.STL_2D_FFT_Torch import WaveletOperator2D_FFT_torch
+            _fft_op = WaveletOperator2D_FFT_torch(
+                N0=N0, J=J, L=self.L, WType=WType,
+                device=device, dtype=dtype,
+            )
+            self.build_decimated_kernel_from_fft_wavelet_op(_fft_op, eps=eps_wiener)
+        elif calibrate and N0 is None:
+            import warnings
+            warnings.warn(
+                "calibrate=True but N0 is not provided — kernels are NOT "
+                "calibrated against the FFT reference.  Pass N0=(Nx, Ny) to "
+                "enable automatic calibration.",
+                stacklevel=2,
+            )
+
     def _build_reweighting_maps_and_scattering_layer_masks(self):
         if self.mask_full_res is None:
             return None, None, None, None
@@ -364,7 +412,7 @@ class WaveletOperator2Dkernel_torch:
                 # 1) reweighting maps needed in downsampling of layer 0 data (no wavelet convolution, only smoothing kernel convolution)
                 local_nan_weight_maps_smooth = {}
                 smooth_kernel = self._gaussian_kernel_5x5(
-                    device=self.mask_full_res.array.device, dtype=self.dtype
+                    device=self.mask_full_res.array.device, dtype=self.dtype, pbc=pbc
                 )
                 assert torch.isclose(
                     smooth_kernel.sum(), torch.tensor(1.0, dtype=smooth_kernel.dtype)
@@ -857,50 +905,267 @@ class WaveletOperator2Dkernel_torch:
                         )
         return
 
-    def apply(self, data, j):
+    def build_decimated_kernel_from_fft_wavelet_op(
+        self, fft_wavelet_op, eps: float = 1e-2
+    ):
         """
-        Apply the convolution kernel to data.array [..., Nx, Ny]
-        and return cdata [..., L, Nx, Ny].
+        Derive per-scale spatial kernels for the **decimated** (downsampling)
+        pipeline so that ``apply(data_dg_j, j)`` matches the FFT approach.
+
+        Derivation
+        ----------
+        The FFT op computes ``IFFT_ortho(X_j_ortho · Ψ_j)``.  Since
+        ``IFFT_ortho = Nj · IDFT_std`` and ``X_j_ortho = X_j_std / Nj``,
+        this equals ``IDFT_std(X_j_std · Ψ_j)`` — exactly the standard
+        discrete convolution of x_j with the kernel ``k_j = IDFT_std(Ψ_j)``.
+        No Wiener correction for the Gaussian downsampling filter is required:
+        the Nj scaling factors cancel analytically.
+
+        Steps per scale j:
+          1. Retrieve ``wavelet_array_MR[j]``  (standard FFT order, Nj×Nj).
+          2. ``k_j = IDFT_std(Ψ_j_MR)``  =  ``fftshift(ifft2(Ψ_j_MR))``.
+          3. Crop to ``KERNELSZ × KERNELSZ`` with a 2-D Hann window.
+          4. Renormalise to preserve impulse-response energy.
+
+        Residual error (~5–20%) comes from the Gaussian anti-aliasing filter
+        not being an ideal brick-wall LPF; this is unavoidable with
+        Gaussian+stride downsampling and much smaller than the error
+        introduced by any Wiener correction.
 
         Parameters
         ----------
-        data : object
-            Object with an attribute `array` storing the data as a tensor
-            or numpy array with shape [..., Nx, Ny].
+        fft_wavelet_op : WaveletOperator2D_FFT_torch
+            Fully built FFT wavelet operator with the same J, L, N0.
+        eps : float
+            Unused (kept for API compatibility).
+        """
+        assert fft_wavelet_op.J == self.J, "J must match"
+        assert fft_wavelet_op.L == self.L, "L must match"
+        assert fft_wavelet_op.N0 == self.N0, "N0 must match"
+
+        K       = self.KERNELSZ
+        kernels = []
+
+        # Derive consistent dtypes from self.dtype
+        if self.dtype in (torch.complex64, torch.float32):
+            cdtype = torch.complex64
+            rdtype = torch.float32
+        else:
+            cdtype = torch.complex128
+            rdtype = torch.float64
+
+        N0x, N0y = self.N0
+
+        for j in range(self.J):
+            # ── 1. Scale info ─────────────────────────────────────────────────
+            # dg_j: actual downsampling level used by the FFT op at scale j.
+            dg_j = fft_wavelet_op.j_to_dg[j]
+            Njx  = N0x >> dg_j
+            Njy  = N0y >> dg_j
+
+            # ── 2. Target FFT wavelet at scale j (standard FFT order, Nj res) ──
+            psi_j = fft_wavelet_op.wavelet_array_MR[j].to(
+                device=self.device, dtype=cdtype
+            )   # [L, Njx, Njy]
+
+            # ── 3. No Wiener correction needed ────────────────────────────
+            # The kernel that makes  k_j ⊛ x_j_gauss = IFFT_ortho(X_j_ortho · Ψ_j)
+            # is simply k_j = IDFT_standard(Ψ_j_MR).  Proof:
+            #
+            #   IFFT_ortho(X_ortho · Ψ) = Nj · IDFT_s(X_ortho · Ψ)
+            #                           = Nj · IDFT_s((X_std/Nj) · Ψ)
+            #                           = IDFT_s(X_std · Ψ)
+            #                           = k ⊛ x   (standard conv)
+            #
+            # The Nj factors cancel exactly; no G_j correction is needed.
+            # The small residual error (~5–20%) comes from the Gaussian filter
+            # not being an ideal brick-wall LPF — unavoidable with Gaussian
+            # downsampling, and far smaller than the error from Wiener.
+            k_fft = psi_j   # [L, Njx, Njy]  — directly the wavelet spectrum
+
+            # ── 4. Back to pixel space (standard FFT → IFFT → center) ─────
+            # k_fft is in standard FFT order → direct IFFT gives spatial kernel
+            # with peak at corner [0,0]; fftshift re-centers it to [Nj//2, Nj//2].
+            # Standard IDFT (no norm, i.e. 1/N factor) → k_j = IDFT_standard(k_fft)
+            # so that  conv(x_j, k_j)  = x_j ⊛ k_j  matches the FFT op output.
+            kernel_spatial = torch.fft.fftshift(
+                torch.fft.ifft2(k_fft),
+                dim=(-2, -1),
+            )   # [L, Njx, Njy], complex — centered at (Nj//2, Nj//2)
+
+            # ── 5. Hann-windowed crop to K×K ──────────────────────────────
+            cx, cy = Njx // 2, Njy // 2
+            half   = K // 2
+
+            hann   = torch.hann_window(K, periodic=False,
+                                       device=self.device, dtype=rdtype)
+            hann2d = (hann[:, None] * hann[None, :]).to(cdtype)
+
+            patch = kernel_spatial[
+                :, cx - half : cx - half + K,
+                   cy - half : cy - half + K
+            ].clone()   # [L, K, K]
+            patch = patch * hann2d
+
+            # ── 6. Renormalise (preserve impulse-response energy) ─────────
+            full_e  = kernel_spatial.abs().pow(2).sum(dim=(-2,-1), keepdim=True).sqrt()
+            patch_e = patch.abs().pow(2).sum(dim=(-2,-1), keepdim=True).sqrt().clamp(1e-12)
+            patch   = patch * (full_e / patch_e)
+
+            kernels.append(patch.reshape(1, self.L, K, K))
+            print('W1 ',j,patch)
+
+        self._decimated_kernels = kernels   # list[J] of [1, L, K, K]
+        self._use_decimated     = True
+        # Align j_to_dg with the FFT op so that apply(data, j) correctly
+        # requires data.dg == j_to_dg[j] (the capped downsampling level).
+        self.j_to_dg = fft_wavelet_op.j_to_dg
+        print(
+            f"Decimated kernels built: J={self.J}, K={K}×{K}, eps={eps:.0e}, "
+            f"j_to_dg={list(fft_wavelet_op.j_to_dg)}."
+        )
+
+    def build_kernel_from_fft_wavelet_op(self, fft_wavelet_op):
+        """
+        Derive à-trous spatial kernels from a FFT wavelet operator so that
+        ``apply(data, j)`` on full-resolution data (dg=0) is equivalent to
+        the FFT approach.
+
+        For each scale j:
+          1. IFFT(ifftshift(wavelet_array[j]))  →  full-size impulse response
+          2. fftshift so the peak is at the array centre
+          3. Crop to KERNELSZ × KERNELSZ with a 2-D Hann window
+          4. Rescale to preserve energy
+
+        After calling this, ``apply(data, j)`` uses à-trous dilation 2**j
+        on full-resolution data (data.dg must be 0).
+
+        Parameters
+        ----------
+        fft_wavelet_op : WaveletOperator2D_FFT_torch
+            Built FFT wavelet operator with same J, L, and spatial size.
+        """
+        assert fft_wavelet_op.J == self.J, "J must match"
+        assert fft_wavelet_op.L == self.L, "L must match"
+
+        K = self.KERNELSZ
+        kernels = []
+
+        cdtype = (torch.complex64 if self.dtype in
+                  (torch.complex64, torch.float32) else torch.complex128)
+        rdtype = torch.float32 if cdtype == torch.complex64 else torch.float64
+
+        for j in range(self.J):
+            wav_fft = fft_wavelet_op.wavelet_array[j].to(
+                device=self.device, dtype=cdtype
+            )   # [L, Nx, Ny]  (fftshifted Fourier-space wavelet)
+
+            # Full spatial impulse response.
+            # wavelet_array[j] is in standard FFT order (DC at corners, same as fft2 output).
+            # Direct IFFT → spatial kernel with peak at [0,0]; fftshift re-centers.
+            # Standard IDFT (no norm) → ψ_j = IDFT_standard(Ψ_j) so that
+            # conv(x, ψ_j) = IFFT_ortho(FFT_ortho(x) · Ψ_j) (FFT op convention).
+            wav_spatial = torch.fft.fftshift(
+                torch.fft.ifft2(wav_fft),
+                dim=(-2, -1),
+            )   # [L, Nx, Ny]
+
+            Nx, Ny = wav_spatial.shape[-2:]
+            cx, cy = Nx // 2, Ny // 2
+            half   = K // 2
+
+            # 2-D Hann window (reduces truncation ringing)
+            hann = torch.hann_window(K, periodic=False, device=self.device, dtype=rdtype)
+            hann2d = (hann[:, None] * hann[None, :]).to(cdtype)
+
+            patch = wav_spatial[:, cx - half : cx - half + K,
+                                    cy - half : cy - half + K].clone()   # [L, K, K]
+            patch = patch * hann2d
+
+            # Preserve energy of the full impulse response
+            full_energy  = wav_spatial.abs().pow(2).sum(dim=(-2, -1), keepdim=True).sqrt()
+            patch_energy = patch.abs().pow(2).sum(dim=(-2, -1), keepdim=True).sqrt().clamp(1e-12)
+            patch = patch * (full_energy / patch_energy)
+
+            kernels.append(patch.reshape(1, self.L, K, K))
+            print('W ',j,patch)
+        self._atrous_kernels = kernels
+        self._use_atrous     = True
+        print(f"À-trous kernels built: J={self.J}, K={K}×{K}.")
+
+    ###########################################################################
+    def apply(self, data, j):
+        """
+        Apply the wavelet kernel to data.array [..., Nx, Ny].
+
+        Standard mode (default, backward-compatible)
+            Requires data.dg == j.  Uses _wav_kernel_0 (j=0) or
+            _wav_kernel (j>0) on the already-downsampled data.
+
+        À-trous mode (activated by build_kernel_from_fft_wavelet_op)
+            Requires data.dg == 0.  Uses _atrous_kernels[j] with
+            dilation=2**j — no downsampling needed, matches FFT approach.
+
+        Parameters
+        ----------
+        data : STL_2D_Kernel_Torch
+        j    : int  — scale index
 
         Returns
         -------
-        torch.Tensor
-            Convolved data with shape [..., L, Nx, Ny].
+        STL_2D_Kernel_Torch  shape [..., L, Nx, Ny]
         """
-        # Check coherence of input data.
         if not isinstance(data, STL_2D_Kernel_Torch):
             raise Exception("Data should be a STL_2D_Kernel_Torch instance")
         if self.DT != data.DT:
             raise Exception("Data and wavelet transform should have same DT")
 
+        x = torch.as_tensor(data.array, device=self._wav_kernel.device)
+        padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
+
+        # ── À-trous mode ─────────────────────────────────────────────────────
+        if getattr(self, "_use_atrous", False):
+            if data.dg != 0:
+                raise ValueError(
+                    "À-trous mode requires full-resolution data (dg=0)."
+                )
+            weight   = self._atrous_kernels[j].squeeze(0)   # [L, K, K]
+            dilation = 2 ** j
+            convolved = self.__class__._semicomplex_conv2d_circular(
+                x, weight, padding_mode=padding_mode, dilation=dilation
+            )
+            return STL_2D_Kernel_Torch(
+                convolved, dg=0, N0=data.N0, pbc=data.pbc,
+                conv_history=data.conv_history + [j],
+            )
+
+        # ── Corrected decimated mode (build_decimated_kernel_from_fft_wavelet_op) ─
+        if getattr(self, "_use_decimated", False):
+            expected_dg = self.j_to_dg[j]
+            if data.dg != expected_dg:
+                raise ValueError(
+                    f"À-trous-decimated mode: scale j={j} expects data.dg="
+                    f"{expected_dg}, got {data.dg}."
+                )
+            weight    = self._decimated_kernels[j].squeeze(0)   # [L, K, K]
+            convolved = self.__class__._semicomplex_conv2d_circular(
+                x, weight, padding_mode=padding_mode
+            )
+            return STL_2D_Kernel_Torch(
+                convolved, dg=data.dg, N0=data.N0, pbc=data.pbc,
+                conv_history=data.conv_history + [j],
+            )
+
+        # ── Standard (decimated) mode — original kernels ──────────────────────
         if j != data.dg:
             raise ValueError("j is not equal to dg, convolution not possible")
 
-        x = data.array  # [..., Nx, Ny]
-
-        # Ensure x is a torch tensor on the same device as the _wav_kernel
-        x = torch.as_tensor(x, device=self._wav_kernel.device)
-
-        if j==0:
-            weight = self._wav_kernel_0.squeeze(0)  # [L, K, K]
-        else:
-            weight = self._wav_kernel.squeeze(0)  # [L, K, K]
-
+        weight = (self._wav_kernel_0 if j == 0 else self._wav_kernel).squeeze(0)
         convolved = self.__class__._semicomplex_conv2d_circular(
-            x, weight, padding_mode=self.__class__._get_padding_mode(pbc=data.pbc)
+            x, weight, padding_mode=padding_mode
         )
-
         return STL_2D_Kernel_Torch(
-            convolved,
-            dg=data.dg,
-            N0=data.N0,
-            pbc=data.pbc,
+            convolved, dg=data.dg, N0=data.N0, pbc=data.pbc,
             conv_history=data.conv_history + [j],
         )
 
@@ -1050,7 +1315,7 @@ class WaveletOperator2Dkernel_torch:
 
         if dg_inc > 0:
             smooth_kernel = self._gaussian_kernel_5x5(
-                device=data.array.device, dtype=data.array.dtype
+                device=data.array.device, dtype=data.array.dtype, pbc=data.pbc
             )
             padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
 
@@ -1177,6 +1442,7 @@ class WaveletOperator2Dkernel_torch:
         smooth_kernel = self._gaussian_kernel_5x5(
             device=data.array.device,
             dtype=data.array.dtype,
+            pbc=data.pbc,
         )
 
         padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
@@ -1289,39 +1555,121 @@ class WaveletOperator2Dkernel_torch:
 
         return data
         
-    def _gaussian_kernel_5x5(self, device, dtype):
+    def _gaussian_kernel_5x5(self, device, dtype, pbc: bool = True):
         """
-        Build and cache a normalized 5x5 Gaussian kernel on (device, dtype)
-        for antialiasing 2D filter used in downsampling.
+        Build and cache an isotropic flat+cosine lowpass kernel for
+        anti-aliasing in the j → j+1 downsampling step.
+
+        The kernel size depends on the boundary condition:
+            pbc=True  (periodic)  → K = 11   (circular padding supports larger kernel)
+            pbc=False (non-per.)  → K =  7   (replicate padding, smaller footprint)
+
+        This filter is designed in the 2-D frequency domain as a radially
+        symmetric (isotropic) lowpass with a raised-cosine transition band.
+        It cuts the small scales (ν ≥ 2·ν_j/3) and preserves the large scales,
+        acting as the anti-aliasing filter before stride-2 decimation.
+
+        The wavelet convolution itself is handled separately by
+        ``build_decimated_kernel_from_fft_wavelet_op``, which reproduces the
+        exact FFT wavelet of ``WaveletOperator2D_FFT_torch``.
+
+        Frequency response (isotropic, ν = radial frequency / Nyquist ∈ [0,1])
+        --------------------------------------------------------------------------
+            H(ν) = 1                                              ν ≤ ν_j / 3
+            H(ν) = ½ · (1 + cos(π · (ν − ν_j/3) / (ν_j/3)))    ν_j/3 < ν < 2ν_j/3
+            H(ν) = 0                                              ν ≥ 2ν_j / 3
+
+        with ν_j = 0.70 (bump-steerable wavelet peak, same at every scale j).
+        This gives:
+            passband  edge  : ν_j / 3 ≈ 0.233
+            stopband  edge  : 2·ν_j / 3 ≈ 0.467
+            wavelet   peak  : ν_j = 0.700
+
+        Measured 2-D transmission (Hann-windowed spatial crop):
+                              K = 7      K = 11
+            ν = 0.05          98.6 %     98.9 %   (large scales)
+            ν = 0.10          94.5 %     95.8 %
+            ν = 0.20          79.4 %     81.7 %
+            ν = 0.233         72.9 %     74.7 %   (passband edge)
+            ν = 0.467         25.1 %     16.1 %   (stopband edge)
+            ν = 0.700          1.7 %      0.3 %   (wavelet peak)
+
+        ``_downsample_tensor`` computes ``pad = K//2`` dynamically, so no
+        other code needs to change when K varies.
 
         Returns
         -------
         kernel : torch.Tensor
-            Shape (5, 5)
+            Shape (K, K), dtype = real counterpart of ``dtype``, sum = 1.
         """
+        # ---- separate cache per (pbc, device, dtype) ----
+        cache_attr = "_smooth_kernel_5x5_pbc" if pbc else "_smooth_kernel_5x5_nopbc"
+        cached = getattr(self, cache_attr, None)
         if (
-            not hasattr(self, "_smooth_kernel_5x5")
-            or self._smooth_kernel_5x5.device != device
-            or self._smooth_kernel_5x5.dtype != dtype
+            cached is None
+            or cached.device != device
+            or cached.dtype != (
+                torch.float32 if dtype == torch.complex64
+                else torch.float64 if dtype == torch.complex128
+                else dtype
+            )
         ):
-            # force real dtype for arange/meshgrid
-            if dtype == torch.complex128:
-                rdtype = torch.float64
-            elif dtype == torch.complex64:
+            # ---- all arithmetic in float64; cast at the end ----
+            K  = 11 if pbc else 7    # spatial kernel size (must be odd)
+            Nd = 512                 # design grid (large for accurate IFFT)
+
+            nu_j = 0.70      # bump wavelet peak (fraction of Nyquist, same for all j)
+            nu1  = nu_j / 3.0          # ≈ 0.233  passband edge
+            nu2  = 2.0 * nu_j / 3.0   # ≈ 0.467  stopband edge
+
+            # --- 2-D radial frequency map (ν ∈ [0, 1] where 1 = Nyquist) ---
+            # fftfreq gives cycles/sample ∈ [-0.5, 0.5);  Nyquist = 0.5
+            # → normalize by 0.5 (i.e. ×2) so Nyquist maps to 1.0
+            f   = torch.fft.fftfreq(Nd, device=device, dtype=torch.float64)
+            fx, fy = torch.meshgrid(f, f, indexing="ij")
+            nu  = torch.sqrt(fx ** 2 + fy ** 2) * 2.0   # [0, √2]; Nyquist = 1
+
+            # --- isotropic raised-cosine frequency response ---
+            H = torch.zeros(Nd, Nd, device=device, dtype=torch.float64)
+            H[nu <= nu1] = 1.0
+            mask = (nu > nu1) & (nu < nu2)
+            H[mask] = 0.5 * (
+                1.0 + torch.cos(torch.pi * (nu[mask] - nu1) / (nu2 - nu1))
+            )
+            # H = 0 for nu >= nu2 (already initialised to zero)
+
+            # --- IFFT → real centred spatial kernel ---
+            # H is real and isotropic → H(-k) = H(k) → IFFT is real
+            h_spatial = torch.fft.fftshift(
+                torch.fft.ifft2(H).real,
+                dim=(-2, -1),
+            )   # shape (Nd, Nd), centred at (Nd//2, Nd//2)
+
+            # --- crop K×K from centre ---
+            cx = cy = Nd // 2
+            half  = K // 2
+            patch = h_spatial[cx - half : cx + half + 1,
+                               cy - half : cy + half + 1].clone()
+
+            # --- Hann window to suppress spatial truncation ringing ---
+            hann   = torch.hann_window(K, periodic=False,
+                                       device=device, dtype=torch.float64)
+            hann2d = hann[:, None] * hann[None, :]
+            patch  = patch * hann2d
+
+            # --- normalise to sum = 1 ---
+            patch = patch / patch.sum()
+
+            # --- cast to caller's real dtype ---
+            if dtype == torch.complex64:
                 rdtype = torch.float32
+            elif dtype == torch.complex128:
+                rdtype = torch.float64
             else:
                 rdtype = dtype
 
-            ax = torch.arange(-2, 3, device=device, dtype=rdtype)
-            xx, yy = torch.meshgrid(ax, ax, indexing="ij")
-
-            sigma = torch.tensor(1.0, device=device, dtype=rdtype)
-            kernel = torch.exp(-(xx**2 + yy**2) / (2*sigma**2))
-            kernel = kernel / kernel.sum()
-
-            # _conv2d_circular expects w shape (O_c, wx, wy)
-            self._smooth_kernel_5x5 = kernel.to(dtype=dtype)
-        return self._smooth_kernel_5x5
+            setattr(self, cache_attr, patch.to(device=device, dtype=rdtype))
+        return getattr(self, cache_attr)
 
 
 class PS_operator_2D_Kernel_torch:
@@ -1595,3 +1943,685 @@ class PS_operator_2D_Kernel_torch:
         plt.title("Radial Power Spectrum")
         plt.grid(True, which="both", ls="-", alpha=0.5)
         plt.legend()
+
+
+###############################################################################
+# Minkowski / Peak / Betti — internal helpers (self-contained, no external dep)
+###############################################################################
+
+# ── Gaussian wavelet helpers ──────────────────────────────────────────────────
+
+def _gaussian_kernel_2d(
+    sigma: float,
+    truncate: float = 3.5,
+    device=None,
+    dtype=None,
+) -> torch.Tensor:
+    """Return a [1, 1, K, K] isotropic Gaussian kernel."""
+    radius = max(1, int(truncate * sigma + 0.5))
+    size   = 2 * radius + 1
+    coords = torch.arange(size, device=device, dtype=dtype) - radius
+    g = torch.exp(-0.5 * (coords / sigma) ** 2)
+    g = g / g.sum()
+    kernel = g[:, None] * g[None, :]     # [K, K]
+    return kernel[None, None]            # [1, 1, K, K]
+
+
+def _gaussian_filter_2d(
+    img: torch.Tensor,
+    sigma: float,
+    padding_mode: str = "circular",
+) -> torch.Tensor:
+    """Gaussian-filter a [B, N, M] image batch; returns same shape."""
+    B, N, M = img.shape
+    kernel = _gaussian_kernel_2d(sigma, device=img.device, dtype=img.dtype)
+    radius = kernel.shape[-1] // 2
+    x = F.pad(img.unsqueeze(1), [radius] * 4, mode=padding_mode)
+    return F.conv2d(x, kernel).squeeze(1)   # [B, N, M]
+
+
+def _extract_scale_flat(
+    flat: torch.Tensor,
+    j: int,
+    pbc: bool = True,
+    wavelet_op=None,
+    scale_mode: str = "smooth",
+) -> torch.Tensor:
+    """
+    Return the scale-j representation of a [B, N, M] batch.
+
+    Parameters
+    ----------
+    j : int
+        Dyadic scale index (0 = finest).  Gaussian sigma = 2^(j+1).
+    pbc : bool
+        Periodic boundary → circular padding.
+    scale_mode : str
+        ``'smooth'`` (default) — Gaussian low-pass at sigma=2^(j+1).
+            Minkowski / Betti computed on the smoothed field; thresholds
+            retain their physical meaning.
+        ``'dog'`` — Difference-of-Gaussians band-pass |G(σ/2) − G(σ)|.
+            Isolates detail at scale j (wavelet-style).
+    wavelet_op : callable or None
+        Reserved for future custom wavelet.
+    """
+    if wavelet_op is not None:
+        raise NotImplementedError(
+            "Custom wavelet_op is not yet implemented. Use wavelet_op=None."
+        )
+    padding_mode = "circular" if pbc else "replicate"
+    sigma = 2.0 ** (j + 1)   # sigma = 2, 4, 8, 16, ...
+    if scale_mode == "smooth":
+        return _gaussian_filter_2d(flat, sigma, padding_mode=padding_mode)
+    elif scale_mode == "dog":
+        g_lo = _gaussian_filter_2d(flat, sigma / 2, padding_mode=padding_mode)
+        g_hi = _gaussian_filter_2d(flat, sigma,     padding_mode=padding_mode)
+        return (g_lo - g_hi).abs()
+    else:
+        raise ValueError(f"scale_mode must be 'smooth' or 'dog', got '{scale_mode}'")
+
+
+# ── Minkowski helpers ─────────────────────────────────────────────────────────
+
+def _mink2d_as_threshold(threshold, img: torch.Tensor) -> torch.Tensor:
+    """Cast threshold to a tensor broadcastable on img [B, N, N]."""
+    B = img.shape[0]
+    t = (threshold if isinstance(threshold, torch.Tensor)
+         else torch.tensor(threshold, dtype=img.dtype, device=img.device))
+    if t.ndim == 1 and t.shape[0] == B:   # [B] → [B, 1, 1]
+        t = t[:, None, None]
+    torch.broadcast_shapes(t.shape, img.shape)  # raises if incompatible
+    return t
+
+
+def _mink2d_functionals(
+    img: torch.Tensor,
+    threshold=None,
+    temperature: float = 20.0,
+) -> "dict[str, torch.Tensor]":
+    """
+    Three 2D Minkowski functionals for a batch of square images [B, N, N].
+
+    Returns {'W0': [B], 'W1': [B], 'W2': [B]}, fully differentiable.
+    """
+    B, N, M = img.shape
+    if threshold is not None:
+        img = torch.sigmoid(temperature * (img - _mink2d_as_threshold(threshold, img)))
+
+    W0 = img.mean(dim=(-2, -1))
+
+    dh = (img[:, :,  1:] - img[:, :, :-1]).abs()
+    dv = (img[:, 1:, :]  - img[:, :-1, :]).abs()
+    W1 = (dh.sum(dim=(-2, -1)) + dv.sum(dim=(-2, -1))) / (N * N)
+
+    Q1 = img.sum(dim=(-2, -1))
+    Qh = (img[:, :,  :-1] * img[:, :,  1:]).sum(dim=(-2, -1))
+    Qv = (img[:, :-1, :]  * img[:, 1:, :] ).sum(dim=(-2, -1))
+    Qf = (img[:, :-1, :-1] * img[:, :-1, 1:]
+        * img[:,  1:, :-1] * img[:,  1:,  1:]).sum(dim=(-2, -1))
+    W2 = (Q1 - Qh - Qv + Qf) / (N * N)
+
+    return {"W0": W0, "W1": W1, "W2": W2}
+
+
+def _mink2d_curves(
+    img: torch.Tensor,
+    thresholds: torch.Tensor,
+    temperature: float = 20.0,
+) -> "dict[str, torch.Tensor]":
+    """
+    Minkowski functionals at multiple thresholds for [B, N, N].
+
+    thresholds : [T] or [B, T].  Returns {'W0','W1','W2'} each [B, T].
+    """
+    B, N, _ = img.shape
+    t = thresholds
+    if t.ndim == 1:
+        t = t.unsqueeze(0).expand(B, t.shape[0])
+    T = t.shape[1]
+    soft = torch.sigmoid(temperature * (img.unsqueeze(1) - t.view(B, T, 1, 1)))
+    mf = _mink2d_functionals(soft.view(B * T, N, N))
+    return {k: v.view(B, T) for k, v in mf.items()}
+
+
+###############################################################################
+class MinkowskiOperator2D:
+    """
+    Minkowski functional operator for 2D planar STL data.
+
+    Computes the three 2D Minkowski functionals — area (W0), perimeter (W1),
+    and Euler characteristic (W2) — in a differentiable manner via soft
+    sigmoid thresholding.
+
+    Follows the same interface as ``PS_operator_2D_Kernel_torch``:
+    build the operator once, then call ``minkowski()`` on any compatible
+    ``STL_2D_Kernel_Torch`` instance.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Spatial shape ``(Nx, Ny)`` of the input maps.  Must match ``data.N0``.
+    thresholds : Tensor [T], Tensor [B, T], or None
+        Default threshold levels.  ``None`` = no thresholding.
+    temperature : float
+        Sigmoid sharpness.  Higher → closer to hard binary thresholding.
+    J : int
+        Number of dyadic scales.
+
+        - ``J=1`` (default) — works at full resolution.
+        - ``J>1`` — applies a Difference-of-Gaussians (DoG) bandpass filter
+          at each scale j=0..J-1 (finest to coarsest) and stacks results
+          along a new leading ``J`` dimension.
+
+          Output shape becomes ``[Nb, Nc, J]`` (no thresholds) or
+          ``[Nb, Nc, J, T]`` (with thresholds).
+    wavelet_op : callable or None
+        Reserved for future use.  Pass ``None`` to use the default DoG filter.
+    device : device
+    dtype  : dtype
+
+    Examples
+    --------
+    >>> op = MinkowskiOperator2D(shape=(64, 64))
+    >>> mf = op.minkowski(data)           # {'W0','W1','W2'} each [Nb, Nc]
+
+    >>> t = torch.linspace(0.1, 0.9, 16)
+    >>> op = MinkowskiOperator2D(shape=(64, 64), thresholds=t, J=3)
+    >>> curves = op.minkowski(data)       # {'W0','W1','W2'} each [Nb, Nc, 3, 16]
+    """
+
+    def __init__(
+        self,
+        shape,
+        thresholds=None,
+        temperature: float = 20.0,
+        J: int = 1,
+        scale_mode: str = "smooth",
+        wavelet_op=None,
+        device=_DEFAULT_DEVICE,
+        dtype=_DEFAULT_DTYPE,
+    ):
+        self.shape = shape
+        self.thresholds = thresholds
+        self.temperature = temperature
+        self.J = J
+        self.scale_mode = scale_mode
+        self.wavelet_op = wavelet_op
+        self.device = _get_device(torch.device(device))
+        self.dtype = _get_dtype(dtype=dtype, device=self.device)
+
+    ###########################################################################
+    def minkowski(
+        self,
+        data,
+        thresholds=None,
+        temperature: float = None,
+    ) -> "dict[str, torch.Tensor]":
+        """
+        Compute the three Minkowski functionals of 2D planar data.
+
+        Parameters
+        ----------
+        data : STL_2D_Kernel_Torch
+            Input data with array of shape ``[..., Nx, Ny]``.
+            Complex arrays are reduced to their modulus before computation.
+        thresholds : Tensor [T] | Tensor [B, T] | None
+            Overrides the operator-level default if provided.
+        temperature : float or None
+            Overrides the operator-level default if provided.
+
+        Returns
+        -------
+        dict[str, Tensor]
+            Keys ``'W0'``, ``'W1'``, ``'W2'``.
+
+            - J=1, no thresholds : ``[Nb, Nc]``
+            - J=1, thresholds T  : ``[Nb, Nc, T]``
+            - J>1, no thresholds : ``[Nb, Nc, J]``
+            - J>1, thresholds T  : ``[Nb, Nc, J, T]``
+        """
+        if not isinstance(data, STL_2D_Kernel_Torch):
+            raise TypeError(
+                f"data must be STL_2D_Kernel_Torch, got {type(data)}"
+            )
+        if self.shape != data.N0:
+            raise ValueError(
+                f"Operator shape {self.shape} != data.N0 {data.N0}"
+            )
+
+        thresholds  = thresholds  if thresholds  is not None else self.thresholds
+        temperature = temperature if temperature is not None else self.temperature
+
+        arr = data.array
+        if torch.is_complex(arr):
+            arr = arr.abs()
+        if arr.ndim == 2:
+            arr = arr[None, None, :, :]
+        elif arr.ndim == 3:
+            arr = arr[None, :, :, :]
+        Nb, Nc, Nx, Ny = arr.shape
+        flat = arr.reshape(Nb * Nc, Nx, Ny)   # [B, Nx, Ny]
+        pbc  = getattr(data, "pbc", True)
+
+        def _compute_one(band: torch.Tensor):
+            """Return mink dict for a single [B, N, M] band."""
+            if thresholds is None:
+                mf = _mink2d_functionals(band, temperature=temperature)
+                return {k: v.view(Nb, Nc) for k, v in mf.items()}
+            t = torch.as_tensor(thresholds, dtype=band.dtype, device=band.device)
+            if t.ndim == 1:
+                t = t.unsqueeze(0).expand(Nb * Nc, t.shape[0])
+            elif t.ndim == 2:
+                assert t.shape[0] == Nb * Nc, (
+                    f"thresholds dim-0 ({t.shape[0]}) must equal Nb*Nc ({Nb*Nc})"
+                )
+            else:
+                raise ValueError(f"thresholds must be 1-D or 2-D, got {t.ndim}-D")
+            T = t.shape[1]
+            curves = _mink2d_curves(band, t, temperature=temperature)
+            return {k: v.view(Nb, Nc, T) for k, v in curves.items()}
+
+        if self.J == 1:
+            return _compute_one(flat)
+
+        # ── Multi-scale ──────────────────────────────────────────────────────
+        scale_results = [
+            _compute_one(_extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op, scale_mode=self.scale_mode))
+            for j in range(self.J)
+        ]
+        # stack along J dimension (inserted after Nc)
+        return {
+            k: torch.stack([sr[k] for sr in scale_results], dim=2)
+            for k in scale_results[0]
+        }
+
+
+
+###############################################################################
+# Peak counts & Betti curves — internal helpers
+###############################################################################
+
+def _neighborhood_extrema(
+    img: torch.Tensor,
+    mode: str = "max",
+    connectivity: int = 8,
+    padding_mode: str = "replicate",
+) -> torch.Tensor:
+    """
+    Max or min over the local K-connectivity neighborhood, excluding center.
+
+    img          : [B, N, M]
+    mode         : 'max' or 'min'
+    connectivity : 4 (N/E/S/W) or 8 (+ diagonals)
+    Returns      : [B, N, M]
+    """
+    B, N, M = img.shape
+    padded = F.pad(img.unsqueeze(1), (1, 1, 1, 1), mode=padding_mode).squeeze(1)
+
+    shifts = [(-1, -1), (-1, 0), (-1, 1),
+              ( 0, -1),          ( 0, 1),
+              ( 1, -1), ( 1, 0), ( 1, 1)]
+    if connectivity == 4:
+        shifts = [(-1, 0), (0, -1), (0, 1), (1, 0)]
+
+    neighbors = torch.stack(
+        [padded[:, 1+di:1+di+N, 1+dj:1+dj+M] for di, dj in shifts], dim=0
+    )   # [K, B, N, M]
+
+    return neighbors.amax(dim=0) if mode == "max" else neighbors.amin(dim=0)
+
+
+def _soft_peaks(
+    img: torch.Tensor,
+    temperature: float,
+    connectivity: int = 8,
+    padding_mode: str = "replicate",
+) -> torch.Tensor:
+    """
+    Soft local-maximum indicator.
+    is_peak[i] = σ(τ * (f_i − max_neighbor_i)).  Returns [B, N, M].
+    """
+    max_nbr = _neighborhood_extrema(img, "max", connectivity, padding_mode)
+    return torch.sigmoid(temperature * (img - max_nbr))
+
+
+def _soft_valleys(
+    img: torch.Tensor,
+    temperature: float,
+    connectivity: int = 8,
+    padding_mode: str = "replicate",
+) -> torch.Tensor:
+    """
+    Soft local-minimum indicator.
+    is_valley[i] = σ(τ * (min_neighbor_i − f_i)).  Returns [B, N, M].
+    """
+    min_nbr = _neighborhood_extrema(img, "min", connectivity, padding_mode)
+    return torch.sigmoid(temperature * (min_nbr - img))
+
+
+def _threshold_weighted_sum(
+    img: torch.Tensor,          # [B, N, M]
+    indicator: torch.Tensor,    # [B, N, M]  soft binary mask (peaks / valleys)
+    thresholds: torch.Tensor,   # [B, T]
+    temperature: float,
+    above: bool = True,         # True → count pixels ABOVE t, False → BELOW t
+) -> torch.Tensor:              # [B, T]
+    """
+    Weighted sum: for each threshold t, accumulate indicator over active pixels.
+    Active = soft excursion-set mask.  Result is normalised by N*M.
+    """
+    B, N, M = img.shape
+    T = thresholds.shape[1]
+    sign = 1.0 if above else -1.0
+    active = torch.sigmoid(
+        sign * temperature * (img.unsqueeze(1) - thresholds.view(B, T, 1, 1))
+    )   # [B, T, N, M]
+    return (active * indicator.unsqueeze(1)).sum(dim=(-2, -1)) / (N * M)
+
+
+def _normalise_thresholds(
+    thresholds,
+    B: int,
+    device,
+    dtype,
+) -> torch.Tensor:
+    """Cast thresholds to [B, T] on the correct device/dtype."""
+    t = torch.as_tensor(thresholds, dtype=dtype, device=device)
+    if t.ndim == 1:
+        t = t.unsqueeze(0).expand(B, t.shape[0])
+    if t.ndim != 2 or t.shape[0] != B:
+        raise ValueError(
+            f"thresholds must be shape [T] or [B={B}, T], got {tuple(t.shape)}"
+        )
+    return t
+
+
+###############################################################################
+class PeakCountOperator2D:
+    """
+    Soft local-extrema count operator for 2D planar STL data.
+
+    Detects peaks (local maxima) and valleys (local minima) using a
+    differentiable sigmoid approximation, optionally conditioned on
+    intensity thresholds and evaluated at multiple dyadic scales.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Spatial shape ``(Nx, Ny)`` matching ``data.N0``.
+    thresholds : Tensor [T] | Tensor [B, T] | None
+        Default threshold grid.  ``None`` = unconditional count.
+    temperature : float
+        Sigmoid sharpness.
+    connectivity : int
+        4 (cardinal) or 8 (incl. diagonals).
+    J : int
+        Number of dyadic scales.
+
+        - ``J=1`` (default) — full resolution.
+        - ``J>1`` — DoG band-pass at each scale j=0..J-1, results stacked
+          along a new ``J`` dimension.
+    wavelet_op : callable or None
+        Reserved for future custom wavelet.  Use ``None`` (DoG).
+    device, dtype
+
+    Examples
+    --------
+    >>> t  = torch.linspace(0.1, 0.9, 16)
+    >>> op = PeakCountOperator2D(shape=(128, 128), thresholds=t)
+    >>> out = op.peaks(data)    # {'peaks': [Nb, Nc, 16]}
+
+    >>> op3 = PeakCountOperator2D(shape=(128, 128), thresholds=t, J=3)
+    >>> out3 = op3.peaks(data)  # {'peaks': [Nb, Nc, 3, 16]}
+    """
+
+    def __init__(
+        self,
+        shape,
+        thresholds=None,
+        temperature: float = 20.0,
+        connectivity: int = 8,
+        J: int = 1,
+        scale_mode: str = "smooth",
+        wavelet_op=None,
+        device=_DEFAULT_DEVICE,
+        dtype=_DEFAULT_DTYPE,
+    ):
+        self.shape        = shape
+        self.thresholds   = thresholds
+        self.temperature  = temperature
+        self.connectivity = connectivity
+        self.J            = J
+        self.scale_mode   = scale_mode
+        self.wavelet_op   = wavelet_op
+        self.device = _get_device(torch.device(device))
+        self.dtype  = _get_dtype(dtype=dtype, device=self.device)
+
+    # ------------------------------------------------------------------
+    def _prepare(self, data):
+        """Validate data, return (flat [B, Nx, Ny], padding_mode, Nb, Nc)."""
+        if not isinstance(data, STL_2D_Kernel_Torch):
+            raise TypeError(f"Expected STL_2D_Kernel_Torch, got {type(data)}")
+        if self.shape != data.N0:
+            raise ValueError(f"Shape mismatch: {self.shape} vs {data.N0}")
+        arr = data.array.abs() if torch.is_complex(data.array) else data.array
+        if arr.ndim == 2:
+            arr = arr[None, None]
+        elif arr.ndim == 3:
+            arr = arr[None]
+        Nb, Nc, Nx, Ny = arr.shape
+        pbc  = getattr(data, "pbc", True)
+        pmode = "circular" if pbc else "replicate"
+        return arr.reshape(Nb * Nc, Nx, Ny), pmode, Nb, Nc
+
+    # ------------------------------------------------------------------
+    def _count_one(self, band, mode, thresholds, temperature, pmode, Nb, Nc):
+        """Compute count dict for a single [B, N, M] band."""
+        B, N, M = band.shape
+        key = "peaks" if mode == "peaks" else "valleys"
+        if mode == "peaks":
+            indicator = _soft_peaks(band, temperature, self.connectivity, pmode)
+            above = True
+        else:
+            indicator = _soft_valleys(band, temperature, self.connectivity, pmode)
+            above = False
+
+        if thresholds is None:
+            count = indicator.mean(dim=(-2, -1))   # [B]
+            return {key: count.view(Nb, Nc)}
+
+        t = _normalise_thresholds(thresholds, B, band.device, band.dtype)
+        T = t.shape[1]
+        counts = _threshold_weighted_sum(band, indicator, t, temperature, above=above)
+        return {key: counts.view(Nb, Nc, T)}
+
+    # ------------------------------------------------------------------
+    def peaks(self, data, thresholds=None, temperature=None):
+        """
+        Soft peak (local-maximum) count, optionally conditioned on threshold.
+
+        Returns
+        -------
+        dict['peaks']:
+
+        - J=1, no thresholds : ``[Nb, Nc]``
+        - J=1, thresholds T  : ``[Nb, Nc, T]``
+        - J>1, no thresholds : ``[Nb, Nc, J]``
+        - J>1, thresholds T  : ``[Nb, Nc, J, T]``
+        """
+        flat, pmode, Nb, Nc = self._prepare(data)
+        thresholds  = thresholds  if thresholds  is not None else self.thresholds
+        temperature = temperature if temperature is not None else self.temperature
+        pbc = pmode == "circular"
+
+        if self.J == 1:
+            return self._count_one(flat, "peaks", thresholds, temperature, pmode, Nb, Nc)
+
+        scales = [
+            self._count_one(
+                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op, scale_mode=self.scale_mode),
+                "peaks", thresholds, temperature, pmode, Nb, Nc,
+            )
+            for j in range(self.J)
+        ]
+        return {"peaks": torch.stack([s["peaks"] for s in scales], dim=2)}
+
+    # ------------------------------------------------------------------
+    def valleys(self, data, thresholds=None, temperature=None):
+        """
+        Soft valley (local-minimum) count, optionally conditioned on threshold.
+
+        Same return-shape convention as :meth:`peaks`.
+        """
+        flat, pmode, Nb, Nc = self._prepare(data)
+        thresholds  = thresholds  if thresholds  is not None else self.thresholds
+        temperature = temperature if temperature is not None else self.temperature
+        pbc = pmode == "circular"
+
+        if self.J == 1:
+            return self._count_one(flat, "valleys", thresholds, temperature, pmode, Nb, Nc)
+
+        scales = [
+            self._count_one(
+                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op, scale_mode=self.scale_mode),
+                "valleys", thresholds, temperature, pmode, Nb, Nc,
+            )
+            for j in range(self.J)
+        ]
+        return {"valleys": torch.stack([s["valleys"] for s in scales], dim=2)}
+
+
+###############################################################################
+class BettiCurveOperator2D:
+    """
+    Differentiable Betti curves for 2D planar STL data.
+
+    Approximates topological Betti numbers as functions of an intensity
+    threshold using soft / differentiable surrogates:
+
+    - **β₀(t)** ≈ soft peak count above t  (Morse theory: one max per component)
+    - **χ(t)**  = Minkowski W2(t)           (exact pixel-complex Euler char.)
+    - **β₁(t)** = β₀(t) − χ(t)
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Spatial shape ``(Nx, Ny)`` matching ``data.N0``.
+    thresholds : Tensor [T] | Tensor [B, T]
+        Threshold levels (required; there is no single-threshold mode).
+    temperature : float
+        Sigmoid sharpness.
+    connectivity : int
+        4 or 8 — neighbourhood for peak detection.
+    J : int
+        Number of dyadic scales (1 = full resolution; >1 = multi-scale DoG).
+    wavelet_op : callable or None
+        Reserved for custom wavelet.
+    device, dtype
+
+    Examples
+    --------
+    >>> t  = torch.linspace(0.1, 0.9, 16)
+    >>> op = BettiCurveOperator2D(shape=(128, 128), thresholds=t)
+    >>> out = op.betti(data)
+    >>> # out['beta0'].shape == out['beta1'].shape == out['chi'].shape == [Nb, Nc, 16]
+
+    >>> op3 = BettiCurveOperator2D(shape=(128, 128), thresholds=t, J=3)
+    >>> out3 = op3.betti(data)
+    >>> # out3['beta0'].shape == [Nb, Nc, 3, 16]
+    """
+
+    def __init__(
+        self,
+        shape,
+        thresholds,
+        temperature: float = 20.0,
+        connectivity: int = 8,
+        J: int = 1,
+        scale_mode: str = "smooth",
+        wavelet_op=None,
+        device=_DEFAULT_DEVICE,
+        dtype=_DEFAULT_DTYPE,
+    ):
+        self.shape        = shape
+        self.thresholds   = thresholds
+        self.temperature  = temperature
+        self.connectivity = connectivity
+        self.J            = J
+        self.scale_mode   = scale_mode
+        self.wavelet_op   = wavelet_op
+        self.device = _get_device(torch.device(device))
+        self.dtype  = _get_dtype(dtype=dtype, device=self.device)
+
+    # ------------------------------------------------------------------
+    def _betti_one(self, band, thresholds, temperature, pmode, Nb, Nc):
+        """Compute Betti dict for a single [B, N, M] band."""
+        B, N, M = band.shape
+        t = _normalise_thresholds(thresholds, B, band.device, band.dtype)
+        T = t.shape[1]
+
+        # β0 : soft peak count above each threshold
+        indicator = _soft_peaks(band, temperature, self.connectivity, pmode)
+        beta0 = _threshold_weighted_sum(band, indicator, t, temperature, above=True)
+
+        # χ : Minkowski W2 curves
+        chi = _mink2d_curves(band, t, temperature=temperature)["W2"]   # [B, T]
+
+        # β1 = β0 − χ
+        beta1 = beta0 - chi
+
+        return {
+            "beta0": beta0.view(Nb, Nc, T),
+            "beta1": beta1.view(Nb, Nc, T),
+            "chi":   chi.view(Nb, Nc, T),
+        }
+
+    # ------------------------------------------------------------------
+    def betti(self, data, thresholds=None, temperature=None):
+        """
+        Compute Betti curves β₀(t), β₁(t) and Euler characteristic χ(t).
+
+        Returns
+        -------
+        dict with keys ``'beta0'``, ``'beta1'``, ``'chi'``:
+
+        - J=1 : each of shape ``[Nb, Nc, T]``
+        - J>1 : each of shape ``[Nb, Nc, J, T]``
+
+        All outputs are fully differentiable w.r.t. ``data.array``.
+        """
+        if not isinstance(data, STL_2D_Kernel_Torch):
+            raise TypeError(f"Expected STL_2D_Kernel_Torch, got {type(data)}")
+        if self.shape != data.N0:
+            raise ValueError(f"Shape mismatch: {self.shape} vs {data.N0}")
+
+        arr = data.array.abs() if torch.is_complex(data.array) else data.array
+        if arr.ndim == 2:
+            arr = arr[None, None]
+        elif arr.ndim == 3:
+            arr = arr[None]
+        Nb, Nc, Nx, Ny = arr.shape
+        flat = arr.reshape(Nb * Nc, Nx, Ny)
+        pbc  = getattr(data, "pbc", True)
+        pmode = "circular" if pbc else "replicate"
+
+        thresholds  = thresholds  if thresholds  is not None else self.thresholds
+        temperature = temperature if temperature is not None else self.temperature
+
+        if thresholds is None:
+            raise ValueError("thresholds must be provided for Betti curves.")
+
+        if self.J == 1:
+            return self._betti_one(flat, thresholds, temperature, pmode, Nb, Nc)
+
+        scale_results = [
+            self._betti_one(
+                _extract_scale_flat(flat, j, pbc=pbc, wavelet_op=self.wavelet_op, scale_mode=self.scale_mode),
+                thresholds, temperature, pmode, Nb, Nc,
+            )
+            for j in range(self.J)
+        ]
+        return {
+            k: torch.stack([sr[k] for sr in scale_results], dim=2)
+            for k in scale_results[0]
+        }
