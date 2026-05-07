@@ -406,6 +406,16 @@ class WaveletOperator2Dkernel_torch:
                 stacklevel=2,
             )
 
+        # Pre-compute smooth kernels for both boundary conditions so that no
+        # lazy build ever occurs during apply() / downsample().  Results are
+        # also copied into st_op.smooth_kernel_{pbc,nopbc} by ST_Operator.
+        self.smooth_kernel_pbc   = self._gaussian_kernel_5x5(
+            device=self.device, dtype=self.dtype, pbc=True
+        )
+        self.smooth_kernel_nopbc = self._gaussian_kernel_5x5(
+            device=self.device, dtype=self.dtype, pbc=False
+        )
+
     def _build_reweighting_maps_and_scattering_layer_masks(self):
         if self.mask_full_res is None:
             return None, None, None, None
@@ -1156,7 +1166,7 @@ class WaveletOperator2Dkernel_torch:
         print(f"À-trous kernels built: J={self.J}, K={K}×{K}.")
 
     ###########################################################################
-    def apply(self, data, j):
+    def apply(self, data, j, kernel=None):
         """
         Apply the wavelet kernel to data.array [..., Nx, Ny].
 
@@ -1210,7 +1220,10 @@ class WaveletOperator2Dkernel_torch:
                     f"À-trous-decimated mode: scale j={j} expects data.dg="
                     f"{expected_dg}, got {data.dg}."
                 )
-            weight = self._decimated_kernels[j].squeeze(0)  # [L, K, K]
+            # kernel may be supplied explicitly from st_op.kernels[j]; fall back
+            # to the internally stored list only if not provided.
+            _k = kernel if kernel is not None else self._decimated_kernels[j]
+            weight = _k.squeeze(0)  # [L, K, K]
             convolved = self.__class__._semicomplex_conv2d_circular(
                 x, weight, padding_mode=padding_mode
             )
@@ -1359,7 +1372,7 @@ class WaveletOperator2Dkernel_torch:
         return y.reshape(*leading_dims, Hf, Wf)
 
     ###########################################################################
-    def downsample(self, data, dg_out, inplace=True, replace_nan_value=nan):
+    def downsample(self, data, dg_out, inplace=True, replace_nan_value=nan, smooth_kernel=None):
         """
         Downsample the data to the dg_out resolution.
         Downsampling is done in real space along the last two dimensions using (successive iterations of, if dg_out - dg > 1) torch.conv2d with stride=2.
@@ -1383,9 +1396,19 @@ class WaveletOperator2Dkernel_torch:
         dg_inc = dg_out - data.dg
 
         if dg_inc > 0:
-            smooth_kernel = self._gaussian_kernel_5x5(
-                device=data.array.device, dtype=data.array.dtype, pbc=data.pbc
-            )
+            if smooth_kernel is None:
+                smooth_kernel = self._gaussian_kernel_5x5(
+                    device=data.array.device, dtype=data.array.dtype, pbc=data.pbc
+                )
+            else:
+                # Caller supplied kernel (e.g. from st_op.smooth_kernel_*);
+                # move to the right device/dtype without recomputing.
+                rdtype = (
+                    torch.float32
+                    if data.array.dtype in (torch.complex64, torch.float32)
+                    else torch.float64
+                )
+                smooth_kernel = smooth_kernel.to(device=data.array.device, dtype=rdtype)
             padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
 
             if self.mask_full_res is None:  # no mask
