@@ -323,7 +323,7 @@ class WaveletOperator2Dkernel_torch:
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
         if self.WType == "Morlet":
-            self._wav_kernel = self._build_morlet_wavelet_kernel()
+            self._wav_kernel, self._wav_kernel_0 = self._build_morlet_wavelet_kernel()
         else:
             raise ValueError(
                 f"WType {self.WType} not recognized. Available options: 'Morlet'."
@@ -562,7 +562,8 @@ class WaveletOperator2Dkernel_torch:
         yy, xx = torch.meshgrid(coords, coords, indexing="ij")
 
         # Gaussian envelope
-        gaussian_envelope = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        gaussian_envelope = torch.exp(-2 * (xx**2 + yy**2) / (self.L * sigma**2))
+        gaussian_envelope_0 = torch.exp(-8 * (xx**2 + yy**2) / (self.L * sigma**2))
 
         # Orientations
         angles = (
@@ -580,16 +581,50 @@ class WaveletOperator2Dkernel_torch:
         # Complex Morlet wavelet
         kernel = torch.exp(1j * 0.75 * np.pi * x_rot) * gaussian_envelope[None, :, :]
 
-        # Remove DC component (admissibility condition)
-        kernel = kernel - torch.mean(kernel, dim=(1, 2))[:, None, None]
-
-        # L2 normalization
-        kernel = (
+        ###### case j=0 ######
+        # y: (L, 3K, 3K)
+        y = torch.zeros(
+            [self.L, self.KERNELSZ * 3, self.KERNELSZ * 3],
+            device=self.device,
+            dtype=kernel.dtype,
+        )
+        y[:, self.KERNELSZ : self.KERNELSZ * 2, self.KERNELSZ : self.KERNELSZ * 2] = (
             kernel
-            / torch.sqrt(torch.sum(torch.abs(kernel) ** 2, dim=(1, 2)))[:, None, None]
         )
 
-        return kernel.reshape(1, self.L, self.KERNELSZ, self.KERNELSZ)
+        # conv2d expects 4D input: (N, C, H, W)
+        y4 = y.unsqueeze(1)  # (L, 1, 3K, 3K)
+
+        # weight: (C_out=1, C_in=1, 5, 5)
+        w = gaussian_envelope_0.unsqueeze(0).unsqueeze(0)  # (1,1,5,5)
+        w = w.to(dtype=kernel.dtype)  # optional: cast to complex if you want
+
+        # No padding needed because you already embedded into a larger array
+        y4 = F.conv2d(input=y4, weight=w, stride=1, padding=0)  # (L,1,3K-4,3K-4)
+
+        # Back to (L, H, W)
+        y = y4.squeeze(1)  # (L, 3K-4, 3K-4)
+
+        # IMPORTANT: indices shift because output is smaller by 4 pixels
+        # You want the central KxK block corresponding to original center
+        kernel_0 = y[
+            :,
+            (self.KERNELSZ - 2) : (self.KERNELSZ - 2) + self.KERNELSZ,
+            (self.KERNELSZ - 2) : (self.KERNELSZ - 2) + self.KERNELSZ,
+        ]
+        ######################
+
+        # Remove DC component (admissibility condition)
+        kernel = kernel - torch.mean(kernel, dim=(1, 2))[:, None, None]
+        kernel_0 = kernel_0 - torch.mean(kernel_0, dim=(1, 2))[:, None, None]
+
+        # L2 normalization
+        kernel /= self.L
+        kernel_0 /= 2 * self.L
+
+        return kernel.reshape(
+            1, self.L, self.KERNELSZ, self.KERNELSZ
+        ), kernel_0.reshape(1, self.L, self.KERNELSZ, self.KERNELSZ)
 
     def _crop(self, array, border):
         """
@@ -889,7 +924,10 @@ class WaveletOperator2Dkernel_torch:
         # Ensure x is a torch tensor on the same device as the _wav_kernel
         x = torch.as_tensor(x, device=self._wav_kernel.device)
 
-        weight = self._wav_kernel.squeeze(0)  # [L, K, K]
+        if j == 0:
+            weight = self._wav_kernel_0.squeeze(0)  # [L, K, K]
+        else:
+            weight = self._wav_kernel.squeeze(0)  # [L, K, K]
 
         convolved = self.__class__._semicomplex_conv2d_circular(
             x, weight, padding_mode=self.__class__._get_padding_mode(pbc=data.pbc)
