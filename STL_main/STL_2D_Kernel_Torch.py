@@ -348,7 +348,7 @@ class WaveletOperator2Dkernel_torch:
         self.J = J
         self.N0 = N0
         self.L = L if L is not None else 4
-        self.KERNELSZ = kernel_size if kernel_size is not None else 5
+        self.KERNELSZ = kernel_size if kernel_size is not None else 7
         self.DT = DT
 
         self.device = _get_device(torch.device(device))
@@ -1074,8 +1074,10 @@ class WaveletOperator2Dkernel_torch:
             )
             patch = patch * (full_e / patch_e)
 
-            kernels.append(patch.reshape(1, self.L, K, K))
-            print("W1 ", j, patch)
+            # Strip zero outer ring: hann[0]=hann[K-1]=0 → outer ring ≡ 0.
+            # K=7 → 5×5 effective kernel stored (better accuracy than 3×3).
+            patch = patch[:, 1:-1, 1:-1].contiguous()   # [L, K-2, K-2]
+            kernels.append(patch.reshape(1, self.L, K - 2, K - 2))
 
         self._decimated_kernels = kernels  # list[J] of [1, L, K, K]
         self._use_decimated = True
