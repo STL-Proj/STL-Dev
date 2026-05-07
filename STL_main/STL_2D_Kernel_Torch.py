@@ -1007,17 +1007,27 @@ class WaveletOperator2Dkernel_torch:
             if dg_j > 0:
                 smooth_k = self._gaussian_kernel_5x5(
                     device=self.device, dtype=rdtype, pbc=True
-                )   # K=11, sum=1
+                )   # (K-2)×(K-2), sum=1
                 Kx, Ky = smooth_k.shape
-                h_pad = torch.zeros(Njx, Njy, dtype=torch.float64, device=self.device)
-                # Center the kernel at (Njx//2, Njy//2) so that ifftshift maps
-                # it to (0,0) → FFT spectrum is real (symmetric kernel, zero phase).
-                # (Njx - Kx)//2 is off by 1 for odd Kx / even Njx → phase rotation
-                # → .real ≈ 0 instead of ≈ 0.7 → ratios ≈ 150 instead of ≈ 1.
-                cx_k = Njx // 2 - Kx // 2
-                cy_k = Njy // 2 - Ky // 2
+                # The LPF was applied on the N_{j-1} = 2*Nj grid before downsampling.
+                # Pad to N2 = 2*Nj so H_big[m] = H_filter(m/N2) at correct frequency.
+                # Center at (Njx, Njy) = (N2x//2, N2y//2) → ifftshift maps to (0,0)
+                # → FFT is real (symmetric kernel, zero phase).
+                N2x, N2y = 2 * Njx, 2 * Njy
+                h_pad = torch.zeros(N2x, N2y, dtype=torch.float64, device=self.device)
+                cx_k = Njx - Kx // 2   # centre at Njx = N2x//2
+                cy_k = Njy - Ky // 2
                 h_pad[cx_k:cx_k + Kx, cy_k:cy_k + Ky] = smooth_k.to(torch.float64)
-                H_down = torch.fft.fft2(torch.fft.ifftshift(h_pad)).real  # [Njx, Njy], real
+                H_big = torch.fft.fft2(torch.fft.ifftshift(h_pad)).real  # [N2x, N2y]
+                # Correct bin mapping:
+                #   pos kx (k ≤ Njx//2) → H_big[k]          (same physical freq)
+                #   neg kx (k > Njx//2) → H_big[k + Njx]    (wrapped in N2 grid)
+                # Likewise for ky.  H is isotropic so neg-freq bins stay in passband.
+                kx_idx = torch.arange(Njx, device=self.device)
+                ky_idx = torch.arange(Njy, device=self.device)
+                kx_big = torch.where(kx_idx <= Njx // 2, kx_idx, kx_idx + Njx)
+                ky_big = torch.where(ky_idx <= Njy // 2, ky_idx, ky_idx + Njy)
+                H_down = H_big[kx_big[:, None], ky_big[None, :]]          # [Njx, Njy]
                 H_down_c = H_down.clamp(min=0.05).to(cdtype)               # clamp before cast
                 k_fft = psi_j / H_down_c[None]                             # [L, Njx, Njy]
             else:
