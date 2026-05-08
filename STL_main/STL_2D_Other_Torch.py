@@ -21,13 +21,27 @@ import math
 import torch
 import torch.nn.functional as F
 
-from STL_main.STL_2D_Kernel_Torch import STL_2D_Kernel_Torch
 from STL_main.torch_backend import (
     _DEFAULT_DEVICE,
     _DEFAULT_DTYPE,
     _get_device,
     _get_dtype,
 )
+
+###############################################################################
+# ── Data compatibility helper ────────────────────────────────────────────────
+
+def _check_data(data, shape):
+    """Accept any object that exposes .array, .N0, .pbc (duck typing)."""
+    for attr in ("array", "N0", "pbc"):
+        if not hasattr(data, attr):
+            raise TypeError(
+                f"data must expose .array, .N0 and .pbc attributes "
+                f"(got {type(data).__name__!r} which is missing .{attr})"
+            )
+    if shape != data.N0:
+        raise ValueError(f"Operator shape {shape} != data.N0 {data.N0}")
+
 
 ###############################################################################
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -339,10 +353,7 @@ class MinkowskiOperator2D:
             - J>1, no thresholds : ``[Nb, Nc, J]``
             - J>1, thresholds T  : ``[Nb, Nc, J, T]``
         """
-        if not isinstance(data, STL_2D_Kernel_Torch):
-            raise TypeError(f"data must be STL_2D_Kernel_Torch, got {type(data)}")
-        if self.shape != data.N0:
-            raise ValueError(f"Operator shape {self.shape} != data.N0 {data.N0}")
+        _check_data(data, self.shape)
 
         thresholds = thresholds if thresholds is not None else self.thresholds
         temperature = temperature if temperature is not None else self.temperature
@@ -442,10 +453,7 @@ class PeakCountOperator2D:
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
     def _prepare(self, data):
-        if not isinstance(data, STL_2D_Kernel_Torch):
-            raise TypeError(f"Expected STL_2D_Kernel_Torch, got {type(data)}")
-        if self.shape != data.N0:
-            raise ValueError(f"Shape mismatch: {self.shape} vs {data.N0}")
+        _check_data(data, self.shape)
         arr = data.array.abs() if torch.is_complex(data.array) else data.array
         if arr.ndim == 2:
             arr = arr[None, None]
@@ -612,10 +620,7 @@ class BettiCurveOperator2D:
         - J=1 : each ``[Nb, Nc, T]``
         - J>1 : each ``[Nb, Nc, J, T]``
         """
-        if not isinstance(data, STL_2D_Kernel_Torch):
-            raise TypeError(f"Expected STL_2D_Kernel_Torch, got {type(data)}")
-        if self.shape != data.N0:
-            raise ValueError(f"Shape mismatch: {self.shape} vs {data.N0}")
+        _check_data(data, self.shape)
 
         arr = data.array.abs() if torch.is_complex(data.array) else data.array
         if arr.ndim == 2:
