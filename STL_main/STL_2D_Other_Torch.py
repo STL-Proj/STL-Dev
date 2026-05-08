@@ -428,10 +428,22 @@ class MinkowskiOperator2D:
         self._wav_L: int = 0
 
         if wavelet_op is not None:
-            # Accept WaveletOperator2Dkernel_torch (._decimated_kernels)
-            # or ST_Operator (.kernels) styles.
+            # ── STL-Dev: pre-computed decimated kernels, one per scale ────────
             if hasattr(wavelet_op, "_decimated_kernels"):
                 self._wav_kernels = list(wavelet_op._decimated_kernels)
+            # ── pablo_one: single kernel applied after downsampling ───────────
+            #    _wav_kernel_0 is used at j=0, _wav_kernel at j>0.
+            elif hasattr(wavelet_op, "_wav_kernel"):
+                _J = getattr(wavelet_op, "J", 1)
+                self._wav_kernels = [
+                    (
+                        wavelet_op._wav_kernel_0
+                        if j == 0 and hasattr(wavelet_op, "_wav_kernel_0")
+                        else wavelet_op._wav_kernel
+                    )
+                    for j in range(_J)
+                ]
+            # ── ST_Operator: .kernels list ────────────────────────────────────
             elif hasattr(wavelet_op, "kernels") and wavelet_op.kernels is not None:
                 self._wav_kernels = list(wavelet_op.kernels)
 
@@ -439,8 +451,17 @@ class MinkowskiOperator2D:
                 self._wav_j_to_dg = list(wavelet_op.j_to_dg)
 
             if hasattr(wavelet_op, "smooth_kernel_pbc"):
+                # STL-Dev: already stored as [1, 1, Ks, Ks]
                 self._wav_smooth_pbc   = wavelet_op.smooth_kernel_pbc
                 self._wav_smooth_nopbc = wavelet_op.smooth_kernel_nopbc
+            elif hasattr(wavelet_op, "_gaussian_kernel_5x5"):
+                # pablo_one: build [5,5] and unsqueeze to [1,1,5,5]
+                _dev  = getattr(wavelet_op, "device", torch.device("cpu"))
+                _dtyp = getattr(wavelet_op, "dtype", torch.float32)
+                _sk   = wavelet_op._gaussian_kernel_5x5(device=_dev, dtype=_dtyp)
+                _sk4  = _sk[None, None]   # [1, 1, 5, 5]
+                self._wav_smooth_pbc   = _sk4
+                self._wav_smooth_nopbc = _sk4  # same kernel; padding_mode differs
 
             if self._wav_kernels is not None:
                 self._wav_L = self._wav_kernels[0].shape[1]
@@ -646,15 +667,41 @@ class PeakCountOperator2D:
         self._wav_L: int = 0
 
         if wavelet_op is not None:
+            # ── STL-Dev: pre-computed decimated kernels, one per scale ────────
             if hasattr(wavelet_op, "_decimated_kernels"):
                 self._wav_kernels = list(wavelet_op._decimated_kernels)
+            # ── pablo_one: single kernel applied after downsampling ───────────
+            #    _wav_kernel_0 is used at j=0, _wav_kernel at j>0.
+            elif hasattr(wavelet_op, "_wav_kernel"):
+                _J = getattr(wavelet_op, "J", 1)
+                self._wav_kernels = [
+                    (
+                        wavelet_op._wav_kernel_0
+                        if j == 0 and hasattr(wavelet_op, "_wav_kernel_0")
+                        else wavelet_op._wav_kernel
+                    )
+                    for j in range(_J)
+                ]
+            # ── ST_Operator: .kernels list ────────────────────────────────────
             elif hasattr(wavelet_op, "kernels") and wavelet_op.kernels is not None:
                 self._wav_kernels = list(wavelet_op.kernels)
+
             if hasattr(wavelet_op, "j_to_dg"):
                 self._wav_j_to_dg = list(wavelet_op.j_to_dg)
+
             if hasattr(wavelet_op, "smooth_kernel_pbc"):
+                # STL-Dev: already stored as [1, 1, Ks, Ks]
                 self._wav_smooth_pbc   = wavelet_op.smooth_kernel_pbc
                 self._wav_smooth_nopbc = wavelet_op.smooth_kernel_nopbc
+            elif hasattr(wavelet_op, "_gaussian_kernel_5x5"):
+                # pablo_one: build [5,5] and unsqueeze to [1,1,5,5]
+                _dev  = getattr(wavelet_op, "device", torch.device("cpu"))
+                _dtyp = getattr(wavelet_op, "dtype", torch.float32)
+                _sk   = wavelet_op._gaussian_kernel_5x5(device=_dev, dtype=_dtyp)
+                _sk4  = _sk[None, None]   # [1, 1, 5, 5]
+                self._wav_smooth_pbc   = _sk4
+                self._wav_smooth_nopbc = _sk4  # same kernel; padding_mode differs
+
             if self._wav_kernels is not None:
                 self._wav_L = self._wav_kernels[0].shape[1]
 
@@ -881,15 +928,41 @@ class BettiCurveOperator2D:
         self._wav_L: int = 0
 
         if wavelet_op is not None:
+            # ── STL-Dev: pre-computed decimated kernels, one per scale ────────
             if hasattr(wavelet_op, "_decimated_kernels"):
                 self._wav_kernels = list(wavelet_op._decimated_kernels)
+            # ── pablo_one: single kernel applied after downsampling ───────────
+            #    _wav_kernel_0 is used at j=0, _wav_kernel at j>0.
+            elif hasattr(wavelet_op, "_wav_kernel"):
+                _J = getattr(wavelet_op, "J", 1)
+                self._wav_kernels = [
+                    (
+                        wavelet_op._wav_kernel_0
+                        if j == 0 and hasattr(wavelet_op, "_wav_kernel_0")
+                        else wavelet_op._wav_kernel
+                    )
+                    for j in range(_J)
+                ]
+            # ── ST_Operator: .kernels list ────────────────────────────────────
             elif hasattr(wavelet_op, "kernels") and wavelet_op.kernels is not None:
                 self._wav_kernels = list(wavelet_op.kernels)
+
             if hasattr(wavelet_op, "j_to_dg"):
                 self._wav_j_to_dg = list(wavelet_op.j_to_dg)
+
             if hasattr(wavelet_op, "smooth_kernel_pbc"):
+                # STL-Dev: already stored as [1, 1, Ks, Ks]
                 self._wav_smooth_pbc   = wavelet_op.smooth_kernel_pbc
                 self._wav_smooth_nopbc = wavelet_op.smooth_kernel_nopbc
+            elif hasattr(wavelet_op, "_gaussian_kernel_5x5"):
+                # pablo_one: build [5,5] and unsqueeze to [1,1,5,5]
+                _dev  = getattr(wavelet_op, "device", torch.device("cpu"))
+                _dtyp = getattr(wavelet_op, "dtype", torch.float32)
+                _sk   = wavelet_op._gaussian_kernel_5x5(device=_dev, dtype=_dtyp)
+                _sk4  = _sk[None, None]   # [1, 1, 5, 5]
+                self._wav_smooth_pbc   = _sk4
+                self._wav_smooth_nopbc = _sk4  # same kernel; padding_mode differs
+
             if self._wav_kernels is not None:
                 self._wav_L = self._wav_kernels[0].shape[1]
 
