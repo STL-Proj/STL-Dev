@@ -949,20 +949,18 @@ class WaveletOperator2Dkernel_torch:
         Downsample a tensor by a factor 2**dg_inc along the last two
         dimensions using (successive iterations of, if dg_inc > 1) torch.conv2d with stride=2.
 
-        Requires that both spatial dimensions be divisible by 2**dg_inc.
+        Odd spatial dimensions are handled at each step:
+          - padding_mode == "circular"  (pbc=True) : mirror the last pixel
+            by appending the first pixel (periodic wrap-around) to make the
+            dimension even before striding.
+          - other padding modes           (pbc=False): crop the last pixel
+            to make the dimension even before striding.
         """
         if dg_inc < 0:
             raise ValueError("dg_inc must be non-negative")
         if dg_inc == 0:
             return x
 
-        scale = 2**dg_inc
-        H, W = x.shape[-2:]
-        if H % scale != 0 or W % scale != 0:
-            raise ValueError(
-                f"Cannot downsample from ({H},{W}) by 2^{dg_inc}: "
-                "dimensions must be divisible."
-            )
         if len(smooth_kernel.shape) != 2:
             raise ValueError("Smooth kernel must be of dimension 2.")
         if smooth_kernel.shape[0] != smooth_kernel.shape[1]:
@@ -971,16 +969,32 @@ class WaveletOperator2Dkernel_torch:
             raise ValueError("Smooth kernel side length must be odd.")
 
         leading_dims = x.shape[:-2]
+        H, W = x.shape[-2:]
         B = int(torch.prod(torch.tensor(leading_dims))) if leading_dims else 1
         y = x.reshape(B, 1, H, W)
 
         for _ in range(dg_inc):
             h, w = y.shape[-2:]
-            if h % 2 != 0 or w % 2 != 0:
-                raise ValueError(
-                    "Downsampling requires even spatial dimensions at each step."
-                )
-            # Add circular padding for periodic boundaries
+
+            # ── make height even ──────────────────────────────────────────────
+            if h % 2 != 0:
+                if padding_mode == "circular":
+                    # PBC: wrap – append the first row at the end
+                    y = torch.cat([y, y[:, :, :1, :]], dim=2)
+                else:
+                    # non-PBC: crop – drop the last row
+                    y = y[:, :, :-1, :]
+
+            # ── make width even ───────────────────────────────────────────────
+            if w % 2 != 0:
+                if padding_mode == "circular":
+                    # PBC: wrap – append the first column at the end
+                    y = torch.cat([y, y[:, :, :, :1]], dim=3)
+                else:
+                    # non-PBC: crop – drop the last column
+                    y = y[:, :, :, :-1]
+
+            # ── smooth + stride-2 ─────────────────────────────────────────────
             pad = smooth_kernel.shape[-1] // 2
             y_padded = F.pad(y, (pad, pad, pad, pad), mode=padding_mode)
             y = F.conv2d(
