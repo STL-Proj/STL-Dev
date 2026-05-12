@@ -1346,8 +1346,13 @@ class CS_operator_2D_Kernel_Torch:
             raise Exception(
                 f"Data should be a STL_2D_Kernel_Torch instance, got {type(data)}"
             )
-        if self.shape != data.N0:
-            raise Exception("Data shape does not match operator shape")
+        actual_shape = tuple(data.array.shape[-2:])
+        if self.shape != actual_shape:
+            raise Exception(
+                f"Data shape does not match operator shape: "
+                f"operator built for {self.shape}, got array shape {actual_shape} "
+                f"(data.N0={data.N0}). Rebuild the CS_operator with the correct shape."
+            )
         if data.dg != 0:
             raise Exception("Data dg must be 0 for power spectrum computation")
         if data.array.isnan().any():

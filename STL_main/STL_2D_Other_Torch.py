@@ -138,11 +138,12 @@ def _mink2d_functionals(
     temperature: float = 20.0,
 ) -> "dict[str, torch.Tensor]":
     """
-    Three 2D Minkowski functionals for a batch [B, N, N].
+    Three 2D Minkowski functionals for a batch [B, H, W].
 
     Returns {'W0': [B], 'W1': [B], 'W2': [B]}, fully differentiable.
+    Works for non-square images (H ≠ W).
     """
-    B, N, M = img.shape
+    B, H, W = img.shape
     if threshold is not None:
         img = torch.sigmoid(temperature * (img - _mink2d_as_threshold(threshold, img)))
 
@@ -150,7 +151,7 @@ def _mink2d_functionals(
 
     dh = (img[:, :, 1:] - img[:, :, :-1]).abs()
     dv = (img[:, 1:, :] - img[:, :-1, :]).abs()
-    W1 = (dh.sum(dim=(-2, -1)) + dv.sum(dim=(-2, -1))) / (N * N)
+    W1 = (dh.sum(dim=(-2, -1)) + dv.sum(dim=(-2, -1))) / (H * W)
 
     Q1 = img.sum(dim=(-2, -1))
     Qh = (img[:, :, :-1] * img[:, :, 1:]).sum(dim=(-2, -1))
@@ -158,7 +159,7 @@ def _mink2d_functionals(
     Qf = (
         img[:, :-1, :-1] * img[:, :-1, 1:] * img[:, 1:, :-1] * img[:, 1:, 1:]
     ).sum(dim=(-2, -1))
-    W2 = (Q1 - Qh - Qv + Qf) / (N * N)
+    W2 = (Q1 - Qh - Qv + Qf) / (H * W)
 
     return {"W0": W0, "W1": W1, "W2": W2}
 
@@ -169,17 +170,18 @@ def _mink2d_curves(
     temperature: float = 20.0,
 ) -> "dict[str, torch.Tensor]":
     """
-    Minkowski functionals at multiple thresholds for [B, N, N].
+    Minkowski functionals at multiple thresholds for [B, H, W].
 
     thresholds : [T] or [B, T].  Returns {'W0','W1','W2'} each [B, T].
+    Works for non-square images (H ≠ W).
     """
-    B, N, _ = img.shape
+    B, H, W = img.shape
     t = thresholds
     if t.ndim == 1:
         t = t.unsqueeze(0).expand(B, t.shape[0])
     T = t.shape[1]
     soft = torch.sigmoid(temperature * (img.unsqueeze(1) - t.view(B, T, 1, 1)))
-    mf = _mink2d_functionals(soft.view(B * T, N, N))
+    mf = _mink2d_functionals(soft.view(B * T, H, W))
     return {k: v.view(B, T) for k, v in mf.items()}
 
 
