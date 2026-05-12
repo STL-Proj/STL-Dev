@@ -1,99 +1,22 @@
 import os
 import sys
 import time
+import warnings
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 
 from STL_main.STL_2D_FFT_Torch import STL_2D_FFT_Torch
 from STL_main.STL_2D_Kernel_Torch import STL_2D_Kernel_Torch
 
 
-def save_comp_sep(
-    d_U,
-    d_Q,
-    s_U_opt,
-    s_Q_opt,
-    s_U_opt_noisy,
-    s_Q_opt_noisy,
-    residual_U,
-    residual_Q,
-    output_dir_name,
-    filename,
-):
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-
-    # common bounds for U
-    vmin_U = d_U.min().item()
-    vmax_U = d_U.max().item()
-
-    # common bounds for Q
-    vmin_Q = d_Q.min().item()
-    vmax_Q = d_Q.max().item()
-
-    # plotting d_U, s_U_opt, s_U_opt_noisy, and residual_U
-    im_U1 = axes[0, 0].imshow(
-        d_U.cpu().numpy(), vmin=vmin_U, vmax=vmax_U, cmap="viridis"
-    )
-    axes[0, 0].set_title("$d_U$")
-
-    im_U2 = axes[0, 1].imshow(
-        s_U_opt.cpu().numpy(), vmin=vmin_U, vmax=vmax_U, cmap="viridis"
-    )
-    axes[0, 1].set_title("$\\tilde{s}_U$")
-
-    im_U3 = axes[0, 2].imshow(
-        s_U_opt_noisy.cpu().numpy(), vmin=vmin_U, vmax=vmax_U, cmap="viridis"
-    )
-    axes[0, 2].set_title("$\\tilde{s}_U + c_U$")
-
-    im_U4 = axes[0, 3].imshow(
-        residual_U.cpu().numpy(),
-        vmin=residual_U.min().item(),
-        vmax=residual_U.max().item(),
-        cmap="viridis",
-    )
-    axes[0, 3].set_title("$d_U - \\tilde{s}_U$")
-
-    # plotting d_Q, s_Q_opt, s_Q_opt_noisy, and residual_Q
-    im_Q1 = axes[1, 0].imshow(
-        d_Q.cpu().numpy(), vmin=vmin_Q, vmax=vmax_Q, cmap="viridis"
-    )
-    axes[1, 0].set_title("$d_Q$")
-
-    im_Q2 = axes[1, 1].imshow(
-        s_Q_opt.cpu().numpy(), vmin=vmin_Q, vmax=vmax_Q, cmap="viridis"
-    )
-    axes[1, 1].set_title("$\\tilde{s}_Q$")
-
-    im_Q3 = axes[1, 2].imshow(
-        s_Q_opt_noisy.cpu().numpy(), vmin=vmin_Q, vmax=vmax_Q, cmap="viridis"
-    )
-    axes[1, 2].set_title("$\\tilde{s}_Q + c_Q$")
-
-    im_Q4 = axes[1, 3].imshow(
-        residual_Q.cpu().numpy(),
-        vmin=residual_Q.min().item(),
-        vmax=residual_Q.max().item(),
-        cmap="viridis",
-    )
-    axes[1, 3].set_title("$d_Q - \\tilde{s}_Q$")
-
-    # layout adjustments
-    for ax in axes.flat:
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir_name, filename))
-    plt.close()
-
-
 # Full phase (5-channel phase)
 def baseline_comp_sep(
-    DATA_PATH,
-    N=10,
+    d_U,
+    d_Q,
+    d_I,
+    c_U,
+    c_Q,
     max_iter=25,
     batch_size=None,
     resampling_period=None,
@@ -102,40 +25,37 @@ def baseline_comp_sep(
 ):
 
     # Set default values for optional parameters
+    N = c_U.shape[0]  # Number of contamination maps in the ensemble
     if batch_size is None:
-        batch_size = N  # Default to full batch if not specified
+        batch_size = N  # default to full batch if not specified
+
     if resampling_period is None:
-        resampling_period = max_iter  # Default to no resampling if not specified
+        resampling_period = 1  # default value
+
+    elif resampling_period != 1 and resampling_period != max_iter:
+        warnings.warn(
+            "Semi-stochastic gradient descent optimization with mini-batch resampling period different from 1 or max_iter. "
+            "May be trapped in local optima.",
+            UserWarning,
+        )
+
     if epoch_period is None:
         epoch_period = max_iter  # Default to single epoch if not specified
 
     # Sanity checks
-    assert batch_size <= N, "Stochastic batch size must be less than or equal to N."
+    assert (
+        batch_size <= N
+    ), "Mini batch size in SGD must be less than or equal to the number of contamination maps in the ensemble."
     assert (
         resampling_period <= max_iter
     ), "Resampling period must be less than or equal to max iterations."
 
-    # Load target map
-    s_U, s_Q, d_I = np.load(DATA_TEST_PATH + "/" + "Turb_6.npy")[:3, :, :]
-    s_U = torch.from_numpy(s_U).float()  # Target map of the U component
-    s_Q = torch.from_numpy(s_Q).float()  # Target map of the Q component
-    d_I = torch.from_numpy(d_I).float()  # Ancillary data
-
-    # Build ensemble of contamination maps
-    H, W = s_U.shape
-    c_U = torch.randn(N + 2, H, W) * (0.5**0.5)
-    c_Q = torch.randn(N + 2, H, W) * (0.5**0.5)
-
-    # Observed maps
-    d_U = s_U + c_U[0]  # Observed map of the U component
-    d_Q = s_Q + c_Q[0]  # Observed map of the Q component
-
     target_maps = torch.stack(
         [
             d_U.unsqueeze(0).repeat(N, 1, 1),  # [N, H, W]
-            c_U[2:],  # [N, H, W]
+            c_U,  # [N, H, W]
             d_Q.unsqueeze(0).repeat(N, 1, 1),  # [N, H, W]
-            c_Q[2:],  # [N, H, W]
+            c_Q,  # [N, H, W]
             d_I.unsqueeze(0).repeat(N, 1, 1),  # [N, H, W]
         ],
         dim=1,
@@ -148,20 +68,14 @@ def baseline_comp_sep(
 
     compute_cross_matrix = torch.tensor(
         [
-            [True, False, True, False, True],
+            [True, False, False, False, False],
             [False, True, False, False, False],
-            [False, False, True, False, True],
+            [False, False, True, False, False],
             [False, False, False, True, False],
-            [
-                False,
-                False,
-                False,
-                False,
-                True,
-            ],  # Auto-stats for ancillary data computed for normalization concerns.
+            [False, False, False, False, True],
         ],
         dtype=torch.bool,
-    )  # [5, 5]
+    )
 
     optimizer = torch.optim.LBFGS(
         [running_maps],
@@ -181,7 +95,7 @@ def baseline_comp_sep(
             norm_batch_mean=True,
             compute_cross_matrix=compute_cross_matrix,
             compute_PS=compute_PS,
-        ).to_flatten(keep_batch_dim=True)
+        ).to_flatten(keep_channel_dim=True)
 
     # Split total iterations into epoch iterations
     n_epochs = max_iter // epoch_period
@@ -189,6 +103,10 @@ def baseline_comp_sep(
         [max_iter % epoch_period] if max_iter % epoch_period > 0 else []
     )
 
+    loss_DC1_history = []
+    loss_DC2_history = []
+    loss_MC1_history = []
+    loss_MC2_history = []
     loss_history = []
     print_iter = 5
 
@@ -209,11 +127,11 @@ def baseline_comp_sep(
 
         rm = torch.stack(
             [
-                running_maps[0].unsqueeze(0) + c_U[2:][indices],  # [batch_size, H, W]
+                running_maps[0].unsqueeze(0) + c_U[indices],  # [batch_size, H, W]
                 (d_U - running_maps[0])
                 .unsqueeze(0)
                 .repeat(batch_size, 1, 1),  # [batch_size, H, W]
-                running_maps[1].unsqueeze(0) + c_Q[2:][indices],  # [batch_size, H, W]
+                running_maps[1].unsqueeze(0) + c_Q[indices],  # [batch_size, H, W]
                 (d_Q - running_maps[1])
                 .unsqueeze(0)
                 .repeat(batch_size, 1, 1),  # [batch_size, H, W]
@@ -226,11 +144,52 @@ def baseline_comp_sep(
 
         stats_rm = stats_flatten(
             stl_rm, st_op, norm="load_ref", compute_PS=compute_PS
-        )  # [batch_size, n_stats]
+        )  # [batch_size, Nc, Nc, n_stats]
 
-        loss = (stats_rm - stats_target_maps[indices]).abs().square().sum(dim=1).mean()
+        loss_DC1 = (
+            (
+                stats_rm[:, 0, 0].mean(dim=0)
+                - stats_target_maps[indices][:, 0, 0].mean(dim=0)
+            )
+            .abs()
+            .square()
+            .sum()
+        )
+        loss_MC1 = (
+            (
+                stats_rm[:, 1, 1].mean(dim=0)
+                - stats_target_maps[indices][:, 1, 1].mean(dim=0)
+            )
+            .abs()
+            .square()
+            .sum()
+        )
+        loss_DC2 = (
+            (
+                stats_rm[:, 2, 2].mean(dim=0)
+                - stats_target_maps[indices][:, 2, 2].mean(dim=0)
+            )
+            .abs()
+            .square()
+            .sum()
+        )
+        loss_MC2 = (
+            (
+                stats_rm[:, 3, 3].mean(dim=0)
+                - stats_target_maps[indices][:, 3, 3].mean(dim=0)
+            )
+            .abs()
+            .square()
+            .sum()
+        )
+
+        loss = loss_DC1 + loss_MC1 + loss_DC2 + loss_MC2
 
         loss.backward()
+        loss_DC1_history.append(loss_DC1.item())
+        loss_DC2_history.append(loss_DC2.item())
+        loss_MC1_history.append(loss_MC1.item())
+        loss_MC2_history.append(loss_MC2.item())
         loss_history.append(loss.item())
 
         if len(loss_history) % print_iter == 0:
@@ -245,7 +204,7 @@ def baseline_comp_sep(
         st_op = stl_target_maps.get_ST_op()
         stats_target_maps = stats_flatten(
             stl_target_maps, st_op, norm="store_ref", compute_PS=compute_PS
-        )  # [N, n_stats]
+        )  # [N, Nc, Nc, n_stats]
 
     for epoch_index, n_iters in enumerate(n_iter_per_epoch):
         print(
@@ -260,11 +219,11 @@ def baseline_comp_sep(
                 stl_current_maps = STL_DataClass(
                     torch.stack(
                         [
-                            running_maps[0].unsqueeze(0) + c_U[2:],  # [N, H, W]
+                            running_maps[0].unsqueeze(0) + c_U,  # [N, H, W]
                             (d_U - running_maps[0])
                             .unsqueeze(0)
                             .repeat(N, 1, 1),  # [N, H, W]
-                            running_maps[1].unsqueeze(0) + c_Q[2:],  # [N, H, W]
+                            running_maps[1].unsqueeze(0) + c_Q,  # [N, H, W]
                             (d_Q - running_maps[1])
                             .unsqueeze(0)
                             .repeat(N, 1, 1),  # [N, H, W]
@@ -273,7 +232,7 @@ def baseline_comp_sep(
                         dim=1,
                     ),
                     pbc=True,
-                )
+                )  # [N, 5, H, W]
                 st_op_current = stl_current_maps.get_ST_op()
                 stats_current_maps = st_op_current.apply(
                     stl_current_maps,
@@ -297,65 +256,13 @@ def baseline_comp_sep(
     print(f"Execution time: {end - start:.3f} s")
 
     running_maps = running_maps.detach()
-
-    # Compute the optimal noisy maps and the residuals for validation
     s_U_opt = running_maps[0]
     s_Q_opt = running_maps[1]
-    s_U_opt_noisy = s_U_opt + c_U[2]
-    s_Q_opt_noisy = s_Q_opt + c_Q[2]
-    residual_U = d_U - s_U_opt
-    residual_Q = d_Q - s_Q_opt
 
-    return (
-        d_U,
-        d_Q,
-        s_U_opt,
-        s_Q_opt,
-        s_U_opt_noisy,
-        s_Q_opt_noisy,
-        residual_U,
-        residual_Q,
-    )
-
-
-if __name__ == "__main__":
-
-    # Find path to test dataset
-    PARENT_DIR = os.path.abspath(os.path.join(os.getcwd(), ".."))
-    sys.path.append(PARENT_DIR)
-    print("Parent directory added to sys.path:", ".../" + os.path.basename(PARENT_DIR))
-
-    DATA_TEST_PATH = PARENT_DIR + "/data" + "/test"
-    print(
-        "Dataset directory used:",
-        ".../"
-        + os.path.basename(PARENT_DIR)
-        + DATA_TEST_PATH.split(os.path.basename(PARENT_DIR))[-1],
-    )
-
-    # Full phase (5-channel phase) component separation
-    d_U, d_Q, s_U_opt, s_Q_opt, s_U_opt_noisy, s_Q_opt_noisy, residual_U, residual_Q = (
-        baseline_comp_sep(
-            DATA_TEST_PATH,
-            N=100,
-            max_iter=25,
-            batch_size=10,
-            resampling_period=5,
-            epoch_period=10,
-            STL_DataClass=STL_2D_FFT_Torch,
-        )
-    )
-    output_dir_name = "comp_sep_5channels_results"
-    os.makedirs(output_dir_name, exist_ok=True)
-    save_comp_sep(
-        d_U,
-        d_Q,
-        s_U_opt,
-        s_Q_opt,
-        s_U_opt_noisy,
-        s_Q_opt_noisy,
-        residual_U,
-        residual_Q,
-        output_dir_name,
-        filename="comp_sep_5channels_results.png",
+    return (s_U_opt, s_Q_opt), (
+        loss_DC1_history,
+        loss_DC2_history,
+        loss_MC1_history,
+        loss_MC2_history,
+        loss_history,
     )

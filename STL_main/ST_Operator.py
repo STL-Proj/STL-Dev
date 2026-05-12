@@ -435,7 +435,7 @@ class ST_Operator:
             )
 
         if SC == "ScatCov":
-            #            data_st.S1 = bk.zeros((Nb, Nc, J, L)) + bk.nan
+            # data_st.S1 = bk.zeros((Nb, Nc, J, L)) + bk.nan
             data_st.S1 = (
                 bk.zeros((Nb, Nc, Nc, J, L), dtype=bk._DEFAULT_COMPLEX_DTYPE) + bk.nan
             )
