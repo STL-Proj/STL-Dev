@@ -1141,7 +1141,9 @@ def _lac_one_scale(
     p = kernel.shape[-1] // 2
     f = flat[:, None]                                              # [B, 1, H, W]
 
-    Q  = F.conv2d(f, kernel, padding=p, padding_mode=pad_mode).squeeze(1)  # [B, H, W]
+    # F.conv2d does not accept padding_mode — pad manually then convolve
+    f_pad = F.pad(f, (p, p, p, p), mode=pad_mode)                 # [B, 1, H+2p, W+2p]
+    Q = F.conv2d(f_pad, kernel, padding=0).squeeze(1)             # [B, H, W]
 
     mu1 = Q.mean(dim=(-2, -1))                                    # [B]
     mu2 = (Q ** 2).mean(dim=(-2, -1))                             # [B]
