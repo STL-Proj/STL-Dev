@@ -11,6 +11,14 @@ PeakCountOperator2D
     Soft local-extrema (peaks / valleys) counts.
 BettiCurveOperator2D
     Differentiable Betti curves β₀(t), β₁(t) and Euler characteristic χ(t).
+LacunarityOperator2D
+    Differentiable lacunarity Λ(ε) = E[Q²]/E[Q]² at multiple window sizes.
+    Optional circular-disk window for rotation invariance.
+    Optional wavelet extension → 'lac_wav' [Nb, Nc, E, J, L].
+GLCMOperator2D
+    Differentiable GLCM statistics (contrast, correlation, energy,
+    homogeneity, entropy) via soft sigmoid binning. Optional 4-direction
+    averaging for rotation invariance. Wavelet ext → '*_wav' [Nb, Nc, D, J, L].
 
 All operators follow the same interface: build once, then call the main
 method on any compatible ``STL_2D_Kernel_Torch`` instance.
@@ -1088,3 +1096,563 @@ class BettiCurveOperator2D:
             "beta1_wav": wav["beta1"],
             "chi_wav":   wav["chi"],
         }
+
+
+###############################################################################
+# ── Lacunarity & GLCM helpers ────────────────────────────────────────────────
+###############################################################################
+
+
+def _circular_disk_kernel(
+    eps: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """
+    Return a [1, 1, eps, eps] circular disk kernel (unnormalized sum kernel).
+
+    Pixels within radius (eps-1)/2 of the centre are 1; others are 0.
+    """
+    ys = torch.arange(eps, dtype=dtype, device=device) - (eps - 1) / 2.0
+    xs = torch.arange(eps, dtype=dtype, device=device) - (eps - 1) / 2.0
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    r    = (eps - 1) / 2.0
+    mask = (xx ** 2 + yy ** 2 <= r ** 2).to(dtype)
+    return mask[None, None]   # [1, 1, eps, eps]
+
+
+def _lac_one_scale(
+    flat: torch.Tensor,
+    kernel: torch.Tensor,
+    pad_mode: str,
+) -> torch.Tensor:
+    """
+    Differentiable lacunarity at one window size.
+
+    Parameters
+    ----------
+    flat   : [B, H, W]
+    kernel : [1, 1, k, k]  unnormalized sum window
+    pad_mode : 'circular' | 'replicate'
+
+    Returns
+    -------
+    [B]  Λ(ε) = E[Q²] / E[Q]²   (≥ 1 always)
+    """
+    B, H, W = flat.shape
+    p = kernel.shape[-1] // 2
+    f = flat[:, None]                                              # [B, 1, H, W]
+
+    Q  = F.conv2d(f, kernel, padding=p, padding_mode=pad_mode).squeeze(1)  # [B, H, W]
+
+    mu1 = Q.mean(dim=(-2, -1))                                    # [B]
+    mu2 = (Q ** 2).mean(dim=(-2, -1))                             # [B]
+    return mu2 / mu1.clamp(min=1e-8) ** 2                         # [B]
+
+
+def _soft_glcm(
+    flat: torch.Tensor,
+    offset: tuple,
+    thresholds: torch.Tensor,
+    temperature: float,
+    pad_mode: str,
+) -> torch.Tensor:
+    """
+    Differentiable soft GLCM for one spatial offset (dy, dx).
+
+    Uses sigmoid-based soft histogram binning so the result is fully
+    differentiable w.r.t. ``flat``.
+
+    Parameters
+    ----------
+    flat        : [B, H, W]
+    offset      : (dy, dx)
+    thresholds  : [N+1]  bin edges
+    temperature : sigmoid sharpness
+    pad_mode    : 'circular' | 'replicate'
+
+    Returns
+    -------
+    glcm : [B, N, N]  normalised co-occurrence matrix
+    """
+    B, H, W = flat.shape
+    dy, dx  = offset
+    N = len(thresholds) - 1
+
+    # ── Shifted image: shifted[y, x] = img[y + dy, x + dx] (with boundary) ──
+    if pad_mode == "circular":
+        shifted = torch.roll(flat, shifts=(-dy, -dx), dims=(-2, -1))
+    else:
+        pad_t   = max(-dy, 0)
+        pad_b   = max( dy, 0)
+        pad_l   = max(-dx, 0)
+        pad_r   = max( dx, 0)
+        padded  = F.pad(flat, (pad_l, pad_r, pad_t, pad_b), mode="replicate")
+        off_h   = pad_t + dy
+        off_w   = pad_l + dx
+        shifted = padded[:, off_h: off_h + H, off_w: off_w + W]
+
+    # ── Soft bin membership ───────────────────────────────────────────────────
+    t    = thresholds.to(flat.device, flat.dtype)     # [N+1]
+    t_lo = t[:-1]                                     # [N]
+    t_hi = t[1:]                                      # [N]
+
+    x1 = flat.unsqueeze(-1)                           # [B, H, W, 1]
+    x2 = shifted.unsqueeze(-1)                        # [B, H, W, 1]
+
+    # p_k(x) = σ(T*(x−t_k)) − σ(T*(x−t_{k+1}))
+    p1 = (torch.sigmoid(temperature * (x1 - t_lo))
+          - torch.sigmoid(temperature * (x1 - t_hi)))    # [B, H, W, N]
+    p2 = (torch.sigmoid(temperature * (x2 - t_lo))
+          - torch.sigmoid(temperature * (x2 - t_hi)))    # [B, H, W, N]
+
+    # Outer product summed over spatial dims → [B, N, N]
+    glcm = (p1.unsqueeze(-1) * p2.unsqueeze(-2)).sum(dim=(1, 2))
+
+    # Normalise
+    glcm = glcm / glcm.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-10)
+    return glcm
+
+
+def _glcm_statistics(glcm: torch.Tensor) -> dict:
+    """
+    Extract five standard GLCM statistics.
+
+    Parameters
+    ----------
+    glcm : [B, N, N]  normalised co-occurrence matrix
+
+    Returns
+    -------
+    dict with keys 'contrast', 'correlation', 'energy', 'homogeneity',
+    'entropy', each [B].
+    """
+    B, N, _ = glcm.shape
+    device  = glcm.device
+    dtype   = glcm.dtype
+
+    idx = torch.arange(N, dtype=dtype, device=device)
+    ii, jj = torch.meshgrid(idx, idx, indexing="ij")   # [N, N]
+
+    # Marginal means and standard deviations
+    mu_i  = (ii[None] * glcm).sum(dim=(-2, -1))        # [B]
+    mu_j  = (jj[None] * glcm).sum(dim=(-2, -1))        # [B]
+    sig_i = ((ii[None] - mu_i[:, None, None]) ** 2 * glcm).sum(dim=(-2, -1)).sqrt().clamp(min=1e-8)
+    sig_j = ((jj[None] - mu_j[:, None, None]) ** 2 * glcm).sum(dim=(-2, -1)).sqrt().clamp(min=1e-8)
+
+    diff      = ii - jj                                 # [N, N]
+    contrast  = (diff[None] ** 2 * glcm).sum(dim=(-2, -1))                          # [B]
+    homo      = (glcm / (1.0 + diff[None].abs())).sum(dim=(-2, -1))                 # [B]
+    energy    = (glcm ** 2).sum(dim=(-2, -1))                                       # [B]
+    entropy   = -(glcm * glcm.clamp(min=1e-10).log()).sum(dim=(-2, -1))             # [B]
+    corr_num  = ((ii[None] - mu_i[:, None, None]) *
+                 (jj[None] - mu_j[:, None, None]) * glcm).sum(dim=(-2, -1))
+    correlation = corr_num / (sig_i * sig_j)                                        # [B]
+
+    return {
+        "contrast":    contrast,
+        "correlation": correlation,
+        "energy":      energy,
+        "homogeneity": homo,
+        "entropy":     entropy,
+    }
+
+
+###############################################################################
+
+
+class LacunarityOperator2D:
+    """
+    Differentiable lacunarity descriptor for 2D planar STL data.
+
+    For each window size ε in ``window_sizes`` computes:
+
+        Λ(ε) = E[Q(r,ε)²] / E[Q(r,ε)]²
+
+    where Q(r, ε) is the local pixel-sum inside a window of size ε centred
+    at r (computed via ``F.conv2d``).  Λ(ε) ≥ 1 (= 1 for a uniform image,
+    large for strongly clustered textures).
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Spatial shape ``(Nx, Ny)`` matching ``data.N0``.
+    window_sizes : sequence of int
+        Window sizes ε₁, …, εE (pixels).
+    rotation_invariant : bool
+        If True, replaces the square window with a circular disk kernel,
+        making Λ(ε) invariant under image rotation.
+    J : int
+        Wavelet scales.  ``J = 0`` — raw image only.
+        ``J > 0`` + ``wavelet_op`` — also return ``'lac_wav'``
+        of shape ``[Nb, Nc, E, J, L]``.
+    wavelet_op : WaveletOperator2Dkernel_torch / ST_Operator / None
+    device, dtype
+
+    Examples
+    --------
+    >>> lac_op = LacunarityOperator2D(shape=(128, 128), window_sizes=[4,8,16,32])
+    >>> out = lac_op.lacunarity(data)
+    >>> # out['lac'].shape == [Nb, Nc, 4]
+    """
+
+    def __init__(
+        self,
+        shape,
+        window_sizes=(4, 8, 16, 32),
+        rotation_invariant: bool = False,
+        J: int = 0,
+        wavelet_op=None,
+        device=_DEFAULT_DEVICE,
+        dtype=_DEFAULT_DTYPE,
+    ):
+        self.shape              = tuple(shape)
+        self.window_sizes       = list(window_sizes)
+        self.rotation_invariant = rotation_invariant
+        self.J                  = J
+        self.device             = _get_device(torch.device(device))
+        self.dtype              = _get_dtype(dtype=dtype, device=self.device)
+
+        # Pre-build one sum kernel per window size
+        self._kernels = []
+        for eps in self.window_sizes:
+            if self.rotation_invariant:
+                k = _circular_disk_kernel(eps, self.dtype, self.device)
+            else:
+                k = torch.ones(1, 1, eps, eps, dtype=self.dtype, device=self.device)
+            self._kernels.append(k)
+
+        # ── Wavelet infrastructure (identical to MinkowskiOperator2D) ─────────
+        self.wavelet_op        = wavelet_op
+        self._wav_kernels      = None
+        self._wav_j_to_dg      = None
+        self._wav_smooth_pbc   = None
+        self._wav_smooth_nopbc = None
+        self._wav_L: int       = 0
+
+        if wavelet_op is not None:
+            if hasattr(wavelet_op, "_decimated_kernels"):
+                self._wav_kernels = list(wavelet_op._decimated_kernels)
+            elif hasattr(wavelet_op, "_wav_kernel"):
+                _J = getattr(wavelet_op, "J", 1)
+                self._wav_kernels = [
+                    (wavelet_op._wav_kernel_0
+                     if j == 0 and hasattr(wavelet_op, "_wav_kernel_0")
+                     else wavelet_op._wav_kernel)
+                    for j in range(_J)
+                ]
+            elif hasattr(wavelet_op, "kernels") and wavelet_op.kernels is not None:
+                self._wav_kernels = list(wavelet_op.kernels)
+
+            if hasattr(wavelet_op, "j_to_dg"):
+                self._wav_j_to_dg = list(wavelet_op.j_to_dg)
+
+            if hasattr(wavelet_op, "smooth_kernel_pbc"):
+                self._wav_smooth_pbc   = wavelet_op.smooth_kernel_pbc
+                self._wav_smooth_nopbc = wavelet_op.smooth_kernel_nopbc
+            elif hasattr(wavelet_op, "_gaussian_kernel_5x5"):
+                _dev  = getattr(wavelet_op, "device", torch.device("cpu"))
+                _dtyp = getattr(wavelet_op, "dtype", torch.float32)
+                _sk4  = wavelet_op._gaussian_kernel_5x5(device=_dev, dtype=_dtyp)[None, None]
+                self._wav_smooth_pbc   = _sk4
+                self._wav_smooth_nopbc = _sk4
+
+            if self._wav_kernels is not None:
+                self._wav_L = self._wav_kernels[0].shape[1]
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _lac_band(self, flat: torch.Tensor, pad_mode: str) -> torch.Tensor:
+        """Returns [B, E] lacunarity at each window size."""
+        return torch.stack(
+            [_lac_one_scale(flat, k, pad_mode) for k in self._kernels],
+            dim=-1,
+        )
+
+    # ── Public method ─────────────────────────────────────────────────────────
+
+    def lacunarity(self, data):
+        """
+        Compute differentiable lacunarity at all window sizes.
+
+        Parameters
+        ----------
+        data : object with .array, .N0, .pbc
+
+        Returns
+        -------
+        dict
+            ``'lac'``     — ``[Nb, Nc, E]``
+            ``'lac_wav'`` — ``[Nb, Nc, E, J, L]``  (only when J>0 + wavelet_op)
+        """
+        _check_data(data, self.shape)
+
+        arr = data.array
+        if torch.is_complex(arr):
+            arr = arr.abs()
+        if arr.ndim == 2:
+            arr = arr[None, None]
+        elif arr.ndim == 3:
+            arr = arr[None]
+        Nb, Nc, Nx, Ny = arr.shape
+        flat     = arr.reshape(Nb * Nc, Nx, Ny).to(self.device, self.dtype)
+        pbc      = getattr(data, "pbc", True)
+        pad_mode = "circular" if pbc else "replicate"
+        E        = len(self.window_sizes)
+
+        # ── J = 0 or no wavelet kernels ───────────────────────────────────────
+        if self.J == 0 or self._wav_kernels is None:
+            return {"lac": self._lac_band(flat, pad_mode).view(Nb, Nc, E)}
+
+        # ── J > 0 : raw + wavelet lacunarity ──────────────────────────────────
+        lac_raw  = self._lac_band(flat, pad_mode)              # [Nb*Nc, E]
+        J_eff    = min(self.J, len(self._wav_kernels))
+        smooth_k = self._wav_smooth_pbc if pbc else self._wav_smooth_nopbc
+
+        wav_per_j = []
+        for j in range(J_eff):
+            dg_j = self._wav_j_to_dg[j] if self._wav_j_to_dg is not None else j
+            ds   = (
+                _downsample_to_scale(flat, dg_j, smooth_k, pad_mode)
+                if smooth_k is not None else flat
+            )
+            moduli = _apply_wavelet_modulus(ds, self._wav_kernels[j], pbc)
+            L_j    = moduli.shape[1]
+            # [Nb*Nc, E, L_j]
+            wav_per_j.append(
+                torch.stack(
+                    [self._lac_band(moduli[:, l, :, :], pad_mode) for l in range(L_j)],
+                    dim=-1,
+                )
+            )
+
+        # [Nb*Nc, E, J, L] → [Nb, Nc, E, J, L]
+        lac_wav = torch.stack(wav_per_j, dim=2).view(Nb, Nc, E, J_eff, self._wav_L)
+
+        return {
+            "lac":     lac_raw.view(Nb, Nc, E),
+            "lac_wav": lac_wav,
+        }
+
+
+###############################################################################
+
+
+class GLCMOperator2D:
+    """
+    Differentiable Gray-Level Co-occurrence Matrix (GLCM) descriptor.
+
+    Replaces hard histogram binning with a soft sigmoid approximation so that
+    all five GLCM statistics are fully differentiable w.r.t. the input image.
+
+    Five statistics per (distance, direction) configuration:
+    **contrast**, **correlation**, **energy**, **homogeneity**, **entropy**.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Spatial shape ``(Nx, Ny)`` matching ``data.N0``.
+    n_bins : int
+        Number of gray-level bins N.  Bin edges are uniformly spaced in
+        ``val_range``.
+    distances : sequence of int
+        Co-occurrence pixel distances d.  One set of statistics is returned
+        per distance.
+    val_range : (float, float)
+        Intensity range ``(lo, hi)`` used to build the bin edges.
+        Defaults to ``(0.0, 1.0)``.
+    temperature : float
+        Sigmoid sharpness for soft histogram binning.  Higher → harder bins.
+    rotation_invariant : bool
+        If True, averages the GLCM over the four canonical directions
+        (0°, 45°, 90°, 135°), making the statistics invariant to in-plane
+        rotation.  If False, uses only 0° (dx=d) and 90° (dy=d).
+    J : int
+        Wavelet scales.  ``J = 0`` — raw image only.
+        ``J > 0`` + ``wavelet_op`` — also return ``'*_wav'`` keys of
+        shape ``[Nb, Nc, D, J, L]``.
+    wavelet_op : WaveletOperator2Dkernel_torch / ST_Operator / None
+    device, dtype
+
+    Examples
+    --------
+    >>> glcm_op = GLCMOperator2D(shape=(128, 128), n_bins=8, distances=[1, 2],
+    ...                          rotation_invariant=True)
+    >>> out = glcm_op.glcm(data)
+    >>> # out['contrast'].shape == [Nb, Nc, 2]   (2 distances)
+    """
+
+    # Canonical co-occurrence directions: (dy, dx) at distance 1
+    _DIRECTIONS_4 = [(0, 1), (-1, 1), (-1, 0), (-1, -1)]   # 0°,45°,90°,135°
+    _DIRECTIONS_2 = [(0, 1), (-1, 0)]                        # 0°,90° only
+
+    _STAT_KEYS = ("contrast", "correlation", "energy", "homogeneity", "entropy")
+
+    def __init__(
+        self,
+        shape,
+        n_bins: int = 8,
+        distances=(1,),
+        val_range=(0.0, 1.0),
+        temperature: float = 10.0,
+        rotation_invariant: bool = True,
+        J: int = 0,
+        wavelet_op=None,
+        device=_DEFAULT_DEVICE,
+        dtype=_DEFAULT_DTYPE,
+    ):
+        self.shape              = tuple(shape)
+        self.n_bins             = n_bins
+        self.distances          = list(distances)
+        self.val_range          = val_range
+        self.temperature        = temperature
+        self.rotation_invariant = rotation_invariant
+        self.J                  = J
+        self.device             = _get_device(torch.device(device))
+        self.dtype              = _get_dtype(dtype=dtype, device=self.device)
+
+        # Bin edges [N+1]
+        self.thresholds = torch.linspace(
+            val_range[0], val_range[1], n_bins + 1,
+            dtype=self.dtype, device=self.device,
+        )
+
+        # Scaled offsets per distance
+        dirs = self._DIRECTIONS_4 if rotation_invariant else self._DIRECTIONS_2
+        self._offsets_per_dist = [
+            [(d * dy, d * dx) for (dy, dx) in dirs]
+            for d in self.distances
+        ]
+
+        # ── Wavelet infrastructure (identical to MinkowskiOperator2D) ─────────
+        self.wavelet_op        = wavelet_op
+        self._wav_kernels      = None
+        self._wav_j_to_dg      = None
+        self._wav_smooth_pbc   = None
+        self._wav_smooth_nopbc = None
+        self._wav_L: int       = 0
+
+        if wavelet_op is not None:
+            if hasattr(wavelet_op, "_decimated_kernels"):
+                self._wav_kernels = list(wavelet_op._decimated_kernels)
+            elif hasattr(wavelet_op, "_wav_kernel"):
+                _J = getattr(wavelet_op, "J", 1)
+                self._wav_kernels = [
+                    (wavelet_op._wav_kernel_0
+                     if j == 0 and hasattr(wavelet_op, "_wav_kernel_0")
+                     else wavelet_op._wav_kernel)
+                    for j in range(_J)
+                ]
+            elif hasattr(wavelet_op, "kernels") and wavelet_op.kernels is not None:
+                self._wav_kernels = list(wavelet_op.kernels)
+
+            if hasattr(wavelet_op, "j_to_dg"):
+                self._wav_j_to_dg = list(wavelet_op.j_to_dg)
+
+            if hasattr(wavelet_op, "smooth_kernel_pbc"):
+                self._wav_smooth_pbc   = wavelet_op.smooth_kernel_pbc
+                self._wav_smooth_nopbc = wavelet_op.smooth_kernel_nopbc
+            elif hasattr(wavelet_op, "_gaussian_kernel_5x5"):
+                _dev  = getattr(wavelet_op, "device", torch.device("cpu"))
+                _dtyp = getattr(wavelet_op, "dtype", torch.float32)
+                _sk4  = wavelet_op._gaussian_kernel_5x5(device=_dev, dtype=_dtyp)[None, None]
+                self._wav_smooth_pbc   = _sk4
+                self._wav_smooth_nopbc = _sk4
+
+            if self._wav_kernels is not None:
+                self._wav_L = self._wav_kernels[0].shape[1]
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _glcm_band(self, flat: torch.Tensor, pad_mode: str) -> dict:
+        """
+        Returns dict of 5 statistics, each [B, D] where D = len(distances).
+        """
+        per_dist = []
+        for offsets in self._offsets_per_dist:
+            # Average soft GLCM over all directions for this distance
+            glcms   = [_soft_glcm(flat, off, self.thresholds,
+                                  self.temperature, pad_mode) for off in offsets]
+            glcm_avg = torch.stack(glcms, dim=0).mean(dim=0)   # [B, N, N]
+            per_dist.append(_glcm_statistics(glcm_avg))
+
+        # Stack over distances: each stat [B, D]
+        return {
+            k: torch.stack([pd[k] for pd in per_dist], dim=-1)
+            for k in self._STAT_KEYS
+        }
+
+    # ── Public method ─────────────────────────────────────────────────────────
+
+    def glcm(self, data):
+        """
+        Compute differentiable GLCM statistics.
+
+        Parameters
+        ----------
+        data : object with .array, .N0, .pbc
+
+        Returns
+        -------
+        dict
+            ``'contrast'``, ``'correlation'``, ``'energy'``,
+            ``'homogeneity'``, ``'entropy'`` — each ``[Nb, Nc, D]``.
+
+            When J>0 + wavelet_op: ``'contrast_wav'``, … each
+            ``[Nb, Nc, D, J, L]``.
+        """
+        _check_data(data, self.shape)
+
+        arr = data.array
+        if torch.is_complex(arr):
+            arr = arr.abs()
+        if arr.ndim == 2:
+            arr = arr[None, None]
+        elif arr.ndim == 3:
+            arr = arr[None]
+        Nb, Nc, Nx, Ny = arr.shape
+        flat     = arr.reshape(Nb * Nc, Nx, Ny).to(self.device, self.dtype)
+        pbc      = getattr(data, "pbc", True)
+        pad_mode = "circular" if pbc else "replicate"
+        D        = len(self.distances)
+
+        def _reshape(stats):
+            return {k: stats[k].view(Nb, Nc, D) for k in self._STAT_KEYS}
+
+        # ── J = 0 or no wavelet kernels ───────────────────────────────────────
+        if self.J == 0 or self._wav_kernels is None:
+            return _reshape(self._glcm_band(flat, pad_mode))
+
+        # ── J > 0 : raw + wavelet GLCM ───────────────────────────────────────
+        raw      = _reshape(self._glcm_band(flat, pad_mode))
+        J_eff    = min(self.J, len(self._wav_kernels))
+        smooth_k = self._wav_smooth_pbc if pbc else self._wav_smooth_nopbc
+
+        wav_per_j = []
+        for j in range(J_eff):
+            dg_j = self._wav_j_to_dg[j] if self._wav_j_to_dg is not None else j
+            ds   = (
+                _downsample_to_scale(flat, dg_j, smooth_k, pad_mode)
+                if smooth_k is not None else flat
+            )
+            moduli = _apply_wavelet_modulus(ds, self._wav_kernels[j], pbc)
+            L_j    = moduli.shape[1]
+            per_l  = [
+                self._glcm_band(moduli[:, l, :, :], pad_mode)
+                for l in range(L_j)
+            ]
+            # each stat: [Nb*Nc, D, L_j]
+            wav_per_j.append(
+                {k: torch.stack([pl[k] for pl in per_l], dim=-1)
+                 for k in self._STAT_KEYS}
+            )
+
+        # Stack over J → [Nb*Nc, D, J, L] → [Nb, Nc, D, J, L]
+        wav = {
+            k: torch.stack([wj[k] for wj in wav_per_j], dim=2).view(
+                Nb, Nc, D, J_eff, self._wav_L
+            )
+            for k in self._STAT_KEYS
+        }
+
+        result = {k: raw[k] for k in self._STAT_KEYS}
+        result.update({f"{k}_wav": wav[k] for k in self._STAT_KEYS})
+        return result
