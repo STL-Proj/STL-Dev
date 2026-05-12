@@ -220,6 +220,7 @@ class ST_Operator:
     def apply(
         self,
         data,
+        standardize=False,
         SC=None,
         has_fewer_convolutions=None,
         norm=None,
@@ -385,23 +386,34 @@ class ST_Operator:
             else compute_cross_matrix.to(device=data.device)
         )
 
+        # Initialize ST statistics values
+        # Add readability w.r.t. having it in the ST statistics initilization
+        if standardize:
+            standardized = True
+            l_data, mean_pre_std, std_pre_std = self.wavelet_op.standardize(
+                data, mean_field=False, inplace=False
+            )
+        else:
+            l_data = data.copy()
+            standardized = False
+            mean_pre_std, std_pre_std = None, None
+
         # Create a ST_statistics instance
         data_st = ST_Statistics(
-            self.DT,
+            data.__class__,
             N0,
-            J,
-            L,
-            WType,
-            SC,
             Nb,
             Nc,
             self.wavelet_op,
+            SC,
+            has_fewer_convolutions,
+            compute_cross_matrix,
             compute_PS,
+            self.n_bins,
+            standardized,
+            mean_pre_std,
+            std_pre_std,
         )
-
-        # Initialize ST statistics values
-        # Add readability w.r.t. having it in the ST statistics initilization
-        l_data = data.copy()
 
         # Systematic statistics (data supposed to be real)
         assert (
@@ -417,7 +429,7 @@ class ST_Operator:
             )
 
         if SC == "ScatCov":
-            #            data_st.S1 = bk.zeros((Nb, Nc, J, L)) + bk.nan
+            # data_st.S1 = bk.zeros((Nb, Nc, J, L)) + bk.nan
             data_st.S1 = (
                 bk.zeros((Nb, Nc, Nc, J, L), dtype=bk._DEFAULT_COMPLEX_DTYPE) + bk.nan
             )
@@ -496,12 +508,9 @@ class ST_Operator:
             if (
                 compute_cross_matrix * (~bk.eye(Nc, dtype=bool, device=data.device))
             ).any():
-                data_l1_modulus_square_rooted = data_l1.copy(empty=True)
-                data_l1_modulus_square_rooted.array = data_l1.array * (
-                    data_l1m[j3].array + 1e-8
-                ) ** (
-                    -0.5
-                )  # (Nb,Nc,L,N3)
+                data_l1_modulus_square_rooted = data_l1.divide(
+                    data_l1m[j3], epsilon=1e-8, pow=0.5, inplace=False
+                )  # [Nb,Nc,L,N3]
 
                 self.wavelet_op._compute_and_store_cross_cov(
                     data_l1_modulus_square_rooted,
