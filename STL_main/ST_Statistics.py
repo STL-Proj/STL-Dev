@@ -596,10 +596,25 @@ class ST_Statistics:
         if self.S1 is None:
             raise ValueError("S1 is None; nothing to plot.")
 
-        S1_bc = to_np(self.S1[b, c])  # (J, L)
-        S2_bc = to_np(self.S2[b, c])  # (J, L)
-        S3_bc = to_np(self.S3[b, c])  # (J, J, L, L)
-        S4_bc = to_np(self.S4[b, c])  # (J, J, J, L, L, L)
+        # S1/S2/S3/S4 can be cross-channel: [Nb, Nc, Nc, J, L] / [Nb, Nc, Nc, J, J, L, L]
+        # Index with (b, c, c) to extract the auto-correlation for channel c.
+        # If the tensor is only 4-D (no cross-channel dim), fall back to (b, c).
+        def _extract_bc(tensor, b, c):
+            """Return the (b, c) auto-correlation slice, handling cross-channel layout."""
+            arr = to_np(tensor)
+            # arr shape: [Nb, Nc, Nc, ...] or [Nb, Nc, ...]
+            # After indexing b: [Nc, Nc, ...] or [Nc, ...]
+            # Count leading Nc dims by comparing shape[1] == shape[2]
+            a = arr[b]
+            if a.ndim >= 2 and a.shape[0] == a.shape[1]:
+                # Likely cross-channel: first two dims are (Nc, Nc)
+                return a[c, c]
+            return a[c]
+
+        S1_bc = _extract_bc(self.S1, b, c)  # (J, L)
+        S2_bc = _extract_bc(self.S2, b, c)  # (J, L)
+        S3_bc = _extract_bc(self.S3, b, c)  # (J, J, L_or_K, L_or_K)
+        S4_bc = _extract_bc(self.S4, b, c)  # (J, J, J, L_or_K, L_or_K, L_or_K)
 
         # Put a fake 'image' dimension of size 1 to match the old plotting code
         S1 = S1_bc[None, ...]  # (1, J, L)
@@ -608,6 +623,11 @@ class ST_Statistics:
         # ---- build the compact index arrays for S3 and S4 as in your old code ----
         J = S1.shape[1]
         N_orient = S1.shape[2]
+
+        # S3 may have gone through to_angular_ft and now has K angular modes
+        # instead of L. Read N_orient_s3 from S3 directly so allocation is correct.
+        N_orient_s3 = S3_bc.shape[-1]
+        N_orient_s4 = S4_bc.shape[-1]
 
         # count combinations for S3 and S4
         n_s3 = 0
@@ -639,10 +659,10 @@ class ST_Statistics:
                     n_s4 += 1
 
         # Now we build compact S3 and S4 arrays with shape
-        #   S3: (1, n_s3, L, L)
-        #   S4: (1, n_s4, L, L, L)
-        S3 = np.zeros((1, len(j1_s3), N_orient, N_orient), dtype=S3_bc.dtype)
-        S4 = np.zeros((1, len(j1_s4), N_orient, N_orient, N_orient), dtype=S4_bc.dtype)
+        #   S3: (1, n_s3, N_orient_s3, N_orient_s3)
+        #   S4: (1, n_s4, N_orient_s4, N_orient_s4, N_orient_s4)
+        S3 = np.zeros((1, len(j1_s3), N_orient_s3, N_orient_s3), dtype=S3_bc.dtype)
+        S4 = np.zeros((1, len(j1_s4), N_orient_s4, N_orient_s4, N_orient_s4), dtype=S4_bc.dtype)
 
         for idx in range(len(j1_s3)):
             j1 = j1_s3[idx]
@@ -690,8 +710,8 @@ class ST_Statistics:
         l_name = []
         for i in np.unique(j1_s3):
             idx = np.where(j1_s3 == i)[0]
-            for k in range(min(4, N_orient)):
-                for l in range(min(4, N_orient)):
+            for k in range(min(4, N_orient_s3)):
+                for l in range(min(4, N_orient_s3)):
                     if i == 0:
                         plt.plot(
                             j2_s3[idx] + nidx[i],
@@ -723,9 +743,9 @@ class ST_Statistics:
         for i in np.unique(j1_s4):
             for j in np.unique(j2_s4):
                 idx = np.where((j1_s4 == i) & (j2_s4 == j))[0]
-                for k in range(min(4, N_orient)):
-                    for l in range(min(4, N_orient)):
-                        for m in range(min(4, N_orient)):
+                for k in range(min(4, N_orient_s4)):
+                    for l in range(min(4, N_orient_s4)):
+                        for m in range(min(4, N_orient_s4)):
                             if i == 0 and j == 0 and m == 0:
                                 plt.plot(
                                     j2_s4[idx] + j3_s4[idx] + nidx,
