@@ -495,23 +495,28 @@ class ST_Statistics:
     ########################################
     def to_flatten(self, mask_st=None, mean_along_batch=False, keepnans=False):
         """
-        Produce a 1d array that can be used for loss constructions.
+        Produce a 2-D array of shape [Nb, N] where each row is the descriptor
+        of one batch item and N is the number of (non-NaN) coefficients.
 
-        A mask can be used to select the coefficients from the initial 1d array.
+        For backward compatibility, if Nb == 1 the result is squeezed to 1-D.
 
         Parameters
         ----------
-        - mask_st : binary 1d array
-            mask for st coefficients after initial flattening
+        mask_st : binary 1-D array or None
+            Optional boolean mask applied after NaN removal.
+        mean_along_batch : bool
+            If True, average over the batch dimension before flattening
+            (returns shape [N]).
+        keepnans : bool
+            If True, keep NaN values in the output (no column removal).
 
-        Output
-        ----------
-        - st_flatten : 1d array
-
+        Returns
+        -------
+        st_flatten : Tensor [Nb, N] or [N] (if Nb==1 or mean_along_batch)
         """
 
         # Collect all statistics into a list
-        stats = [self.mean, self.var]  # Always include mean and variance
+        stats = [self.mean, self.var]
 
         if self.SC == "ScatCov":
             stats += [self.S1, self.S2, self.S3, self.S4]
@@ -521,29 +526,55 @@ class ST_Statistics:
 
         if mean_along_batch:
             stats = [bk.mean(s, 0) for s in stats]
+            # After averaging: tensors have no batch dim → flatten to 1-D
+            flattened_list = []
+            for S in stats:
+                S_flat = S.reshape(-1)
+                flattened_list.append(
+                    S_flat if keepnans else S_flat[~bk.isnan(S_flat)]
+                )
+            st_flatten = bk.cat(flattened_list, dim=0)
+            if mask_st is not None:
+                mask_st = bk.as_tensor(mask_st, dtype=bk.bool,
+                                       device=st_flatten.device)
+                st_flatten = st_flatten[mask_st]
+            self.st_flatten = st_flatten
+            return st_flatten
 
-        # Flatten each, remove NaNs, concat
-        flattened_list = []
+        # ── Batch-aware flattening → [Nb, N] ─────────────────────────────────
+        Nb = stats[0].shape[0]
+
+        # Reshape each stat to [Nb, D_i], collect column-wise NaN masks
+        flat2d_list  = []
+        col_nan_list = []
         for S in stats:
-            # S may contain NaNs → keep only non-NaNs
-            S_flat = S.reshape(-1)
-            flattened_list.append(S_flat if keepnans else S_flat[~bk.isnan(S_flat)])
+            S2 = S.reshape(Nb, -1)           # [Nb, D_i]
+            flat2d_list.append(S2)
+            col_nan_list.append(bk.isnan(S2).any(dim=0))   # [D_i]
 
-        # Concatenate all statistics into a single 1D vector
-        st_flatten = bk.cat(flattened_list, dim=0)
+        # Concatenate → [Nb, D_total]
+        st_2d    = bk.cat(flat2d_list,  dim=1)   # [Nb, D_total]
+        col_nans = bk.cat(col_nan_list, dim=0)   # [D_total]
 
-        # Optional mask after nan-removal
+        if not keepnans:
+            # Remove columns that are NaN for ANY batch item
+            st_2d = st_2d[:, ~col_nans]
+
+        # Optional mask (applied on columns)
         if mask_st is not None:
-            mask_st = bk.as_tensor(mask_st, dtype=bk.bool, device=st_flatten.device)
-            if mask_st.numel() != st_flatten.numel():
+            mask_st = bk.as_tensor(mask_st, dtype=bk.bool,
+                                   device=st_2d.device)
+            if mask_st.numel() != st_2d.shape[1]:
                 raise ValueError(
                     f"mask_st length {mask_st.numel()} does not match "
-                    f"flattened statistic length {st_flatten.numel()}."
+                    f"flattened statistic width {st_2d.shape[1]}."
                 )
-            st_flatten = st_flatten[mask_st]
+            st_2d = st_2d[:, mask_st]
+
+        # Squeeze batch dim for single-image compatibility
+        st_flatten = st_2d.squeeze(0) if Nb == 1 else st_2d
 
         self.st_flatten = st_flatten
-
         return st_flatten
 
     ########################################
@@ -761,18 +792,12 @@ class ST_Statistics:
                                     symbol[l % len(symbol)],
                                     color=color[k % len(color)],
                                 )
-                l_pos += list(j2_s4[idx] + j3_s4[idx] + nidx)
+                nidx += len(idx)
+                l_pos  += list(j2_s4[idx] + j3_s4[idx] + nidx)
                 l_name += [f"{j1_s4[m]},{j2_s4[m]},{j3_s4[m]}" for m in idx]
-            # increment nidx to separate groups of constant j1
-            sel = j1_s4 == i
-            if np.any(sel):
-                span = j2_s4[sel] + j3_s4[sel]
-                nidx += int(np.max(span) - np.min(span) + 1)
 
         plt.legend(frameon=False, ncol=2)
-        plt.xticks(l_pos, l_name, fontsize=6, rotation=90)
+        plt.xticks(l_pos, l_name, fontsize=6)
         plt.xlabel(r"$j_{1},j_{2},j_{3}$", fontsize=9)
         plt.ylabel(r"$S_{4}$", fontsize=9)
-
         plt.tight_layout()
-        plt.show()
