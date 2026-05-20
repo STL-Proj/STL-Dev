@@ -129,6 +129,9 @@ class ST_Statistics:
         self.flatten = False
         self.mask_st = None  # Not used in flatten method for now
 
+        # S0: zeroth-order statistics (mean and variance), shape [Nb, Nc, 2]
+        self.S0 = None
+
         # Power spectrum computation
         self.compute_PS = compute_PS
         self.PS_ref_sqrt_chan_diag = None
@@ -516,7 +519,12 @@ class ST_Statistics:
         """
 
         # Collect all statistics into a list
-        stats = [self.mean, self.var]
+        # S0 = stack([mean, var], dim=-1) → [Nb, Nc, 2]; fall back to
+        # separate mean/var tensors if S0 has not been set yet (backward compat).
+        if self.S0 is not None:
+            stats = [self.S0]
+        else:
+            stats = [self.mean, self.var]
 
         if self.SC == "ScatCov":
             stats += [self.S1, self.S2, self.S3, self.S4]

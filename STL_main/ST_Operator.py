@@ -409,6 +409,8 @@ class ST_Operator:
         ), "Data should be real for now, otherwise mean and var computation should be adapted"
         data_st.mean = self.wavelet_op.mean(l_data).real  # [Nb,Nc]
         data_st.var = self.wavelet_op.cov(l_data, l_data).real  # [Nb,Nc]
+        # S0: zeroth-order descriptor stacking mean and variance → [Nb, Nc, 2]
+        data_st.S0 = torch.stack([data_st.mean, data_st.var], dim=-1)
 
         if compute_PS:
             data_st.PS = self.CS_op.apply(
