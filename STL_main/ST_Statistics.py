@@ -519,12 +519,11 @@ class ST_Statistics:
         """
 
         # Collect all statistics into a list
-        # S0 = stack([mean, var], dim=-1) → [Nb, Nc, 2]; fall back to
-        # separate mean/var tensors if S0 has not been set yet (backward compat).
-        if self.S0 is not None:
-            stats = [self.S0]
-        else:
-            stats = [self.mean, self.var]
+        # S0 is always rebuilt here from the *current* self.mean / self.var
+        # (which may have been updated by to_norm()), so it always stays fresh.
+        S0 = bk.stack([self.mean, self.var], dim=-1)   # [Nb, Nc, 2]
+        self.S0 = S0
+        stats = [S0]
 
         if self.SC == "ScatCov":
             stats += [self.S1, self.S2, self.S3, self.S4]
