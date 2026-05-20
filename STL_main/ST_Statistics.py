@@ -502,7 +502,6 @@ class ST_Statistics:
     def to_flatten(
         self,
         keep_batch_dim=False,
-        keep_channel_dim=False,
         mask_st=None,
         mean_along_batch=False,
         keepnans=False,
@@ -557,17 +556,10 @@ class ST_Statistics:
                 if S_name in ["S1", "S2", "PS"]:
                     S = S[..., 0]  # Keep only real part
 
-            if keep_channel_dim:
-                if S_name in ["mean", "var"]:
-                    S_flat = S.unsqueeze(2) * bk.eye(
-                        S.shape[1], device=S.device
-                    )  # [Nb, Nc] -> [Nb, Nc, Nc] with mean/var on the diagonal
-                else:
-                    S_flat = S.flatten(
-                        start_dim=3
-                    )  # Keep batch and channel dimensions separate
-            elif keep_batch_dim:
-                S_flat = S.reshape(S.shape[0], -1)  # Keep batch dimension separate
+            if keep_batch_dim:
+                S_flat = S.reshape(
+                    S.shape[0], -1
+                )  # Keep batch dimension, flatten the rest
             else:
                 S_flat = S.flatten()  # Flatten everything into 1D
 
@@ -587,10 +579,8 @@ class ST_Statistics:
             else:
                 flattened_list.append(S_flat)
 
-        # Concatenate all statistics into a single 1D/2D or 4D tensor
-        if keep_channel_dim:
-            st_flatten = bk.cat(flattened_list, dim=3)  # [Nb, Nc, Nc, n_stats]
-        elif keep_batch_dim:
+        # Concatenate all statistics into a 1D array (or 2D if keep_batch_dim is True)
+        if keep_batch_dim:
             st_flatten = bk.cat(flattened_list, dim=1)  # [Nb, n_stats]
         else:
             st_flatten = bk.cat(flattened_list, dim=0)  # [n_stats]
