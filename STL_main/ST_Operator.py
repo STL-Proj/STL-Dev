@@ -157,6 +157,12 @@ class ST_Operator:
         self.replace_nan_value = replace_nan_value
 
         # Additional transform/compression related parameters
+        assert norm in [
+            None,
+            "vanilla",
+            "store_ref",
+            "load_ref",
+        ], "Invalid norm type. Should be one of [None, 'vanilla', 'store_ref', 'load_ref']"
         self.norm = norm
         self.S2_ref_sqrt_chan_diag = S2_ref_sqrt_chan_diag
         self.var_ref = var_ref
@@ -588,11 +594,13 @@ class ST_Operator:
                     ##############################################################################
                     if not has_fewer_convolutions:
                         self.wavelet_op._compute_and_store_cross_cov(
-                            data_l1m_l2[j1][:, :, :, None],
-                            data_l1m_l2[j2][:, :, None, :],
-                            output=data_st.S4[:, :, :, j1, j2, j3, :, :, :],
+                            data_l1m_l2[j1][:, :, :, None, :, :],  # (Nb,Nc,L1,1,L3,N3)
+                            data_l1m_l2[j2][:, :, None, :, :, :],  # (Nb,Nc,1,L2,L3,N3)
+                            output=data_st.S4[
+                                :, :, :, j1, j2, j3, :, :, :
+                            ],  # (Nb,Nc,Nc,L1,L2,L3)
                             compute_cross_matrix=compute_cross_matrix,
-                            redundant_channels=False,
+                            redundant_channels=False,  # TODO: S4(c1,c2) and S4(c2,c1) are conjugates if j1==j2 and thetha1=theta2
                         )  # (Nb,Nc,Nc,L1,L2,L3)
 
                     else:
@@ -633,6 +641,7 @@ class ST_Operator:
         # Normalisation
         if norm == "vanilla":
             pass
+
         elif norm == "store_ref":
             if self.var_ref is not None:
                 print("Replacing existing var_ref in ST_Op")
@@ -685,6 +694,11 @@ class ST_Operator:
             # Appel avec seulement les bons arguments
             data_st.to_norm(
                 norm_type="from_ref", norm_batch_mean=norm_batch_mean, **kwargs
+            )
+
+        else:
+            raise Exception(
+                f"Unknown norm type: {norm}. Should be one of ['vanilla', 'store_ref', 'load_ref']."
             )
 
         if iso:
