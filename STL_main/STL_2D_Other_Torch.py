@@ -513,6 +513,7 @@ class MinkowskiOperator2D:
         arr = data.array
         if torch.is_complex(arr):
             arr = arr.abs()
+        arr = torch.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         if arr.ndim == 2:
             arr = arr[None, None, :, :]
         elif arr.ndim == 3:
@@ -720,6 +721,7 @@ class PeakCountOperator2D:
     def _prepare(self, data):
         _check_data(data, self.shape)
         arr = data.array.abs() if torch.is_complex(data.array) else data.array
+        arr = torch.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         if arr.ndim == 2:
             arr = arr[None, None]
         elif arr.ndim == 3:
@@ -1022,6 +1024,7 @@ class BettiCurveOperator2D:
         _check_data(data, self.shape)
 
         arr = data.array.abs() if torch.is_complex(data.array) else data.array
+        arr = torch.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         if arr.ndim == 2:
             arr = arr[None, None]
         elif arr.ndim == 3:
