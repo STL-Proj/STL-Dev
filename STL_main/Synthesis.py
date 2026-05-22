@@ -25,6 +25,8 @@ class ScatteringMatchModel(nn.Module):
         mean_field,
         device,
         dtype,
+        prefilter_Nyquist,
+        adhoc_weights,
     ):
         super().__init__()
         self.st_op = st_op
@@ -35,11 +37,16 @@ class ScatteringMatchModel(nn.Module):
         self.compute_cross_matrix = compute_cross_matrix
         self.compute_PS = compute_PS
         self.mean_field = mean_field
+        self.adhoc_weights = adhoc_weights
 
         # Learnable field u
         self.u = torch.randn(
             init_shape, device=device, dtype=dtype
         )  # WARNING: if filtered to match PS constraints in the future, think about sampling non PBC fields when asked!!!
+
+        if prefilter_Nyquist:
+            print("Prefiltering initial noise to remove frequencies above Nyquist")
+            self.u = apply_prefilter_Nyquist(self.u)
 
         # for security put large values which should raise abberant values if actually used
         if self.mask_full_res is not None:
@@ -68,8 +75,52 @@ class ScatteringMatchModel(nn.Module):
             norm="load_ref",
             norm_batch_mean=self.mean_field,
         )
+        if self.adhoc_weights is not None:
+            reweight(st_u, self.adhoc_weights)
         s_flat_u = st_u.to_flatten(mean_along_batch=self.mean_field, keepnans=True)
         return s_flat_u
+
+
+def reweight(stats, weights):
+    for coeff_label, weight in weights.items():
+        if hasattr(stats, coeff_label):
+            coeff = getattr(stats, coeff_label)
+            coeff *= weight
+        else:
+            print(coeff_label)
+            raise
+
+
+def apply_prefilter_Nyquist(array, plot=False):
+    dim = (-2, -1)
+    target_fft = torch.fft.fftshift(torch.fft.fft2(array, dim=dim), dim=dim)
+
+    # filter out high frequencies to see better the low frequency content
+    X, Y = torch.meshgrid(
+        torch.arange(target_fft.shape[-2]), torch.arange(target_fft.shape[-1])
+    )
+    center_x, center_y = target_fft.shape[-2] // 2, target_fft.shape[-1] // 2
+    radius = min(target_fft.shape[-2:]) // 2
+    mask = (X - center_x) ** 2 + (Y - center_y) ** 2 <= radius**2
+    target_fft[:, :, ~mask] = 0.0
+    if not array.is_complex():
+        array = torch.fft.ifft2(torch.fft.ifftshift(target_fft, dim=dim), dim=dim).real
+    else:
+        array = torch.fft.ifft2(torch.fft.ifftshift(target_fft, dim=dim), dim=dim)
+
+    if plot:
+        import matplotlib.pyplot as plt
+
+        plt.imshow(
+            np.abs(torch.fft.fftshift(torch.fft.fft2(array[0, 0])).cpu().numpy()),
+            cmap="plasma",
+            norm="log",
+        )
+        plt.colorbar()
+        plt.title("Nyquist filtered array (Fourier)")
+        plt.show()
+
+    return array
 
 
 def optimize_scattering_LBFGS(
@@ -88,6 +139,8 @@ def optimize_scattering_LBFGS(
     print_iter=10,
     verbose=True,
     seed=None,
+    prefilter_Nyquist=True,
+    adhoc_weights={"S3": 3.5, "S4": 3.5**2},
 ):
     device = st_op_running.wavelet_op.device
     dtype = st_op_running.wavelet_op.dtype
@@ -143,6 +196,11 @@ def optimize_scattering_LBFGS(
         l_target = target.copy(empty=False)
 
         l_target.array = l_target.array.reshape(target_shape)
+
+        if prefilter_Nyquist:
+            print("Prefiltering target to remove frequencies above Nyquist")
+            l_target.array = apply_prefilter_Nyquist(l_target.array)
+
         l_target, mean_target, std_target = st_op_target.wavelet_op.standardize(
             l_target, mean_field=mean_field, inplace=True
         )
@@ -153,7 +211,14 @@ def optimize_scattering_LBFGS(
             compute_PS=compute_PS,
             norm="store_ref",
             norm_batch_mean=mean_field,
-        ).to_flatten(mean_along_batch=mean_field, keepnans=True)
+        )
+
+        if adhoc_weights is not None:
+            reweight(target_stats, adhoc_weights)
+
+        target_stats = target_stats.to_flatten(
+            mean_along_batch=mean_field, keepnans=True
+        )
 
     target_stats = target_stats.detach()
     target_coeffs_mask = ~target_stats.isnan()
@@ -177,6 +242,8 @@ def optimize_scattering_LBFGS(
         mean_field=mean_field,
         device=device,
         dtype=dtype,
+        prefilter_Nyquist=prefilter_Nyquist,
+        adhoc_weights=adhoc_weights,
     )
 
     optimizer = LBFGS(

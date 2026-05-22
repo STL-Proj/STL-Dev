@@ -1004,7 +1004,7 @@ class WaveletOperator2Dkernel_torch:
                 raise ValueError(
                     "Downsampling requires even spatial dimensions at each step."
                 )
-            if torch.allclose(
+            if smooth_kernel.shape == (2, 2) and torch.allclose(
                 smooth_kernel,
                 0.25
                 * torch.ones(
@@ -1166,6 +1166,20 @@ class WaveletOperator2Dkernel_torch:
                     device=device,
                     dtype=dtype,
                 )
+            elif False:
+                # Precomputed 5x5 Gaussian
+                self._smooth_kernel = torch.tensor(
+                    [
+                        [0.0030, 0.0133, 0.0219, 0.0133, 0.0030],
+                        [0.0133, 0.0596, 0.0983, 0.0596, 0.0133],
+                        [0.0219, 0.0983, 0.1621, 0.0983, 0.0219],
+                        [0.0133, 0.0596, 0.0983, 0.0596, 0.0133],
+                        [0.0030, 0.0133, 0.0219, 0.0133, 0.0030],
+                    ],
+                    device=device,
+                    dtype=dtype,
+                )
+                self._smooth_kernel /= self._smooth_kernel.sum()
             elif False:
                 # Precomputed 3x3 square -> each pixel has the same weight with striding 2 downsampling
                 self._smooth_kernel = torch.tensor(
