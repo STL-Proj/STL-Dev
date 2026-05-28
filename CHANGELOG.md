@@ -52,3 +52,13 @@
 ### Fixed
 - Added the `WType` argument to the constructor of the Wavelet operator in the `STL_2D_Kernel_Torch` dataclass. Currently available: Morlet
 - Removed the `mean_ref` variable to avoid numerical instability
+
+
+## [v1.4.0] - 2026-04-29
+### Added
+- Added the ability to perform synthesis from the statistics of a target map.
+- Added and fully completed a user notebook demonstrating synthesis from statistics.
+- Extended the `flatten` method to optionally preserve the batch dimension and to handle flattening of complex coefficients.
+
+### Fixed
+- Fixed incorrect synthesis behavior in mono-channel FFT and cross-channel FFT.

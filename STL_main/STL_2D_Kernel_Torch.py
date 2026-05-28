@@ -120,6 +120,40 @@ class STL_2D_Kernel_Torch(Base_DataClass):
 
         return data
 
+    def divide(self, data2, epsilon=1e-8, pow=1.0, inplace=False):
+        """
+        Divide self.array by data2.array raised to a power, with a small epsilon added to the denominator for numerical stability.
+
+        Division is still performed in real space
+
+        Parameters
+        ----------
+        data2 : STL_2D_FFT_Torch
+            Another instance whose array is used as the denominator. Its Fourier
+            status determines the computation domain.
+        epsilon : float, optional
+            Small constant added to the denominator for numerical stability
+            (default is 1e-8).
+        power : float, optional
+            Exponent applied to the denominator (default is 1).
+        inplace : bool
+            If True, performs the operation in-place and returns self.
+            If False, returns a new instance.
+
+        Returns
+        -------
+        STL_2D_FFT_Torch
+            Result of the division in the appropriate domain.
+        """
+
+        data1 = self.copy(empty=False) if not inplace else self
+
+        # Apply the division in real space
+        data1.array = data1.array / (data2.array + epsilon) ** pow
+        data1.dtype = data1.array.dtype
+
+        return data1
+
     def get_wavelet_op(
         self,
         J=None,
@@ -829,7 +863,7 @@ class WaveletOperator2Dkernel_torch:
 
         mean = self.mean(l_data)  # [Nb,Nc]
         if mean_field:
-            mean = mean.mean(dim=0)  # [Nc]
+            mean = mean.mean(dim=0, keepdim=True)  # [1,Nc]
 
         l_data.array = (
             l_data.array - mean[..., None, None]
@@ -837,7 +871,7 @@ class WaveletOperator2Dkernel_torch:
 
         var = self.cov(l_data, l_data)
         if mean_field:
-            var = var.mean(dim=0)  # [Nc]
+            var = var.mean(dim=0, keepdim=True)  # [1,Nc]
 
         std = torch.sqrt(var)
 
