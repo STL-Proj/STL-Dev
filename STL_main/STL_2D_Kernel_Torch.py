@@ -1159,7 +1159,7 @@ class WaveletOperator2Dkernel_torch:
             or self._smooth_kernel.device != device
             or self._smooth_kernel.dtype != dtype
         ):
-            if True:
+            if False:
                 # Precomputed 2x2 square -> no padding needed for striding 2 downsampling, but more aliasing
                 self._smooth_kernel = torch.tensor(
                     [[0.25, 0.25], [0.25, 0.25]],

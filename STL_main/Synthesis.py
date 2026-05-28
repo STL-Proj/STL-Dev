@@ -198,8 +198,13 @@ def optimize_scattering_LBFGS(
         l_target.array = l_target.array.reshape(target_shape)
 
         if prefilter_Nyquist:
-            print("Prefiltering target to remove frequencies above Nyquist")
-            l_target.array = apply_prefilter_Nyquist(l_target.array)
+            if l_target.array.isnan().any():
+                print(
+                    "WARNING: prefiltering target above Nyquist is asked but target has NaNs. Only initial noise will be filtered."
+                )
+            else:
+                print("Prefiltering target to remove frequencies above Nyquist")
+                l_target.array = apply_prefilter_Nyquist(l_target.array)
 
         l_target, mean_target, std_target = st_op_target.wavelet_op.standardize(
             l_target, mean_field=mean_field, inplace=True
