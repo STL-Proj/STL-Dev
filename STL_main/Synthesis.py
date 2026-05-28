@@ -115,8 +115,7 @@ def reweight(stats, weights):
             coeff = getattr(stats, coeff_label)
             coeff *= weight
         else:
-            print(coeff_label)
-            raise
+            raise ValueError(f"Unsupported coefficient label: {coeff_label}")
 
 
 # === LBFGS optimization (low level)===
