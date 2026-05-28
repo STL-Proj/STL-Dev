@@ -61,7 +61,9 @@ class ScatteringMatchModel(nn.Module):
 
         if prefilter_Nyquist:
             print("Prefiltering initial map to remove frequencies above Nyquist")
-            assert not self.u.isnan().any(), "Cannot apply Nyquist filter on intial map with NaNs. Either remove NaNs from the initial map or specify prefilter_Nyquist=False."
+            assert (
+                not self.u.isnan().any()
+            ), "Cannot apply Nyquist filter on intial map with NaNs. Either remove NaNs from the initial map or specify prefilter_Nyquist=False."
             self.u = apply_nyquist_filter(self.u)
 
         # === Apply mask constraints ===
@@ -95,7 +97,7 @@ class ScatteringMatchModel(nn.Module):
             compute_PS=self.compute_PS,
             norm="load_ref",
         )
-        
+
         # === Re-weight statistics ===
         if self.adhoc_weights is not None:
             reweight(st_u, self.adhoc_weights)
@@ -108,6 +110,7 @@ class ScatteringMatchModel(nn.Module):
         )
 
         return s_flat_u
+
 
 def reweight(stats, weights):
     for coeff_label, weight in weights.items():
@@ -266,7 +269,7 @@ def optimize_from_maps(
         )  # [n_stats] if mean_field else [Nb, n_stats]
 
     target_stats = target_stats.detach()
-    print("Synthesis on {:} ST coefficients".format(target_coeffs_mask.size()))
+    print("Synthesis on {:} ST coefficients".format(target_stats.nelement()))
 
     # ------- Transfer reference normalization from target to running operator -------
     st_op_running.S2_ref_sqrt_chan_diag = st_op_target.S2_ref_sqrt_chan_diag
@@ -374,9 +377,9 @@ def optimize_from_stats(
     # ------- Target stats Processing -------
     if adhoc_weights is not None:
         reweight(target_stats, adhoc_weights)
-        
+
     target_stats_flat = target_stats.to_flatten(
-        keep_batch_dim=True, 
+        keep_batch_dim=True,
         mean_along_batch=mean_field,
         keepnans=False,
     )  # [1, n_stats] if mean_field else [Nb, n_stats]
@@ -458,7 +461,7 @@ def optimize_from_stats(
 
 #######################################################################################
 # ------- Pre/Post-processing functions -------
-def apply_nyquist_filter(tensor, plot=Flase):
+def apply_nyquist_filter(tensor, plot=False):
     """
     Apply a low-pass filter to an input tensor, keeping only frequencies within the Nyquist radius.
 
@@ -473,7 +476,7 @@ def apply_nyquist_filter(tensor, plot=Flase):
         Filtered tensor in real space of the same shape as input, with high frequencies removed
     """
     dim = (-2, -1)
-    
+
     # Compute frequency grids
     N, M = tensor.shape[-2:]
     fx = N * torch.fft.fftfreq(N, d=1.0, device=tensor.device)
@@ -487,11 +490,11 @@ def apply_nyquist_filter(tensor, plot=Flase):
 
     # Apply mask in Fourier space
     tensor_fft = torch.fft.fft2(tensor, dim=dim)
-    tensor_fft[..., ~mask] = 0.
+    tensor_fft[..., ~mask] = 0.0
 
     # Inverse Fourier transform to get the filtered tensor in real space
     tensor_filtered = torch.fft.ifft2(tensor_fft, dim=dim)
-    
+
     if not tensor.is_complex():
         tensor_filtered = tensor_filtered.real
 
@@ -509,7 +512,7 @@ def apply_nyquist_filter(tensor, plot=Flase):
 
     return tensor_filtered
 
-  
+
 # === User-friendly wrapper for synthesis from target maps (high level) ===
 def synthesize_from_maps(
     data_target,
@@ -602,7 +605,16 @@ def synthesize_from_maps(
 
     # Set default optimization parameters and update with user-provided values
     optim_params = dict(
-        max_iter=100, lr=1.0, history_size=50, print_iter=10, verbose=True, seed=26, prefilter_Nyquist=True if init_running is None else not init_running.isnan.any(), adhoc_weights={"S3": 3.5, "S4": 3.5**2},
+        max_iter=100,
+        lr=1.0,
+        history_size=50,
+        print_iter=10,
+        verbose=True,
+        seed=26,
+        prefilter_Nyquist=(
+            True if init_running is None else not init_running.isnan.any()
+        ),
+        adhoc_weights={"S3": 3.5, "S4": 3.5**2},
     )
     optim_params.update(optim_kwargs)
 
@@ -682,7 +694,16 @@ def synthesize_from_stats(
 
     # Set default optimization parameters and update with user-provided values
     optim_params = dict(
-        max_iter=100, lr=1.0, history_size=50, print_iter=10, verbose=True, seed=26, prefilter_Nyquist=True if init_running is None else not init_running.isnan.any(), adhoc_weights={"S3": 3.5, "S4": 3.5**2},
+        max_iter=100,
+        lr=1.0,
+        history_size=50,
+        print_iter=10,
+        verbose=True,
+        seed=26,
+        prefilter_Nyquist=(
+            True if init_running is None else not init_running.isnan.any()
+        ),
+        adhoc_weights={"S3": 3.5, "S4": 3.5**2},
     )
     optim_params.update(optim_kwargs)
 

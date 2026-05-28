@@ -341,6 +341,15 @@ class ST_Operator:
 
         # Local value for the additional transforms parameters
         norm = self.norm if norm is None else norm
+        if norm is None and self.norm is None:
+            raise Exception(
+                f"Norm type should be one of ['vanilla', 'store_ref', 'load_ref'] but is not specified in the ST operator initialization nor in the apply method. If you don't want to apply any normalization, please set norm to 'vanilla'."
+            )
+        assert norm in [
+            "vanilla",
+            "store_ref",
+            "load_ref",
+        ], "Invalid norm type. Should be one of ['vanilla', 'store_ref', 'load_ref']."
         if norm == "store_ref":
             assert (
                 var_ref is None
@@ -706,9 +715,7 @@ class ST_Operator:
             )
 
         else:
-            raise Exception(
-                f"Unknown norm type: {norm}. Should be one of ['vanilla', 'store_ref', 'load_ref']."
-            )
+            raise Exception(f"Unknown norm type: {norm}.")
 
         if iso:
             data_st.to_iso()
