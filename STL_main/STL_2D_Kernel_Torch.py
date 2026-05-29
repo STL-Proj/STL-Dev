@@ -27,6 +27,7 @@ from scipy.integrate import quad
 import STL_main.torch_backend as bk
 from STL_main.Base_DataClass import Base_DataClass
 from STL_main.ST_Operator import ST_Operator
+from STL_main.STL_2D_FFT_Torch import WaveletOperator2D_FFT_torch
 from STL_main.torch_backend import (
     _DEFAULT_DEVICE,
     _DEFAULT_DTYPE,
@@ -272,6 +273,7 @@ class WaveletOperator2Dkernel_torch:
         wr = torch.real(w)  # if torch.is_complex(w) else w
         wi = torch.imag(w)  # if torch.is_complex(w) else torch.zeros_like(wr)
 
+        # TODO: stack real and imag kernels and convolve once instead of twice for efficiency
         real_part = cls._conv2d_circular(
             x, wr, padding_mode=padding_mode
         )  # - cls._conv2d_circular(xi, wi)
@@ -333,7 +335,7 @@ class WaveletOperator2Dkernel_torch:
         J,
         L=None,
         kernel_size=None,
-        WType="Morlet",
+        WType="Bump-Steerable",
         DT="Planar2D_kernel_torch",
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
@@ -357,10 +359,14 @@ class WaveletOperator2Dkernel_torch:
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
         if self.WType == "Morlet":
-            self._wav_kernel = self._build_morlet_wavelet_kernel()
+            self._wav_kernel = self._build_morlet_wavelet_kernel()  # [1, L, K, K]
+        elif self.WType == "Bump-Steerable":
+            self._wav_kernel = (
+                self._build_bump_steerable_wavelet_kernel()
+            )  # [1, L, K, K]
         else:
             raise ValueError(
-                f"WType {self.WType} not recognized. Available options: 'Morlet'."
+                f"WType {self.WType} not recognized. Available options: 'Bump-Steerable' or 'Morlet'."
             )
 
         self.sigma_smooth = (
@@ -412,7 +418,7 @@ class WaveletOperator2Dkernel_torch:
 
                 # 1) reweighting maps needed in downsampling of layer 0 data (no wavelet convolution, only smoothing kernel convolution)
                 local_nan_weight_maps_smooth = {}
-                smooth_kernel = self._gaussian_kernel_5x5(
+                smooth_kernel = self._get_smooth_kernel(
                     device=self.mask_full_res.array.device, dtype=self.dtype
                 )
                 assert torch.isclose(
@@ -585,6 +591,25 @@ class WaveletOperator2Dkernel_torch:
             else:
                 raise ValueError("len(data.conv_history) must be 0, 1 or 2.")
 
+    def _build_bump_steerable_wavelet_kernel(self):
+        N = 256
+        assert (
+            self.KERNELSZ % 2 == 1
+        ), "KERNELSZ must be odd to have a well-defined center."
+        w = self.KERNELSZ // 2
+        kernel = WaveletOperator2D_FFT_torch.bump_steerable_bank(
+            self.J, self.L, size=(N, N)
+        )[
+            0
+        ]  # [L, N, N]
+        kernel = torch.fft.fftshift(torch.fft.ifft2(kernel, dim=(-2, -1)), dim=(-2, -1))
+        kernel = kernel[
+            :, N // 2 - w : N // 2 + w + 1, N // 2 - w : N // 2 + w + 1
+        ]  # [L, K, K]
+        kernel -= kernel.mean(dim=(-2, -1), keepdims=True)
+        kernel = kernel.to(device=self.device)
+        return kernel.unsqueeze(0)  # (1, L, K, K)
+
     def _build_morlet_wavelet_kernel(self, sigma=1):
         """Create a 2D Wavelet kernel."""
 
@@ -596,7 +621,8 @@ class WaveletOperator2Dkernel_torch:
         yy, xx = torch.meshgrid(coords, coords, indexing="ij")
 
         # Gaussian envelope
-        gaussian_envelope = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        gaussian_envelope_tmp = torch.exp(-2 * (xx**2 + yy**2) / (self.L * sigma**2))
+        gaussian_envelope = torch.exp(-8 * (xx**2 + yy**2) / (self.L * sigma**2))
 
         # Orientations
         angles = (
@@ -604,6 +630,7 @@ class WaveletOperator2Dkernel_torch:
             / self.L
             * torch.pi
         )
+        angles *= -1  # align with bump-steerable wavelet orientations
 
         # Morlet wavelet: exp(i*k0*x_rot) * gaussian_envelope
         # x_rot is the coordinate along the orientation direction
@@ -612,18 +639,52 @@ class WaveletOperator2Dkernel_torch:
         ] * torch.sin(angles[:, None, None])
 
         # Complex Morlet wavelet
-        kernel = torch.exp(1j * 0.75 * np.pi * x_rot) * gaussian_envelope[None, :, :]
+        kernel_tmp = (
+            torch.exp(1j * 0.75 * np.pi * x_rot) * gaussian_envelope_tmp[None, :, :]
+        )  # (L, K, K)
+
+        # y: (L, 3K, 3K)
+        y = torch.zeros(
+            [self.L, self.KERNELSZ * 3, self.KERNELSZ * 3],
+            device=self.device,
+            dtype=kernel_tmp.dtype,
+        )
+        y[:, self.KERNELSZ : self.KERNELSZ * 2, self.KERNELSZ : self.KERNELSZ * 2] = (
+            kernel_tmp
+        )
+
+        # conv2d expects 4D input: (N, C, H, W)
+        y4 = y.unsqueeze(1)  # (L, 1, 3K, 3K)
+
+        # weight: (C_out=1, C_in=1, 5, 5)
+        w = gaussian_envelope.unsqueeze(0).unsqueeze(0)  # (1,1,5,5)
+        w = w.to(dtype=kernel_tmp.dtype)  # optional: cast to complex if you want
+
+        # No padding needed because you already embedded into a larger array
+        y4 = F.conv2d(input=y4, weight=w, stride=1, padding=0)  # (L,1,3K-4,3K-4)
+
+        # Back to (L, H, W)
+        y = y4.squeeze(1)  # (L, 3K-4, 3K-4)
+
+        # IMPORTANT: indices shift because output is smaller by 4 pixels
+        # You want the central KxK block corresponding to original center
+        kernel = y[
+            :,
+            (self.KERNELSZ - 2) : (self.KERNELSZ - 2) + self.KERNELSZ,
+            (self.KERNELSZ - 2) : (self.KERNELSZ - 2) + self.KERNELSZ,
+        ]  # (L, K, K)
+        ######################
 
         # Remove DC component (admissibility condition)
         kernel = kernel - torch.mean(kernel, dim=(1, 2))[:, None, None]
 
         # L2 normalization
-        kernel = (
-            kernel
-            / torch.sqrt(torch.sum(torch.abs(kernel) ** 2, dim=(1, 2)))[:, None, None]
-        )
+        kernel /= 2 * self.L
 
-        return kernel.reshape(1, self.L, self.KERNELSZ, self.KERNELSZ)
+        # ad hoc normalisation
+        kernel /= 0.8
+
+        return kernel.reshape(1, self.L, self.KERNELSZ, self.KERNELSZ)  # (1, L, K, K)
 
     def _crop(self, array, border):
         """
@@ -947,6 +1008,9 @@ class WaveletOperator2Dkernel_torch:
 
         Requires that both spatial dimensions be divisible by 2**dg_inc.
         """
+        assert not torch.is_complex(x), "Input tensor x must be real-valued"
+        assert not torch.is_complex(smooth_kernel), "smooth_kernel must be real-valued"
+
         if dg_inc < 0:
             raise ValueError("dg_inc must be non-negative")
         if dg_inc == 0:
@@ -963,8 +1027,6 @@ class WaveletOperator2Dkernel_torch:
             raise ValueError("Smooth kernel must be of dimension 2.")
         if smooth_kernel.shape[0] != smooth_kernel.shape[1]:
             raise ValueError("Smooth kernel must be a square.")
-        if smooth_kernel.shape[-1] % 2 == 0:
-            raise ValueError("Smooth kernel side length must be odd.")
 
         leading_dims = x.shape[:-2]
         B = int(torch.prod(torch.tensor(leading_dims))) if leading_dims else 1
@@ -976,12 +1038,37 @@ class WaveletOperator2Dkernel_torch:
                 raise ValueError(
                     "Downsampling requires even spatial dimensions at each step."
                 )
-            # Add circular padding for periodic boundaries
-            pad = smooth_kernel.shape[-1] // 2
-            y_padded = F.pad(y, (pad, pad, pad, pad), mode=padding_mode)
-            y = F.conv2d(
-                input=y_padded, weight=smooth_kernel.unsqueeze(0).unsqueeze(0), stride=2
-            )
+            if smooth_kernel.shape == (2, 2) and torch.allclose(
+                smooth_kernel,
+                0.25
+                * torch.ones(
+                    (2, 2), device=smooth_kernel.device, dtype=smooth_kernel.dtype
+                ),
+            ):
+                # Fast path for 2x2 average pooling (equivalent to convolution with a 2x2 kernel of 0.25)
+                y = 0.25 * (
+                    y[..., ::2, ::2]
+                    + y[..., 1::2, ::2]
+                    + y[..., ::2, 1::2]
+                    + y[..., 1::2, 1::2]
+                )
+            else:
+                # if smooth_kernel.shape[-1] % 2 == 0:
+                #    raise ValueError("Smooth kernel side length must be odd.")
+                # TODO: check if below fix using pad_before != pad_after for even kernel size is correct
+
+                # Add circular padding for periodic boundaries
+                pad_before = (smooth_kernel.shape[-1] - 1) // 2
+                pad_after = smooth_kernel.shape[-1] // 2
+                y_padded = F.pad(
+                    y, (pad_before, pad_after, pad_before, pad_after), mode=padding_mode
+                )
+                # TODO: rely on self.__class__._conv2d_circular instead
+                y = F.conv2d(
+                    input=y_padded,
+                    weight=smooth_kernel.unsqueeze(0).unsqueeze(0),
+                    stride=2,
+                )
 
         H2, W2 = y.shape[-2:]
         return y.reshape(*leading_dims, H2, W2)
@@ -1011,7 +1098,7 @@ class WaveletOperator2Dkernel_torch:
         dg_inc = dg_out - data.dg
 
         if dg_inc > 0:
-            smooth_kernel = self._gaussian_kernel_5x5(
+            smooth_kernel = self._get_smooth_kernel(
                 device=data.array.device, dtype=data.array.dtype
             )
             padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
@@ -1091,29 +1178,111 @@ class WaveletOperator2Dkernel_torch:
                     )  # put a large value instead of NaNs WARNING: if applied, this breaks the backprop!!!
         return data
 
-    def _gaussian_kernel_5x5(self, device, dtype):
+    def _get_smooth_kernel(self, device, dtype):
         """
-        Build and cache a normalized 5x5 Gaussian kernel on (device, dtype)
+        Build and cache a normalized smoothing kernel on (device, dtype)
         for antialiasing 2D filter used in downsampling.
 
         Returns
         -------
         kernel : torch.Tensor
-            Shape (5, 5)
+            Shape (2, 2) or (3,3) or (6, 6)
         """
         if (
-            not hasattr(self, "_smooth_kernel_5x5")
-            or self._smooth_kernel_5x5.device != device
-            or self._smooth_kernel_5x5.dtype != dtype
+            not hasattr(self, "_smooth_kernel")
+            or self._smooth_kernel.device != device
+            or self._smooth_kernel.dtype != dtype
         ):
-            size = 5
-            coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2.0
-            yy, xx = torch.meshgrid(coords, coords, indexing="ij")
-            kernel = torch.exp(-(xx**2 + yy**2) / (2 * self.sigma_smooth**2))
-            kernel = kernel / kernel.sum()
-            # _conv2d_circular expects w shape (O_c, wx, wy)
-            self._smooth_kernel_5x5 = kernel
-        return self._smooth_kernel_5x5
+            if False:
+                # Precomputed 2x2 square -> no padding needed for striding 2 downsampling, but more aliasing
+                self._smooth_kernel = torch.tensor(
+                    [[0.25, 0.25], [0.25, 0.25]],
+                    device=device,
+                    dtype=dtype,
+                )
+            elif False:
+                # Precomputed 5x5 Gaussian
+                self._smooth_kernel = torch.tensor(
+                    [
+                        [0.0030, 0.0133, 0.0219, 0.0133, 0.0030],
+                        [0.0133, 0.0596, 0.0983, 0.0596, 0.0133],
+                        [0.0219, 0.0983, 0.1621, 0.0983, 0.0219],
+                        [0.0133, 0.0596, 0.0983, 0.0596, 0.0133],
+                        [0.0030, 0.0133, 0.0219, 0.0133, 0.0030],
+                    ],
+                    device=device,
+                    dtype=dtype,
+                )
+                self._smooth_kernel /= self._smooth_kernel.sum()
+            elif False:
+                # Precomputed 3x3 square -> each pixel has the same weight with striding 2 downsampling
+                self._smooth_kernel = torch.tensor(
+                    [
+                        [0.0625, 0.125, 0.0625],
+                        [0.125, 0.25, 0.125],
+                        [0.0625, 0.125, 0.0625],
+                    ],
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                # Precomputed 6x6 cropped raised cosine kernel with bandwidth=.71, beta=.35
+                # to have smaller loss of energy as possible and avoid aliasing while keeping a small kernel size for efficiency
+                self._smooth_kernel = torch.tensor(
+                    [
+                        [
+                            0.00238073,
+                            -0.00275097,
+                            -0.02402609,
+                            -0.02402609,
+                            -0.00275097,
+                            0.00238073,
+                        ],
+                        [
+                            -0.00275097,
+                            0.0031788,
+                            0.0277626,
+                            0.0277626,
+                            0.0031788,
+                            -0.00275097,
+                        ],
+                        [
+                            -0.02402609,
+                            0.0277626,
+                            0.2424694,
+                            0.2424694,
+                            0.0277626,
+                            -0.02402609,
+                        ],
+                        [
+                            -0.02402609,
+                            0.0277626,
+                            0.2424694,
+                            0.2424694,
+                            0.0277626,
+                            -0.02402609,
+                        ],
+                        [
+                            -0.00275097,
+                            0.0031788,
+                            0.0277626,
+                            0.0277626,
+                            0.0031788,
+                            -0.00275097,
+                        ],
+                        [
+                            0.00238073,
+                            -0.00275097,
+                            -0.02402609,
+                            -0.02402609,
+                            -0.00275097,
+                            0.00238073,
+                        ],
+                    ],
+                    device=device,
+                    dtype=dtype,
+                )
+        return self._smooth_kernel
 
 
 class CS_operator_2D_Kernel_Torch:
