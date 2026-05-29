@@ -62,3 +62,11 @@
 
 ### Fixed
 - Fixed incorrect synthesis behavior in mono-channel FFT and cross-channel FFT.
+
+
+## [v1.5.0] - 2026-05-29
+### Added
+- Added user informative exceptions in the handling of the `norm` parameter of the scattering operator.
+  
+### Fixed
+- Updated wavelet filters for both FFT & Kernel backends to improve Littlewood-Paley condition. Updated smoothing filter with better anti-aliasing propoerties for Kernel backend.
