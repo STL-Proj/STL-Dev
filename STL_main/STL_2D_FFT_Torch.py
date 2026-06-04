@@ -444,8 +444,8 @@ class WaveletOperator2D_FFT_torch:
 
         # apply bump window over r: g(r) = exp(-r^2 / (1 - r^2)) * 1_{0<r<1}
         r2 = r**2
-        support_r = (r >= 0.0) & (r < 1.0)
-        r2 *= width_factor  # optimized parameter (for L=4) to follow at best Littlewood Paley condition, see numerical integration in the notebook "BS_wavelet_kernel.ipynb"
+        r2 *= width_factor  # optimized parameter (for L=4) to follow at best Littlewood Paley condition, see numerical integration in the notebook "consistency_Kernel_FFT.ipynb"
+        support_r = (r >= 0.0) & (r < width_factor ** (-0.5))
         denom = (1.0 - r2).clamp_min(eps)
         bump = torch.where(support_r, torch.exp(-r2 / denom), torch.zeros_like(r))
 
