@@ -343,6 +343,7 @@ class WaveletOperator2Dkernel_torch:
         sigma_smooth=1.0,
         downsample_nan_weight_threshold=0.33,
         get_crop_border_size_method=None,
+        wav_kernel=None,
     ):
         if J is None:
             raise ValueError(
@@ -358,7 +359,15 @@ class WaveletOperator2Dkernel_torch:
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
-        if self.WType == "Morlet":
+        if wav_kernel is not None:
+            # Externally provided kernel bank (e.g. learnable wavelets, see
+            # Learnable_Wavelets.py). Shape [1, L, K, K], complex. The autograd
+            # graph is preserved so that ST coefficients stay differentiable
+            # with respect to the parameters that generated the kernel.
+            if kernel_size is None:
+                self.KERNELSZ = wav_kernel.shape[-1]
+            self.set_wavelet_kernel(wav_kernel)
+        elif self.WType == "Morlet":
             self._wav_kernel = self._build_morlet_wavelet_kernel()  # [1, L, K, K]
         elif self.WType == "Bump-Steerable":
             self._wav_kernel = (
@@ -604,6 +613,32 @@ class WaveletOperator2Dkernel_torch:
         kernel -= kernel.mean(dim=(-2, -1), keepdims=True)
         kernel = kernel.to(device=self.device)
         return kernel.unsqueeze(0)  # (1, L, K, K)
+
+    def set_wavelet_kernel(self, kernel):
+        """
+        Inject an external (possibly learnable) wavelet kernel bank.
+
+        Replaces `_wav_kernel` used by `apply`. The tensor is NOT detached:
+        if `kernel` was generated from torch Parameters (see
+        Learnable_Wavelets.LearnableMorletKernel2D), the scattering
+        coefficients computed afterwards remain differentiable with respect
+        to those parameters. Call this before each forward pass when the
+        parameters have changed.
+
+        Parameters
+        ----------
+        kernel : torch.Tensor
+            Complex kernel bank of shape [1, L, K, K], same convention as
+            the internally built `_wav_kernel`.
+        """
+        assert kernel.ndim == 4, "kernel must have shape [1, L, K, K]"
+        assert kernel.shape[1] == self.L, (
+            f"kernel has {kernel.shape[1]} orientations, expected L={self.L}"
+        )
+        assert kernel.shape[-2] == kernel.shape[-1] == self.KERNELSZ, (
+            f"kernel size {kernel.shape[-2:]} != KERNELSZ={self.KERNELSZ}"
+        )
+        self._wav_kernel = kernel.to(device=self.device)
 
     def _build_bump_steerable_wavelet_kernel(self):
         return self._build_wavelet_kernel_from_ifft_crop(
