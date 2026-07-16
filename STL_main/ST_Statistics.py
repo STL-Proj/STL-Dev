@@ -544,17 +544,19 @@ class ST_Statistics:
 
         if mean_along_batch:
             stats = [bk.mean(s, dim=0, keepdim=True) for s in stats]
+            
         # Flatten each, remove NaNs, concat
         flattened_list = []
         for S, S_name in zip(stats, stats_names):
             if flatten_complex and bk.is_complex(S):
-
-                S = bk.view_as_real(
-                    S
-                )  # [..., 2] with last dimension for real and imag parts
-
+                S = bk.view_as_real(S) # [..., 2] with last dimension for real and imag parts
                 if S_name in ["S1", "S2", "PS"]:
                     S = S[..., 0]  # Keep only real part
+            elif not flatten_complex and S_name in ("mean", "var"):
+                # mean/var are real by construction (they describe real maps).
+                # All other statistics (S1-S4, PS) are complex-typed, so promote
+                # mean/var here to match dtype for the cat() below.
+                S = S.to(dtype=self.S1.dtype)
 
             S_flat = S.reshape(-1) if not keep_batch_dim else S.reshape(S.shape[0], -1)
 
