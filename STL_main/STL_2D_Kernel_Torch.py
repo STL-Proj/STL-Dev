@@ -602,7 +602,12 @@ class WaveletOperator2Dkernel_torch:
             :, N // 2 - w : N // 2 + w + 1, N // 2 - w : N // 2 + w + 1
         ]  # [L, K, K]
         kernel -= kernel.mean(dim=(-2, -1), keepdims=True)
-        kernel = kernel.to(device=self.device)
+        # Cast to the operator's working precision so the kernel matches the data
+        # dtype in the convolution (e.g. complex128 for float64 data on CPU).
+        complex_dtype = (
+            torch.complex128 if self.dtype == torch.float64 else torch.complex64
+        )
+        kernel = kernel.to(device=self.device, dtype=complex_dtype)
         return kernel.unsqueeze(0)  # (1, L, K, K)
 
     def _build_bump_steerable_wavelet_kernel(self):
