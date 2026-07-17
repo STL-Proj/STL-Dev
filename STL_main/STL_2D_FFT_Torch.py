@@ -1280,6 +1280,8 @@ class CS_operator_2D_FFT_torch:
         shape,
         n_bins=None,
         J=None,
+        Jmin=0,
+        power_spectrum_method="legacy",
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
         get_crop_border_size_method="flexible_crop",
@@ -1299,6 +1301,16 @@ class CS_operator_2D_FFT_torch:
             int(2 ** (np.log2(min(shape)) - 4)) if n_bins is None else n_bins
         )  # adaptive number of bins
         self.J = int(np.log2(min(shape))) - 2 if J is None else J
+        if Jmin < 0 or Jmin >= self.J:
+            raise ValueError(
+                f"Jmin must satisfy 0 <= Jmin < J (got Jmin={Jmin}, J={self.J})."
+            )
+        self.Jmin = Jmin
+        self.power_spectrum_method = power_spectrum_method.lower().strip()
+        if self.power_spectrum_method not in {"legacy", "gaussian_rings"}:
+            raise ValueError(
+                "power_spectrum_method must be either 'legacy' or 'gaussian_rings'"
+            )
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
         self.get_crop_border_size_method = get_crop_border_size_method
@@ -1311,6 +1323,12 @@ class CS_operator_2D_FFT_torch:
 
     ###########################################################################
     def _build_bin_masks(self):
+        if self.power_spectrum_method == "gaussian_rings":
+            self._build_log_gaussian_bin_masks()
+        else:
+            self._build_legacy_bin_masks()
+
+    def _build_legacy_bin_masks(self):
 
         N, M = self.shape
 
@@ -1350,6 +1368,52 @@ class CS_operator_2D_FFT_torch:
         self.bin_centers = self.min_freq * lam**scales_j
         self.lam = lam
 
+    def _build_log_gaussian_bin_masks(self):
+        N, M = self.shape
+
+        freq_y = torch.fft.fftfreq(N, d=1.0, device=self.device)
+        freq_x = torch.fft.fftfreq(M, d=1.0, device=self.device)
+        FY, FX = torch.meshgrid(freq_y, freq_x, indexing="ij")
+        self.radial_freq = torch.fft.fftshift(torch.sqrt(FX**2 + FY**2)).to(
+            dtype=self.dtype
+        )
+
+        self.min_freq = 1 / (2.0**self.J)
+        self.max_freq = 0.5 / (2.0**self.Jmin)
+
+        log_edges = torch.linspace(
+            np.log(self.min_freq),
+            np.log(self.max_freq),
+            self.n_bins + 1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.bin_edges = torch.exp(log_edges)
+
+        log_centers = 0.5 * (log_edges[:-1] + log_edges[1:])
+        self.bin_centers = torch.exp(log_centers)
+
+        log_sigma = torch.abs(log_edges[1:] - log_edges[:-1])
+        log_sigma = torch.where(log_sigma > 0, log_sigma, torch.ones_like(log_sigma))
+        log_radial = torch.log(
+            torch.where(
+                self.radial_freq > 0,
+                self.radial_freq,
+                torch.ones_like(self.radial_freq),
+            )
+        )
+        self.bin_masks = torch.exp(
+            -0.5
+            * ((log_radial[None, :, :] - log_centers[:, None, None]) ** 2)
+            / (log_sigma[:, None, None] ** 2)
+        )
+        self.bin_masks = torch.where(
+            (self.radial_freq == 0)[None, :, :],
+            torch.zeros_like(self.bin_masks),
+            self.bin_masks,
+        )
+        self.lam = None
+
     def estimate_crop_borders(self):
 
         N, M = self.shape
@@ -1383,7 +1447,7 @@ class CS_operator_2D_FFT_torch:
     ###########################################################################
     def build_mask_crop(self, array, border):
         """
-        Build a smooth per-bin crop mask.
+        Build per-bin crop masks.
 
         Parameters
         ----------
@@ -1402,6 +1466,11 @@ class CS_operator_2D_FFT_torch:
             raise ValueError(
                 "Input tensor must have at least 3 dimensions to apply per-bin crop."
             )
+        if self.power_spectrum_method == "gaussian_rings":
+            return self._build_hard_mask_crop(array, border)
+        return self._build_smooth_mask_crop(array, border)
+
+    def _build_smooth_mask_crop(self, array, border):
         N, M = array.shape[-2:]
 
         rows = torch.arange(N, device=array.device, dtype=self.dtype)
@@ -1422,6 +1491,25 @@ class CS_operator_2D_FFT_torch:
 
         mask = taper_y * taper_x  # [n_bins, N, M]
         mask = torch.where(has_border, mask, torch.ones_like(mask))
+
+        return mask
+
+    def _build_hard_mask_crop(self, array, border):
+        n_bins_dim, N, M = array.shape[-3], array.shape[-2], array.shape[-1]
+        if border.shape[0] != n_bins_dim:
+            raise ValueError(
+                f"border length ({border.shape[0]}) does not match n_bins ({n_bins_dim})"
+            )
+
+        rows = torch.arange(N, device=array.device).view(1, N, 1)
+        cols = torch.arange(M, device=array.device).view(1, 1, M)
+        border_broadcast = border.to(device=array.device).view(n_bins_dim, 1, 1)
+        mask = (
+            (rows >= border_broadcast)
+            & (rows < (N - border_broadcast))
+            & (cols >= border_broadcast)
+            & (cols < (M - border_broadcast))
+        )
 
         return mask
 
@@ -1493,19 +1581,18 @@ class CS_operator_2D_FFT_torch:
             else compute_cross_spectrum_matrix
         )
 
-        l_data_bin = (
-            l_data.array[:, :, None, :, :] * self.bin_masks[None, None, :, :, :]
-        )  # [Nb, Nc, Nbin, N, M]
-
-        cross_product_bin = l_data_bin[:, :, None, :, :, :] * torch.conj(
-            l_data.array[:, None, :, None, :, :]
-        )  # [Nb, Nc, Nc, n_bins, N, M]
+        bin_norm = self.bin_masks.sum(dim=(-2, -1))
 
         if l_data.pbc:
 
             cross_vals = (
-                cross_product_bin.sum(dim=(-2, -1))
-                / self.bin_masks.sum(dim=(-2, -1))[None, None, None, :]
+                torch.einsum(
+                    "jxy,bcxy,bdxy->bcdj",
+                    self.bin_masks.to(dtype=l_data.array.dtype),
+                    l_data.array,
+                    torch.conj(l_data.array),
+                )
+                / bin_norm[None, None, None, :]
             ).to(dtype=bk._DEFAULT_COMPLEX_DTYPE)
 
             # Symetric part is redundant and then not filled as cross_spectrum(c1, c2) and cross_spectrum(c2, c1) are conjugates
@@ -1527,27 +1614,35 @@ class CS_operator_2D_FFT_torch:
                 f"Invalid get_crop_border_size_method: {get_crop_border_size_method}"
             )
 
+        l_data_bin = (
+            l_data.array[:, :, None, :, :] * self.bin_masks[None, None, :, :, :]
+        )  # [Nb, Nc, n_bins, N, M]
+
         ifft_l_data_bin = torch.fft.ifft2(
             l_data_bin, norm="ortho", dim=(-2, -1)
         )  # [Nb, Nc, n_bins, N, M]
         l_data.set_fourier_status(
             target_fourier_status=False, inplace=True
         )  # [Nb, Nc, N, M]
-        mask_crop = self.build_mask_crop(l_data.array, border=border)  # [n_bins, N, M]
+        mask_source = (
+            ifft_l_data_bin[0, 0]
+            if self.power_spectrum_method == "gaussian_rings"
+            else l_data.array
+        )
+        mask_crop = self.build_mask_crop(mask_source, border=border)  # [n_bins, N, M]
+        mask_crop_c = mask_crop.to(dtype=ifft_l_data_bin.dtype)
         prefactor = (l_data.N0[0] * l_data.N0[1]) / mask_crop.sum(
             dim=(-2, -1)
         )  # [n_bins]
 
-        cross_product_bin_real = ifft_l_data_bin[:, :, None, :, :, :] * torch.conj(
-            l_data.array[:, None, :, None, :, :]
-        )  # [Nb, Nc, Nc, n_bins, N, M]
-
         cross_vals = (
-            prefactor
-            * (cross_product_bin_real * mask_crop[None, None, None, :, :, :]).sum(
-                dim=(-2, -1)
+            torch.einsum(
+                "bcjxy,bdxy,jxy->bcdj",
+                ifft_l_data_bin,
+                torch.conj(l_data.array),
+                mask_crop_c,
             )
-            / self.bin_masks.sum(dim=(-2, -1))[None, None, None, :]
+            * (prefactor / bin_norm)[None, None, None, :]
         ).to(dtype=bk._DEFAULT_COMPLEX_DTYPE)
 
         cross_spectrum[:, compute_cross_spectrum_matrix, :] = cross_vals[

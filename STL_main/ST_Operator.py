@@ -122,6 +122,8 @@ class ST_Operator:
         get_crop_border_size_method=None,
         # Optional power spectrum args
         n_bins=None,
+        power_spectrum_method=None,
+        Jmin=None,
     ):
         """
         Constructor, see details above.
@@ -183,6 +185,10 @@ class ST_Operator:
             cross_spectrum_op_kwargs["n_bins"] = n_bins
         if J is not None:
             cross_spectrum_op_kwargs["J"] = J
+        if power_spectrum_method is not None:
+            cross_spectrum_op_kwargs["power_spectrum_method"] = power_spectrum_method
+        if Jmin is not None:
+            cross_spectrum_op_kwargs["Jmin"] = Jmin
         self.CS_op = data_example.get_CS_op(**cross_spectrum_op_kwargs)
         self.n_bins = self.CS_op.n_bins
         self.PS_ref_sqrt_chan_diag = PS_ref_sqrt_chan_diag
