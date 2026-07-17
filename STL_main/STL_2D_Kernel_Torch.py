@@ -1368,10 +1368,13 @@ class CS_operator_2D_Kernel_Torch:
     ###########################################################################
     def build_mask_crop(self, array, border):
         """
-        Crops an array by removing 'border' pixels from each side
-        along the last two dimensions. Pads with zeros for each
-        cropped side (border may be different for each bin) to keep
-        the same output shape.
+        Build a per-bin smooth crop/apodization mask.
+
+        The older implementation used a hard square mask: pixels inside the
+        crop were 1 and pixels outside were 0. That creates a sharp square
+        boundary in the non-PBC power-spectrum loss. Here we keep the same
+        per-bin border scale, but turn it into a cosine taper from 0 at the
+        image edge to 1 in the interior.
 
         Parameters
         ----------
@@ -1383,7 +1386,7 @@ class CS_operator_2D_Kernel_Torch:
         Returns
         -------
         torch.Tensor
-            Cropped array. Shape [Nb, Nc, n_bins, N, M].
+            Smooth apodization mask. Shape [n_bins, N, M].
         """
 
         if array.ndim < 3:
@@ -1392,16 +1395,24 @@ class CS_operator_2D_Kernel_Torch:
             )
         N, M = array.shape[-2:]
 
-        rows = torch.arange(N, device=array.device).view(1, N, 1)
-        cols = torch.arange(M, device=array.device).view(1, 1, M)
-        border_broadcast = border.view(self.n_bins, 1, 1)
+        rows = torch.arange(N, device=array.device, dtype=self.dtype)
+        cols = torch.arange(M, device=array.device, dtype=self.dtype)
+        dist_y = torch.minimum(rows, (N - 1) - rows).view(1, N, 1)
+        dist_x = torch.minimum(cols, (M - 1) - cols).view(1, 1, M)
 
-        mask = (
-            (rows >= border_broadcast)
-            & (rows < (N - border_broadcast))
-            & (cols >= border_broadcast)
-            & (cols < (M - border_broadcast))
-        )  # [n_bins, N, M]
+        border_broadcast = border.to(device=array.device, dtype=self.dtype).view(
+            self.n_bins, 1, 1
+        )
+        has_border = border_broadcast > 0
+        border_safe = border_broadcast.clamp_min(1.0)
+
+        taper_y = (dist_y / border_safe).clamp(0.0, 1.0)
+        taper_x = (dist_x / border_safe).clamp(0.0, 1.0)
+        taper_y = 0.5 - 0.5 * torch.cos(torch.pi * taper_y)
+        taper_x = 0.5 - 0.5 * torch.cos(torch.pi * taper_x)
+
+        mask = taper_y * taper_x  # [n_bins, N, M]
+        mask = torch.where(has_border, mask, torch.ones_like(mask))
 
         return mask
 
