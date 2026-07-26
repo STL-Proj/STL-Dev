@@ -373,7 +373,23 @@ class ST_Statistics:
     ########################################
     def to_scale_ft(self, harmonics_scale=None, dj=None, harmonics_angle=None):
         """
-        Angular scale transform on the ST statistcs
+        Apply a cosine (DCT-like) transform along the scale axis of S3 and S4.
+
+        The statistics are first reparametrized in terms of scale differences
+        (j1, a, b), with j2 = j1 + a and j3 = j1 + b, keeping 0 <= a <= b < dj.
+        Pairs reaching beyond the coarsest scale are left at NaN, so for a given
+        difference only j1 < J - a (resp. J - b) contribute. The DCT then runs
+        along j1 at fixed differences, and the harmonics that the missing scales
+        would make linearly dependent are NaN as well.
+
+        Parameters
+        ----------
+        - harmonics_scale : int, default self.J
+            number of cosine harmonics of j1 to keep
+        - dj : int, default self.J
+            maximum scale difference to keep, clipped to self.J
+        - harmonics_angle : int, default self.L
+            size of the angular axes, as left by to_angular_ft
         """
         Nb, Nc = self.Nb, self.Nc
         if harmonics_scale is None:
@@ -384,6 +400,10 @@ class ST_Statistics:
             harmonics_angle = self.L
 
         J, L = self.J, harmonics_angle
+
+        # Scale differences a = j2 - j1 are non-negative and satisfy j1 + a <= J - 1,
+        # so any dj beyond J would only add all-NaN slices.
+        dj = min(dj, J)
 
         def cosinus1(N, device, dtype):
             """
@@ -407,95 +427,69 @@ class ST_Statistics:
             return F
 
         if self.SC == "ScatCov":
-            if self.iso:
-                S3_reparam = bk.zeros(
-                    (Nb, Nc, Nc, J, J, L), device=self.S3.device, dtype=self.S3.dtype
-                )
-                S4_reparam = bk.zeros(
-                    (Nb, Nc, Nc, J, J, J, L, L),
-                    device=self.S4.device,
-                    dtype=self.S3.dtype,
-                )
-                nan_complex = bk.tensor(
-                    complex(float("nan"), float("nan")),
-                    dtype=self.S3.dtype,
-                    device=self.S3.device,
-                )
+            if not self.iso:
+                raise Exception("Scale_ft is only implemented after isotropization")
 
-                for j1 in range(J):
-                    for j2 in range(J):
-                        dj2 = (j2 - j1) % J
+            nan_complex = complex(float("nan"), float("nan"))
 
-                        # Set to NaN if dj2 > 3
-                        if dj2 >= dj:
-                            S3_reparam[..., j1, dj2, :] = nan_complex
-                        else:
-                            S3_reparam[..., j1, dj2, :] = self.S3[..., j1, j2, :]
+            # Reparametrize the scales as (j1, a, b) with j2 = j1 + a and j3 = j1 + b.
+            # Differences are causal (0 <= a <= b) rather than cyclic, so pairs
+            # falling outside the scale range stay NaN instead of wrapping around.
+            S3_reparam = bk.full(
+                (Nb, Nc, Nc, J, dj, L),
+                nan_complex,
+                device=self.S3.device,
+                dtype=self.S3.dtype,
+            )
+            S4_reparam = bk.full(
+                (Nb, Nc, Nc, J, dj, dj, L, L),
+                nan_complex,
+                device=self.S4.device,
+                dtype=self.S4.dtype,
+            )
 
-                        for j3 in range(J):
-                            dj3 = (j3 - j1) % J
-                            dj32 = (j3 - j2) % J
+            for j1 in range(J):
+                a_max = min(dj, J - j1)
+                for a in range(a_max):
+                    j2 = j1 + a
+                    S3_reparam[..., j1, a, :] = self.S3[..., j1, j2, :]
 
-                            # Set to NaN if dj2 > 3 or dj3 > 3 or dj32 > 3
-                            if dj2 >= dj or dj3 >= dj or dj32 >= dj:
-                                S4_reparam[..., j1, dj2, dj3, :, :] = nan_complex
-                            else:
-                                S4_reparam[..., j1, dj2, dj3, :, :] = self.S4[
-                                    ..., j1, j2, j3, :, :
-                                ]
+                    for b in range(a, a_max):  # enforce j2 <= j3
+                        j3 = j1 + b
+                        S4_reparam[..., j1, a, b, :, :] = self.S4[..., j1, j2, j3, :, :]
 
-                # # Apply DCT on the first J dimension
-                F = cosinus1(J, device=self.S3.device, dtype=self.S3.real.dtype)
+            # Apply DCT on the j1 dimension, for each fixed scale difference
+            F = cosinus1(J, device=self.S3.device, dtype=self.S3.real.dtype)
 
-                S3_real = S3_reparam.real
-                S3_imag = S3_reparam.imag
+            def dct_along_j1(S_reparam, subscripts):
+                S_real, S_imag = S_reparam.real, S_reparam.imag
 
                 # Create mask for NaN values
-                nan_mask = bk.isnan(S3_real) | bk.isnan(S3_imag)
+                nan_mask = bk.isnan(S_real) | bk.isnan(S_imag)
 
                 # Replace NaN with 0 for computation
-                S3_real_clean = bk.nan_to_num(S3_real, nan=0.0)
-                S3_imag_clean = bk.nan_to_num(S3_imag, nan=0.0)
+                S_real_clean = bk.nan_to_num(S_real, nan=0.0)
+                S_imag_clean = bk.nan_to_num(S_imag, nan=0.0)
 
-                S3_real_reshaped = S3_real_clean.reshape(-1, J, L)
-                S3_imag_reshaped = S3_imag_clean.reshape(-1, J, L)
+                S_cos = bk.complex(
+                    bk.einsum(subscripts, F, S_real_clean),
+                    bk.einsum(subscripts, F, S_imag_clean),
+                )
 
-                S3_cos_real = bk.matmul(F, S3_real_reshaped)
-                S3_cos_imag = bk.matmul(F, S3_imag_reshaped)
+                # Restore NaN where they were present. For a difference a, the
+                # inputs are only defined for j1 < J - a, so this also discards
+                # the harmonics that the zero-padding made linearly dependent.
+                S_cos[nan_mask] = nan_complex
 
-                S3_cos = bk.complex(S3_cos_real, S3_cos_imag).reshape(S3_reparam.shape)
+                return S_cos
 
-                # Restore NaN where they were present
-                S3_cos[nan_mask] = complex(float("nan"), float("nan"))
+            S3_cos = dct_along_j1(S3_reparam, "ij,...jkl->...ikl")
+            S4_cos = dct_along_j1(S4_reparam, "ij,...jklmn->...iklmn")
 
-                S4_real = S4_reparam.real
-                S4_imag = S4_reparam.imag
+            # Keep the low cosine harmonics of j1
+            self.S3 = S3_cos[..., 0:harmonics_scale, :, :]
+            self.S4 = S4_cos[..., 0:harmonics_scale, :, :, :, :]
 
-                # Create mask for NaN values
-                nan_mask = bk.isnan(S4_real) | bk.isnan(S4_imag)
-
-                # Replace NaN with 0 for computation
-                S4_real_clean = bk.nan_to_num(S4_real, nan=0.0)
-                S4_imag_clean = bk.nan_to_num(S4_imag, nan=0.0)
-
-                S4_real_reshaped = S4_real_clean.reshape(-1, J, J, L, L)
-                S4_imag_reshaped = S4_imag_clean.reshape(-1, J, J, L, L)
-
-                S4_cos_real = bk.einsum("ij,bjklm->biklm", F, S4_real_reshaped)
-                S4_cos_imag = bk.einsum("ij,bjklm->biklm", F, S4_imag_reshaped)
-
-                S4_cos = bk.complex(S4_cos_real, S4_cos_imag).reshape(S4_reparam.shape)
-
-                # Restore NaN where they were present
-                S4_cos[nan_mask] = complex(float("nan"), float("nan"))
-            else:
-                # TODO
-                pass
-        else:
-            pass
-
-        self.S3 = S3_cos[:, :, :, 0:harmonics_scale]
-        self.S4 = S4_cos[:, :, :, 0:harmonics_scale]
         # store scale_ft parameter
         self.scale_ft = True
 
@@ -544,17 +538,21 @@ class ST_Statistics:
 
         if mean_along_batch:
             stats = [bk.mean(s, dim=0, keepdim=True) for s in stats]
+
         # Flatten each, remove NaNs, concat
         flattened_list = []
         for S, S_name in zip(stats, stats_names):
             if flatten_complex and bk.is_complex(S):
-
                 S = bk.view_as_real(
                     S
                 )  # [..., 2] with last dimension for real and imag parts
-
                 if S_name in ["S1", "S2", "PS"]:
                     S = S[..., 0]  # Keep only real part
+            elif not flatten_complex and S_name in ("mean", "var"):
+                # mean/var are real by construction (they describe real maps).
+                # All other statistics (S1-S4, PS) are complex-typed, so promote
+                # mean/var here to match dtype for the cat() below.
+                S = S.to(dtype=self.S1.dtype)
 
             S_flat = S.reshape(-1) if not keep_batch_dim else S.reshape(S.shape[0], -1)
 
