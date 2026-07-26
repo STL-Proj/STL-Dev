@@ -1281,7 +1281,7 @@ class CS_operator_2D_FFT_torch:
         n_bins=None,
         J=None,
         Jmin=0,
-        power_spectrum_method="legacy",
+        power_spectrum_method="gaussian_rings",
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
         get_crop_border_size_method="flexible_crop",
