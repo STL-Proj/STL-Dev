@@ -64,7 +64,9 @@ def test_DataClass_downsample():
     diff = np.asarray(
         (data_downsampled.array - data.array[..., :: 2**dg_out, :: 2**dg_out]).cpu()
     )
-    assert np.all(np.abs(diff) < threshold * np.abs(np.asarray(data_downsampled.array.cpu())))
+    assert np.all(
+        np.abs(diff) < threshold * np.abs(np.asarray(data_downsampled.array.cpu()))
+    )
 
 
 if __name__ == "__main__":
