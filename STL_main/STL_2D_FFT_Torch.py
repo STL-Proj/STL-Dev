@@ -531,6 +531,112 @@ class WaveletOperator2D_FFT_torch:
         return filters_bank
 
     @staticmethod
+    def analytic_bump_steerable_2d(omega_grid, L, xi0):
+
+        omega_x = omega_grid[..., 0]
+        omega_y = omega_grid[..., 1]
+
+        # Polar coordinates
+        r = torch.sqrt(omega_x**2 + omega_y**2)
+        phi = torch.atan2(omega_y, omega_x)
+
+        # Radial part: bump window centered at xi0 and with support in [0, 2*xi0]
+        u_sq = ((r - xi0) / xi0) ** 2
+        mask_radial = u_sq < 1.0
+        bump_window = torch.zeros_like(r)
+        bump_window[mask_radial] = torch.exp(
+            -u_sq[mask_radial] / (1.0 - u_sq[mask_radial])
+        )
+
+        # Angular part
+        mask_angular = torch.abs(phi) < (math.pi / 2)
+        angular_part = torch.zeros_like(phi)
+        angular_part[mask_angular] = torch.cos(phi[mask_angular]) ** (L - 1)
+
+        c = (
+            math.sqrt(2)
+            * (1.29**-1)
+            * (2 ** (L - 1))
+            * math.factorial(L - 1)
+            / math.sqrt(L * math.factorial(2 * (L - 1)))
+        )
+
+        return c * bump_window * angular_part
+
+    @classmethod
+    def analytic_bump_steerable_bank(
+        cls, J, L, size, xi0=torch.pi / 2, smooth_nyquist=True, delta_rho=0.2
+    ):
+        Nx, Ny = size
+        low_pass_filter = torch.empty((Nx, Ny))
+        filters_bank = torch.empty((J, L, Nx, Ny))
+
+        # Numerical impulse grid in Fourier space
+        omega_x = 2 * torch.pi * torch.fft.fftfreq(Nx)
+        omega_y = 2 * torch.pi * torch.fft.fftfreq(Ny)
+
+        Omega_x, Omega_y = torch.meshgrid(omega_x, omega_y, indexing="ij")
+        omega_sq = Omega_x**2 + Omega_y**2
+        omega_grid = torch.stack((Omega_x, Omega_y), dim=-1)
+
+        # Low-pass filter for the last scale
+        sigma_J = (2 ** -(0.550)) * (2.0 ** (-J + 1)) * xi0
+        low_pass_filter = torch.exp(-omega_sq / (2.0 * (sigma_J**2)))
+
+        for j in range(J):
+            scale_factor = 2**j
+            for l_idx, l in enumerate(range(L)):
+                theta = math.pi * l / L
+
+                cos_theta = torch.cos(torch.tensor(theta))
+                sin_theta = torch.sin(torch.tensor(theta))
+                R = torch.tensor(
+                    [[cos_theta, -sin_theta], [sin_theta, cos_theta]],
+                    dtype=omega_grid.dtype,
+                    device=omega_grid.device,
+                )
+
+                q = (
+                    scale_factor * omega_grid @ R
+                )  # rotate and dilate the frequency grid
+
+                if j == 0:
+                    # Deform bump steerable wavelet at first scale to Littlewood-Paley condition
+                    filters_bank[j, l_idx] = torch.sqrt(
+                        cls.analytic_bump_steerable_2d(q, L=L, xi0=xi0).pow(2)
+                        + cls.analytic_bump_steerable_2d(q, L=L, xi0=2 * xi0).pow(2)
+                        + cls.analytic_bump_steerable_2d(q, L=L, xi0=4 * xi0).pow(2)
+                    )
+
+                    # Smooth the deformed bump steerable wavelet at the Nyquist frequency
+                    if smooth_nyquist:
+                        rho = torch.sqrt(omega_sq)
+                        rho_cut = torch.pi  # don't mind the corner frequencies
+                        rho_start = (1 - delta_rho) * rho_cut
+
+                        smooth_window = torch.ones_like(rho)
+
+                        # Transition region: apply a smooth window between rho_start and rho_cut
+                        mask_trans = (rho > rho_start) & (rho < rho_cut)
+                        u = (rho[mask_trans] - rho_start) / (rho_cut - rho_start)
+                        smooth_window[mask_trans] = torch.cos(
+                            0.5 * float(np.pi) * u
+                        ).pow(2)
+
+                        # Above rho_cut, set the window to zero
+                        smooth_window[rho >= rho_cut] = 0.0
+
+                        # Apply the smooth window
+                        filters_bank[j, l_idx] = filters_bank[j, l_idx] * smooth_window
+
+                else:
+                    filters_bank[j, l_idx] = cls.analytic_bump_steerable_2d(
+                        q, L=L, xi0=xi0
+                    )
+
+        return low_pass_filter, filters_bank
+
+    @staticmethod
     def _get_crop_border_size_largest_scale_second_layer(data, wavelet_op):
         if data.pbc:
             return 0
@@ -669,6 +775,13 @@ class WaveletOperator2D_FFT_torch:
             self.wavelet_array = self.__class__.bump_steerable_bank(
                 self.J, self.L, self.N0
             ).to(
+                device=self.device, dtype=self.dtype
+            )  # [J, L, N0x, N0y]
+
+        elif self.WType == "Analytic-Bump-Steerable":
+            self.wavelet_array = self.__class__.analytic_bump_steerable_bank(
+                self.J, self.L, self.N0
+            )[1].to(
                 device=self.device, dtype=self.dtype
             )  # [J, L, N0x, N0y]
 
