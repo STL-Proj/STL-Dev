@@ -616,11 +616,26 @@ class WaveletOperator2D_FFT_torch:
 
                     if oriented_low_pass_filter:
 
-                        filters_bank[J, l_idx] = (
-                            low_pass_filter
-                            * c_L
-                            * torch.abs(torch.cos(torch.atan2(q[..., 1], q[..., 0])))
-                            ** (L - 1)
+                        # Design the oriented low-pass filters by convexly blending a purely isotropic energy
+                        # at the origin with a directional energy away from it, thereby removing the origin
+                        # singularity inherent to standalone oriented designs.
+
+                        # Radial blending function
+                        sigma_r = 1 * sigma_J  # width of the transition region
+                        alpha = torch.exp(-omega_sq / (2.0 * (sigma_r**2)))
+
+                        # Isotropic energy (same contribution for all orientations)
+                        isotropic_energy = 1.0 / L
+
+                        # Oriented energy (directional contribution)
+                        oriented_amp = c_L * torch.abs(
+                            torch.cos(torch.atan2(q[..., 1], q[..., 0]))
+                        ) ** (L - 1)
+                        oriented_energy = oriented_amp**2
+
+                        # Convex combination of isotropic and oriented energies
+                        filters_bank[J, l_idx] = low_pass_filter * torch.sqrt(
+                            alpha * isotropic_energy + (1.0 - alpha) * oriented_energy
                         )
 
                     # Deform bump steerable wavelet at first scale to Littlewood-Paley condition
