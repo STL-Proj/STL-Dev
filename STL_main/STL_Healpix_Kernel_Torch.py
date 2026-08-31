@@ -298,6 +298,29 @@ class STL_Healpix_Kernel_Torch(Base_DataClass):
         return data1
 
     ###########################################################################
+    def apply_bandlimit(self, array):
+        """
+        Project the map onto the multipoles the pixelisation can carry, by a
+        round trip through the spherical harmonic transform.
+
+        Only defined on the full sky: on a partial sky the transform would need
+        the mask deconvolution the spectrum operator does not do either, so the
+        array is returned untouched.
+        """
+        npix_full = 12 * self.N0[0] ** 2
+        if array.shape[-1] != npix_full:
+            return array
+
+        sht = _build_hpa_operator(
+            HEALPixSHT,
+            nside=self.N0[0],
+            level=int(round(math.log2(self.N0[0]))),
+            required={},
+            optional={"dtype": self.dtype, "device": self.device},
+        )
+        return sht.alm2map(sht.map2alm(array, nest=self.nest), nest=self.nest)
+
+    ###########################################################################
     def get_wavelet_op(
         self,
         J=None,

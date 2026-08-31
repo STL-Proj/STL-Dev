@@ -450,6 +450,8 @@ class ST_Operator:
             standardized,
             mean_pre_std,
             std_pre_std,
+            data_example=data.copy(empty=True),
+            pix_shape=tuple(data.array.shape[-len(N0) :]),
         )
 
         # Systematic statistics (data supposed to be real)

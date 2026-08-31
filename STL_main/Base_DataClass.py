@@ -145,6 +145,51 @@ class Base_DataClass(ABC):
         return new
 
     ###########################################################################
+    def new_like(self, array, **overrides):
+        """
+        Build a new instance carrying `array` on this object's geometry.
+
+        Everything that describes *where* the data live -- resolution, pixel
+        indices, boundary convention -- is inherited, and only the values are
+        replaced. This is what lets the DT-independent code (Synthesis in
+        particular) create companion fields without knowing which data type it
+        is dealing with.
+
+        Parameters
+        ----------
+        array : np.ndarray or torch.Tensor
+            Values of the new instance. Its trailing NDIM_PIX axes must describe
+            the same pixel grid as this object.
+        **overrides
+            Attributes to set on the new instance, e.g. pbc=False.
+
+        Returns
+        -------
+        instance of self.__class__
+        """
+        new = self.copy(empty=True)
+        new.array = new._to_array(array)
+        new.conv_history = []
+
+        for name, value in overrides.items():
+            setattr(new, name, value)
+
+        new.device = new.array.device
+        new.dtype = new.array.dtype
+        return new
+
+    ###########################################################################
+    def apply_bandlimit(self, array):
+        """
+        Remove from `array` the content below the pixel scale.
+
+        Used by the synthesis to start from a band-limited random field. The
+        default is a no-op; data types that can define a band limit (a Nyquist
+        radius in the plane, a maximum multipole on the sphere) override it.
+        """
+        return array
+
+    ###########################################################################
     # TODO: shall we return an instance of self.__class__ or a simple array? (attribute N0 would not be relevant then)
     def __getitem__(self, key):
         """
