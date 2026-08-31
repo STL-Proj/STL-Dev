@@ -10,6 +10,9 @@ unchanged:
   - data live on HEALPix pixels, the array is shaped (..., Npix)
   - convolutions and downsampling are performed with the `healpix-analyse`
     package (HealPixConv / HealPixDown)
+  - the power spectrum is the angular power spectrum C_ell, computed with the
+    differentiable spherical harmonic transform of the same package
+    (HEALPixSHT: map2alm / alm2map / anafast)
   - the statistics (mean, square_mean, cov, standardize, ...) live on the
     *wavelet operator*, not on the data class, exactly as in the planar kernel
 
@@ -22,16 +25,17 @@ Assumptions
 
 Status w.r.t. the planar kernel
 -------------------------------
-Implemented: data class, wavelet convolution, smoothing, downsampling, and the
-full statistics interface consumed by ST_Operator.
+Implemented: data class, wavelet convolution, smoothing, downsampling, the full
+statistics interface consumed by ST_Operator, and the angular cross-spectrum
+operator.
 Not implemented yet:
-  - get_CS_op(): on the sphere the power spectrum is anafast, not an FFT
-    binning; it is to be built on healpix_analyse.healpix_sht.HEALPixSHT.
-    Use ST_Operator(..., compute_PS=False) until it lands.
   - mask/NaN bookkeeping (mask_full_res): the planar kernel precomputes layer
     masks and reweighting maps; the spherical equivalent (mask erosion by the
     stencil support) is not written yet. `nan_aware_stats=True` gives a
     lightweight substitute based on nanmean.
+  - deconvolution of the mask-induced mode coupling in the partial-sky power
+    spectrum: CS_operator_Healpix_Torch returns a pseudo-C_ell, with no MASTER
+    matrix, exactly as the planar operator does not deconvolve its crop window.
 """
 
 import inspect
@@ -43,6 +47,7 @@ import numpy as np
 import torch
 from healpix_analyse.convol import HealPixConv
 from healpix_analyse.down import HealPixDown
+from healpix_analyse.healpix_sht import HEALPixSHT
 
 from STL_main.Base_DataClass import Base_DataClass
 from STL_main.ST_Operator import ST_Operator
@@ -54,6 +59,65 @@ from STL_main.torch_backend import (
     maskmean,
     nan,
 )
+
+
+###############################################################################
+def _build_hpa_operator(cls, nside, level, required, optional=None):
+    """
+    Build a healpix-analyse operator, adapting to the signature of the installed
+    release.
+
+    Across versions the resolution argument has been spelled `level`, `nside` or
+    `nside_in`, and some options only exist in some releases. `required` entries
+    must be present in the signature -- dropping one silently would change the
+    result -- while `optional` ones are skipped when the installed version does
+    not know them.
+
+    Parameters
+    ----------
+    cls : type
+        The healpix-analyse class to instantiate.
+    nside, level : int
+        The resolution, in both spellings (level = log2(nside)).
+    required : dict
+        Keyword arguments that must be accepted by the constructor.
+    optional : dict or None
+        Keyword arguments passed only when the constructor knows them.
+
+    Returns
+    -------
+    An instance of `cls`.
+    """
+    params = inspect.signature(cls.__init__).parameters
+
+    call = {}
+    if "nside" in params:
+        call["nside"] = int(nside)
+    elif "nside_in" in params:
+        call["nside_in"] = int(nside)
+    if "level" in params:
+        call["level"] = int(level)
+
+    if not call:
+        raise TypeError(
+            f"{cls.__name__} exposes none of the expected resolution arguments "
+            "('level', 'nside', 'nside_in'): this version of healpix-analyse is "
+            "not supported."
+        )
+
+    for name, value in required.items():
+        if name not in params:
+            raise TypeError(
+                f"{cls.__name__} has no '{name}' argument: this version of "
+                "healpix-analyse is not supported."
+            )
+        call[name] = value
+
+    for name, value in (optional or {}).items():
+        if name in params:
+            call[name] = value
+
+    return cls(**call)
 
 
 ###############################################################################
@@ -270,23 +334,26 @@ class STL_Healpix_Kernel_Torch(Base_DataClass):
     def get_ST_op(self, *args, **kwargs):
         """
         Build the scattering transform operator for this data type.
-
-        Note: compute_PS defaults to False here, because the spherical
-        cross-spectrum operator (anafast) is not implemented yet. Pass
-        compute_PS=True explicitly once get_CS_op is available.
         """
-        kwargs.setdefault("compute_PS", False)
         return ST_Operator(data_example=self, *args, **kwargs)
 
     ###########################################################################
     def get_CS_op(self, *args, **kwargs):
-        raise NotImplementedError(
-            "The HEALPix cross-spectrum operator is not implemented yet. On the "
-            "sphere the power spectrum is the angular power spectrum C_ell "
-            "(anafast), not an FFT ring binning: it is to be built on the "
-            "differentiable spherical harmonic transform of healpix-analyse "
-            "(healpix_analyse.healpix_sht.HEALPixSHT.anafast). In the "
-            "meantime, build the ST operator with compute_PS=False."
+        """
+        Build the angular cross-spectrum operator, analogous to
+        STL_2D_Kernel_Torch.get_CS_op.
+
+        On the sphere the power spectrum is the angular power spectrum C_ell,
+        computed with the spherical harmonic transform of healpix-analyse.
+        """
+        return CS_operator_Healpix_Torch(
+            nside=self.N0[0],
+            nest=self.nest,
+            cell_ids=self.cell_ids,
+            device=self.device,
+            dtype=self.dtype,
+            *args,
+            **kwargs,
         )
 
 
@@ -522,49 +589,6 @@ class WaveletOperatorHealpixKernel_torch:
         cid_np = None if full_sky else cid.detach().cpu().numpy().astype(np.int64)
         return nside, level, cid_np
 
-    @staticmethod
-    def _instantiate(cls, nside, level, required, optional=None):
-        """
-        Build a healpix-analyse operator, adapting to the signature of the
-        installed release.
-
-        Across versions, the resolution argument has been spelled `level`,
-        `nside` or `nside_in`, and some options only exist in some releases.
-        `required` entries must be present in the signature -- dropping one
-        silently would change the result -- while `optional` ones are skipped
-        when the installed version does not know them.
-        """
-        params = inspect.signature(cls.__init__).parameters
-
-        call = {}
-        if "nside" in params:
-            call["nside"] = int(nside)
-        elif "nside_in" in params:
-            call["nside_in"] = int(nside)
-        if "level" in params:
-            call["level"] = int(level)
-
-        if not call:
-            raise TypeError(
-                f"{cls.__name__} exposes none of the expected resolution "
-                "arguments ('level', 'nside', 'nside_in'): this version of "
-                "healpix-analyse is not supported."
-            )
-
-        for name, value in required.items():
-            if name not in params:
-                raise TypeError(
-                    f"{cls.__name__} has no '{name}' argument: this version of "
-                    "healpix-analyse is not supported."
-                )
-            call[name] = value
-
-        for name, value in (optional or {}).items():
-            if name in params:
-                call[name] = value
-
-        return cls(**call)
-
     def _get_conv(self, dg, cell_ids, n_gauges, weights):
         """
         Return a cached HealPixConv for this resolution / grid / gauge count,
@@ -585,7 +609,7 @@ class WaveletOperatorHealpixKernel_torch:
         conv = self._conv_cache.get(key, None)
         if conv is None:
             nside, level, cid_np = self._grid_spec(dg, cid_t)
-            conv = self._instantiate(
+            conv = _build_hpa_operator(
                 HealPixConv,
                 nside=nside,
                 level=level,
@@ -617,7 +641,7 @@ class WaveletOperatorHealpixKernel_torch:
         down = self._down_cache.get(key, None)
         if down is None:
             nside, level, cid_np = self._grid_spec(dg, cid_t)
-            down = self._instantiate(
+            down = _build_hpa_operator(
                 HealPixDown,
                 nside=nside,
                 level=level,
@@ -1162,6 +1186,516 @@ class WaveletOperatorHealpixKernel_torch:
                             specific_channel_pair=(c2, c1),
                         )
         return
+
+
+###############################################################################
+###############################################################################
+class CS_operator_Healpix_Torch:
+    """
+    Angular cross-spectrum operator for HEALPix data.
+
+    Spherical counterpart of CS_operator_2D_Kernel_Torch: same public contract
+    (`n_bins`, `bin_centers`, `apply(...) -> [Nb, Nc, Nc, n_bins]`,
+    `plot_cross_spectrum`), but the estimator is the angular power spectrum
+    C_ell rather than an FFT ring binning.
+
+    Everything rests on `healpix_analyse.healpix_sht.HEALPixSHT`, whose
+    `map2alm`, `alm2map` and `anafast` are differentiable, so the spectrum can
+    be used inside a synthesis loss.
+
+    Binning
+    -------
+    The C_ell are averaged in `n_bins` logarithmically spaced multipole bins,
+    each weighted by (2l+1) times a window W_b(l):
+
+        C_b = sum_l (2l+1) W_b(l) C_l  /  sum_l (2l+1) W_b(l)
+
+    With `power_spectrum_method="gaussian_rings"` the window is a Gaussian in
+    log(l), which mirrors the planar `_build_log_gaussian_bin_masks`; with
+    `"tophat"` it is a plain indicator over the bin.
+
+    Estimators
+    ----------
+    Full sky (`data.pbc` True) -- the C_ell come straight from the harmonic
+    coefficients, then are binned. Two equivalent routes are available:
+
+    * ``cross_spectrum_method="alm"`` (default) computes `map2alm` once per
+      channel and forms every requested pair from those coefficients: Nc
+      transforms instead of Nc^2;
+    * ``cross_spectrum_method="anafast"`` calls `HEALPixSHT.anafast(im, map2=)`
+      for each requested pair. Slower, kept as the reference route.
+
+    Partial sky (`data.pbc` False, or `use_band_maps=True`) -- the map is
+    zero-padded outside `cell_ids`, band-filtered with `alm2map`, and the
+    cross-spectrum is estimated in pixel space over the observed pixels only:
+
+        C_b = 4 pi * < f_b . g >_observed  /  sum_l (2l+1) W_b(l)
+
+    which reduces exactly to the full-sky expression when every pixel is
+    observed. This is a pseudo-C_ell estimator: the mode coupling induced by
+    the mask is *not* deconvolved (no MASTER matrix), exactly as the planar
+    operator does not deconvolve its crop window.
+
+    Parameters
+    ----------
+    nside : int
+        HEALPix resolution of the data at dg = 0.
+    n_bins : int or None
+        Number of multipole bins. Defaults to roughly three bins per octave.
+    J, Jmin : int or None
+        Kept for signature parity with the planar operator. `Jmin` sets the
+        lowest multipole kept, l_min = 2**Jmin; `J` is accepted and ignored
+        (on the sphere l_max is set by the resolution).
+    lmax : int or None
+        Highest multipole. Defaults to the transform's own l_max (3*nside-1).
+    nest : bool
+        NESTED pixel indexing.
+    cell_ids : array-like or None
+        Pixel indices of the data. None means full sky.
+    power_spectrum_method : {"gaussian_rings", "tophat"}
+        Shape of the bin windows.
+    cross_spectrum_method : {"alm", "anafast"}
+        Route used for the full-sky estimator.
+    device, dtype : torch device / dtype
+    ellipsoid : str
+        Passed through to HEALPixSHT when that version accepts it.
+    """
+
+    ###########################################################################
+    def __init__(
+        self,
+        nside,
+        n_bins=None,
+        J=None,
+        Jmin=0,
+        lmax=None,
+        nest=True,
+        cell_ids=None,
+        power_spectrum_method="gaussian_rings",
+        cross_spectrum_method="alm",
+        device=_DEFAULT_DEVICE,
+        dtype=_DEFAULT_DTYPE,
+        ellipsoid="sphere",
+    ):
+        self.nside = int(nside)
+        self.level = int(round(math.log2(self.nside)))
+        if 2**self.level != self.nside:
+            raise ValueError(f"nside={nside} is not a power of 2.")
+
+        self.nest = bool(nest)
+        self.ellipsoid = ellipsoid
+        self.device = _get_device(torch.device(device))
+        self.dtype = _get_dtype(dtype=dtype, device=self.device)
+
+        self.J = J  # accepted for parity with the planar operator, unused
+        self.Jmin = int(Jmin)
+
+        self.power_spectrum_method = str(power_spectrum_method).lower().strip()
+        if self.power_spectrum_method not in {"gaussian_rings", "tophat"}:
+            raise ValueError(
+                "power_spectrum_method must be either 'gaussian_rings' or 'tophat'"
+            )
+        self.cross_spectrum_method = str(cross_spectrum_method).lower().strip()
+        if self.cross_spectrum_method not in {"alm", "anafast"}:
+            raise ValueError("cross_spectrum_method must be either 'alm' or 'anafast'")
+
+        self._cell_ids = (
+            None
+            if cell_ids is None
+            else torch.as_tensor(cell_ids).view(-1).to(torch.long)
+        )
+
+        # --- spherical harmonic transform (cached, geometry is expensive) ---
+        self._sht = None
+        self._requested_lmax = None if lmax is None else int(lmax)
+        sht = self._get_sht()
+        self.lmax = int(getattr(sht, "lmax"))
+
+        # --- multipole binning ---
+        self.ell = torch.arange(self.lmax + 1, device=self.device, dtype=self.dtype)
+        self.n_bins = n_bins
+        self._build_bin_windows()
+
+        # --- flat (l, m) bookkeeping used to form the cross-spectra ---
+        self._build_alm_index()
+
+    ###########################################################################
+    def _get_sht(self):
+        """Return the cached HEALPixSHT, building it on first use."""
+        if self._sht is None:
+            required = {}
+            optional = {"dtype": self.dtype, "device": self.device}
+            if self._requested_lmax is not None:
+                optional["lmax"] = self._requested_lmax
+            optional["ellipsoid"] = self.ellipsoid
+            self._sht = _build_hpa_operator(
+                HEALPixSHT,
+                nside=self.nside,
+                level=self.level,
+                required=required,
+                optional=optional,
+            )
+        return self._sht
+
+    ###########################################################################
+    def _build_bin_windows(self):
+        """
+        Build the [n_bins, lmax+1] window matrix and its (2l+1) weighting.
+        """
+        l_min = max(1.0, float(2**self.Jmin))
+        l_max = float(self.lmax)
+        if l_max <= l_min:
+            raise ValueError(
+                f"lmax={self.lmax} is too small for Jmin={self.Jmin}: no bin left."
+            )
+
+        if self.n_bins is None:
+            # about three bins per octave, the density the planar operator uses
+            self.n_bins = max(4, int(round(3 * math.log2(l_max / l_min))))
+        self.n_bins = int(self.n_bins)
+
+        log_edges = torch.linspace(
+            math.log(l_min),
+            math.log(l_max),
+            self.n_bins + 1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.bin_edges = torch.exp(log_edges)
+        log_centers = 0.5 * (log_edges[:-1] + log_edges[1:])
+        self.bin_centers = torch.exp(log_centers)
+
+        ell = self.ell
+        safe_ell = torch.where(ell > 0, ell, torch.ones_like(ell))
+        log_ell = torch.log(safe_ell)
+
+        if self.power_spectrum_method == "gaussian_rings":
+            log_sigma = (log_edges[1:] - log_edges[:-1]).abs()
+            log_sigma = torch.where(
+                log_sigma > 0, log_sigma, torch.ones_like(log_sigma)
+            )
+            windows = torch.exp(
+                -0.5
+                * (log_ell[None, :] - log_centers[:, None]) ** 2
+                / log_sigma[:, None] ** 2
+            )
+        else:  # tophat
+            lo = self.bin_edges[:-1][:, None]
+            hi = self.bin_edges[1:][:, None]
+            windows = ((ell[None, :] >= lo) & (ell[None, :] < hi)).to(self.dtype)
+            # the last bin is closed so that l = lmax is never dropped
+            windows[-1] = torch.where(
+                ell >= lo[-1, 0], torch.ones_like(ell), windows[-1]
+            )
+
+        # the monopole carries no information and l < l_min is excluded
+        windows = torch.where(
+            (ell >= l_min)[None, :], windows, torch.zeros_like(windows)
+        )
+
+        self.bin_windows = windows  # [n_bins, lmax+1]
+        self.bin_weights = windows * (2.0 * ell + 1.0)[None, :]
+        self.bin_norm = self.bin_weights.sum(dim=-1)  # [n_bins]
+
+        if bool((self.bin_norm <= 0).any()):
+            raise ValueError(
+                "Some multipole bins are empty; reduce n_bins or lower Jmin."
+            )
+
+    ###########################################################################
+    def _build_alm_index(self):
+        """
+        Map the flat a_lm layout of HEALPixSHT onto multipoles.
+
+        The layout is [m=0: l=0..lmax | m=1: l=1..lmax | ... | m=lmax], so the
+        multipole of every flat entry and the m>0 doubling factor are built
+        once and reused at every call.
+        """
+        lmax = self.lmax
+        ell_of_k, weight_of_k = [], []
+        for m in range(lmax + 1):
+            ell_of_k.append(np.arange(m, lmax + 1, dtype=np.int64))
+            weight_of_k.append(np.full(lmax + 1 - m, 1.0 if m == 0 else 2.0))
+
+        self._ell_of_k = torch.as_tensor(
+            np.concatenate(ell_of_k), device=self.device, dtype=torch.long
+        )
+        self._weight_of_k = torch.as_tensor(
+            np.concatenate(weight_of_k), device=self.device, dtype=self.dtype
+        )
+        self._n_alm = int(self._ell_of_k.numel())
+
+    ###########################################################################
+    def _cross_cl(self, alm1, alm2):
+        """
+        Angular cross-spectrum of two sets of harmonic coefficients.
+
+        C_l = 1/(2l+1) * Re[ a_l0^1 conj(a_l0^2)
+                             + 2 sum_{m>0} a_lm^1 conj(a_lm^2) ]
+
+        which is the estimator HEALPixSHT.anafast implements for the auto case.
+
+        Parameters
+        ----------
+        alm1, alm2 : torch.Tensor
+            Complex coefficients of shape (..., K).
+
+        Returns
+        -------
+        torch.Tensor
+            Real C_l of shape (..., lmax+1).
+        """
+        contrib = (alm1 * alm2.conj()).real * self._weight_of_k
+
+        shape = contrib.shape[:-1] + (self.lmax + 1,)
+        cl = torch.zeros(shape, device=contrib.device, dtype=contrib.dtype)
+        cl = cl.index_add(-1, self._ell_of_k, contrib)
+
+        return cl / (2.0 * self.ell + 1.0)
+
+    ###########################################################################
+    def _bin_cl(self, cl):
+        """Bin C_l into the n_bins multipole bands. (..., lmax+1) -> (..., n_bins)."""
+        weights = self.bin_weights.to(dtype=cl.dtype)
+        return torch.einsum("...l,bl->...b", cl, weights) / self.bin_norm.to(
+            dtype=cl.dtype
+        )
+
+    ###########################################################################
+    def _to_full_sky(self, x, cell_ids):
+        """
+        Scatter partial-sky data onto the full HEALPix grid, zero elsewhere.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            (..., Npix_observed)
+        cell_ids : torch.LongTensor or None
+
+        Returns
+        -------
+        torch.Tensor
+            (..., 12*nside**2)
+        """
+        npix_full = 12 * self.nside**2
+        if cell_ids is None or (
+            x.shape[-1] == npix_full
+            and bool((cell_ids.cpu() == torch.arange(npix_full)).all())
+        ):
+            return x
+
+        full = torch.zeros(x.shape[:-1] + (npix_full,), device=x.device, dtype=x.dtype)
+        return full.index_copy(-1, cell_ids.to(x.device), x)
+
+    ###########################################################################
+    def apply(
+        self,
+        data,
+        compute_cross_spectrum_matrix=None,
+        cross_spectrum_method=None,
+        use_band_maps=None,
+        **kwargs,
+    ):
+        """
+        Compute the binned angular cross-spectrum of the data.
+
+        Parameters
+        ----------
+        data : STL_Healpix_Kernel_Torch
+            Input data at dg = 0.
+        compute_cross_spectrum_matrix : torch.BoolTensor of shape [Nc, Nc]
+            Which channel pairs to compute. None means auto-spectra only.
+        cross_spectrum_method : {"alm", "anafast"} or None
+            Overrides the operator default for this call.
+        use_band_maps : bool or None
+            Force (True) or forbid (False) the pixel-space band-filtered
+            estimator. None picks it automatically for a partial sky.
+
+        Returns
+        -------
+        torch.Tensor
+            Cross-spectra of shape [Nb, Nc, Nc, n_bins]. Entries that were not
+            requested are NaN, as in the planar operator.
+        """
+        if type(data).__name__ != "STL_Healpix_Kernel_Torch":
+            raise Exception(
+                f"Data should be a STL_Healpix_Kernel_Torch instance, got {type(data)}"
+            )
+        if tuple(data.N0) != (self.nside,):
+            raise Exception(
+                f"Data resolution {tuple(data.N0)} does not match operator "
+                f"nside {self.nside}."
+            )
+        if data.dg != 0:
+            raise Exception("Data dg must be 0 for power spectrum computation")
+        if data.nest != self.nest:
+            raise Exception("Data and operator must share the same pixel ordering")
+        if bool(data.array.isnan().any()):
+            raise ValueError(
+                "Data array contains NaN values; the angular power spectrum "
+                "cannot be computed on them. Mask them out through cell_ids "
+                "instead."
+            )
+
+        method = (
+            self.cross_spectrum_method
+            if cross_spectrum_method is None
+            else str(cross_spectrum_method).lower().strip()
+        )
+
+        # --- put the data in the expected (Nb, Nc, Npix) shape ---
+        x = data.array
+        if x.ndim == 1:
+            x = x[None, None, :]
+        elif x.ndim == 2:
+            x = x[None, :, :]
+        elif x.ndim != 3:
+            raise ValueError(f"Expected data of dimension 1, 2 or 3, got {x.ndim}.")
+        Nb, Nc, _ = x.shape
+
+        if compute_cross_spectrum_matrix is None:
+            compute_cross_spectrum_matrix = torch.eye(
+                Nc, dtype=torch.bool, device=x.device
+            )
+        else:
+            compute_cross_spectrum_matrix = compute_cross_spectrum_matrix.to(
+                device=x.device
+            )
+
+        full_sky = bool(data.pbc)
+        if use_band_maps is None:
+            use_band_maps = not full_sky
+
+        maps_full = self._to_full_sky(x.to(dtype=self.dtype), data.cell_ids)
+
+        out = torch.full(
+            (Nb, Nc, Nc, self.n_bins),
+            float("nan"),
+            device=x.device,
+            dtype=torch.promote_types(self.dtype, torch.complex64),
+        )
+
+        pairs = [
+            (c1, c2)
+            for c1 in range(Nc)
+            for c2 in range(c1, Nc)
+            if bool(compute_cross_spectrum_matrix[c1, c2])
+        ]
+        if not pairs:
+            return out
+
+        if use_band_maps:
+            values = self._apply_band_maps(maps_full, data, pairs)
+        elif method == "anafast":
+            values = self._apply_anafast(maps_full, pairs)
+        else:
+            values = self._apply_alm(maps_full, pairs)
+
+        for (c1, c2), cs in zip(pairs, values):
+            # C_l is real and symmetric in the two channels
+            out[:, c1, c2, :] = cs.to(dtype=out.dtype)
+
+        return out  # [Nb, Nc, Nc, n_bins]
+
+    ###########################################################################
+    def _apply_alm(self, maps_full, pairs):
+        """Full-sky estimator: one map2alm per channel, then every pair."""
+        sht = self._get_sht()
+        alm = sht.map2alm(maps_full, nest=self.nest)  # (Nb, Nc, K)
+
+        return [
+            self._bin_cl(self._cross_cl(alm[:, c1], alm[:, c2])) for c1, c2 in pairs
+        ]
+
+    ###########################################################################
+    def _apply_anafast(self, maps_full, pairs):
+        """Full-sky estimator going through HEALPixSHT.anafast pair by pair."""
+        sht = self._get_sht()
+
+        values = []
+        for c1, c2 in pairs:
+            if c1 == c2:
+                cl = sht.anafast(maps_full[:, c1], nest=self.nest)
+            else:
+                cl = sht.anafast(
+                    maps_full[:, c1], map2=maps_full[:, c2], nest=self.nest
+                )
+            values.append(self._bin_cl(cl))
+        return values
+
+    ###########################################################################
+    def _apply_band_maps(self, maps_full, data, pairs):
+        """
+        Partial-sky estimator: band-filter with alm2map, then take the
+        cross-covariance over the observed pixels.
+
+            C_b = 4 pi * < f_b . g >_observed / sum_l (2l+1) W_b(l)
+
+        `alm2map` is called once for every (batch, channel, bin), in a single
+        batched call, because its cost is dominated by the transform setup
+        rather than by the batch size.
+        """
+        sht = self._get_sht()
+        alm = sht.map2alm(maps_full, nest=self.nest)  # (Nb, Nc, K)
+        Nb, Nc, K = alm.shape
+
+        # window every set of coefficients by W_b(l): (Nb, Nc, n_bins, K)
+        window_k = self.bin_windows[:, self._ell_of_k]  # (n_bins, K)
+        alm_binned = alm[:, :, None, :] * window_k[None, None, :, :].to(alm.dtype)
+
+        band = sht.alm2map(
+            alm_binned.reshape(Nb * Nc * self.n_bins, K), nest=self.nest
+        ).reshape(Nb, Nc, self.n_bins, -1)
+
+        # restrict to the observed pixels
+        cell_ids = data.cell_ids.to(band.device)
+        observed = maps_full.index_select(-1, cell_ids)  # (Nb, Nc, Npix_obs)
+        band = band.index_select(-1, cell_ids)  # (Nb, Nc, n_bins, Npix_obs)
+
+        prefactor = 4.0 * math.pi / self.bin_norm  # (n_bins,)
+
+        values = []
+        for c1, c2 in pairs:
+            cs = (band[:, c1] * observed[:, c2][:, None, :]).mean(dim=-1)
+            values.append(cs * prefactor)
+        return values
+
+    ###########################################################################
+    def plot_cross_spectrum(self, cs_tensor, b=0, c1=0, c2=0, label=None, color="b"):
+        """
+        Plot a binned angular cross-spectrum.
+
+        Parameters
+        ----------
+        cs_tensor : torch.Tensor of shape [Nb, Nc, Nc, n_bins]
+            Cross-spectra as returned by `apply`.
+        b : int
+            Batch index.
+        c1, c2 : int
+            Channel indices.
+        label, color : passed through to matplotlib.
+        """
+        import matplotlib.pyplot as plt
+
+        cs_values = cs_tensor[b, c1, c2, :].real.detach().cpu().numpy()
+        ell = self.bin_centers.detach().cpu().numpy()
+
+        if cs_values.shape != ell.shape:
+            raise ValueError(
+                f"cs values shape {cs_values.shape} and bin_centers shape "
+                f"{ell.shape} must match."
+            )
+
+        plt.plot(ell, cs_values, "-", marker="o", label=label, color=color)
+
+        plt.xscale("log")
+        plt.yscale("log")
+        plt.xlabel(r"multipole $\ell$")
+        plt.ylabel(r"$C_\ell$")
+        plt.title(f"Angular cross spectrum c{c1 + 1}-c{c2 + 1} for map {b + 1}")
+        plt.grid(True, which="both", ls="-", alpha=0.5)
+        if label is not None:
+            plt.legend()
 
 
 ###############################################################################
