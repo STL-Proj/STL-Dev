@@ -32,13 +32,19 @@ class Base_DataClass(ABC):
     # Common class constant(s) (shall be defined in child classes)
     DT: ClassVar[str]
 
+    # Number of trailing axes of `array` describing the pixel grid.
+    # 2 for planar maps (..., Nx, Ny), 1 for HEALPix maps (..., Npix), 1 for 1D data.
+    # It is used to make all the DT-independent code (ST_Operator, ST_Statistics,
+    # Synthesis) agnostic to the geometry of the data.
+    NDIM_PIX: ClassVar[int] = 2
+
     # Common instance attributes
     array: (
         torch.Tensor
     )  # Other types will be converted to torch.Tensor in __post_init__ if possible
     pbc: Optional[bool] = None
     dg: Optional[int] = None
-    N0: Optional[tuple[int, int]] = None
+    N0: Optional[tuple[int, ...]] = None
     conv_history: list[int] = field(default_factory=list)  # empty list by default
     device: torch.device = field(init=False)
     dtype: torch.dtype = field(init=False)
@@ -52,13 +58,33 @@ class Base_DataClass(ABC):
 
         if self.dg is None:
             self.dg = 0
-            self.N0 = self.array.shape[-2:]
 
-        if self.dg is not None and self.N0 is None:
-            raise ValueError("dg is given, N0 should not be None")
+        if self.N0 is None:
+            if self.dg != 0:
+                raise ValueError("dg is given, N0 should not be None")
+            self.N0 = self._infer_N0(self.array)
 
         self.device = self.array.device
         self.dtype = self.array.dtype
+
+    ###########################################################################
+    @classmethod
+    def _infer_N0(cls, array):
+        """
+        Infer the initial resolution descriptor N0 from the stored array.
+
+        The default implementation returns the NDIM_PIX trailing axes, which is
+        the right answer whenever the pixel axes *are* the resolution (planar
+        maps). Child classes whose resolution is not the array shape (HEALPix,
+        where the resolution is nside and not Npix) must override this.
+
+        Returns
+        -------
+        tuple of int
+            Resolution descriptor. len(N0) is always NDIM_PIX, so that
+            DT-independent code can use it to recognize the pixel axes.
+        """
+        return tuple(int(s) for s in array.shape[-cls.NDIM_PIX :])
 
     ###########################################################################
     @staticmethod

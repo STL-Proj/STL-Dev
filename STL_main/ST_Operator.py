@@ -120,6 +120,7 @@ class ST_Operator:
         WType=None,
         downsample_nan_weight_threshold=None,
         get_crop_border_size_method=None,
+        wavelet_op_kwargs=None,
         # Optional power spectrum args
         n_bins=None,
         power_spectrum_method=None,
@@ -132,7 +133,9 @@ class ST_Operator:
         self.DT = data_example.DT
 
         # Wavelet transform and related parameters
-        wavelet_op_kwargs = {}
+        # `wavelet_op_kwargs` lets a data type receive DT-specific options
+        # (e.g. nan_aware_stats for HEALPix) without adding them here.
+        wavelet_op_kwargs = dict(wavelet_op_kwargs or {})
         if WType is not None:
             wavelet_op_kwargs["WType"] = WType
         if mask_full_res is not None:
@@ -189,8 +192,15 @@ class ST_Operator:
             cross_spectrum_op_kwargs["power_spectrum_method"] = power_spectrum_method
         if Jmin is not None:
             cross_spectrum_op_kwargs["Jmin"] = Jmin
-        self.CS_op = data_example.get_CS_op(**cross_spectrum_op_kwargs)
-        self.n_bins = self.CS_op.n_bins
+        if self.compute_PS:
+            self.CS_op = data_example.get_CS_op(**cross_spectrum_op_kwargs)
+            self.n_bins = self.CS_op.n_bins
+        else:
+            # No cross-spectrum operator is built when the power spectrum is not
+            # requested, so that a data type which does not (yet) provide one can
+            # still be used for the scattering statistics alone.
+            self.CS_op = None
+            self.n_bins = None
         self.PS_ref_sqrt_chan_diag = PS_ref_sqrt_chan_diag
 
     ########################################
@@ -381,6 +391,12 @@ class ST_Operator:
         mask_st = self.mask_st if mask_st is None else mask_st
 
         compute_PS = self.compute_PS if compute_PS is None else compute_PS
+        if compute_PS and self.CS_op is None:
+            raise Exception(
+                "compute_PS=True but no cross-spectrum operator was built. "
+                "Rebuild the ST_Operator with compute_PS=True, or make sure the "
+                f"data class '{self.DT}' implements get_CS_op()."
+            )
         PS_ref_sqrt_chan_diag = (
             self.PS_ref_sqrt_chan_diag
             if PS_ref_sqrt_chan_diag is None
@@ -520,7 +536,7 @@ class ST_Operator:
             data_st.S1[
                 :, channels_with_auto_stats, channels_with_auto_stats, j3, :
             ] = self.wavelet_op.mean(
-                data_l1m[j3][:, channels_with_auto_stats, :, :, :],
+                data_l1m[j3][:, channels_with_auto_stats],
             ).to(
                 dtype=data_st.S1.dtype  # cast to complex if needed
             )  # (Nb,Nc,Nc,L3)
@@ -551,7 +567,7 @@ class ST_Operator:
             data_st.S2[
                 :, channels_with_auto_stats, channels_with_auto_stats, j3, :
             ] = self.wavelet_op.square_mean(
-                data_l1m[j3][:, channels_with_auto_stats, :, :, :]
+                data_l1m[j3][:, channels_with_auto_stats]
             ).to(
                 dtype=data_st.S2.dtype  # cast to complex if needed
             )  # (Nb,Nc,Nc,L3)
@@ -592,9 +608,7 @@ class ST_Operator:
                 if not has_fewer_convolutions:
                     self.wavelet_op._compute_and_store_cross_cov(
                         data_l1m_l2_j2,
-                        data_l1[
-                            :, :, None, :, :, :
-                        ],  # (Nb,Nc,L2,L3,N3) x (Nb,Nc,1,L3,N3)
+                        data_l1[:, :, None],  # (Nb,Nc,L2,L3,N3) x (Nb,Nc,1,L3,N3)
                         output=data_st.S3[:, :, :, j2, j3, :, :],
                         compute_cross_matrix=compute_cross_matrix,
                         redundant_channels=False,
@@ -603,7 +617,7 @@ class ST_Operator:
                 else:
                     # Sihao S3 version : S3(j1,j2,j3) = Cov(I, |I*psi2|*psi3)
                     self.wavelet_op._compute_and_store_cross_cov(
-                        l_data[:, :, None, None, :, :],  # [Nb,Nc,1,1,N3]
+                        l_data[:, :, None, None],  # [Nb,Nc,1,1,N3]
                         data_l1m_l2_j2,  # [Nb,Nc,L2,L3,N3]
                         output=data_st.S3[:, :, :, j2, j3, :, :],
                         compute_cross_matrix=compute_cross_matrix,
@@ -618,8 +632,8 @@ class ST_Operator:
                     ##############################################################################
                     if not has_fewer_convolutions:
                         self.wavelet_op._compute_and_store_cross_cov(
-                            data_l1m_l2[j1][:, :, :, None, :, :],  # (Nb,Nc,L1,1,L3,N3)
-                            data_l1m_l2[j2][:, :, None, :, :, :],  # (Nb,Nc,1,L2,L3,N3)
+                            data_l1m_l2[j1][:, :, :, None],  # (Nb,Nc,L1,1,L3,N3)
+                            data_l1m_l2[j2][:, :, None],  # (Nb,Nc,1,L2,L3,N3)
                             output=data_st.S4[
                                 :, :, :, j1, j2, j3, :, :, :
                             ],  # (Nb,Nc,Nc,L1,L2,L3)
@@ -630,12 +644,8 @@ class ST_Operator:
                     else:
                         # Sihao S4 version : S4(j1,j2,j3) = Cov(|I*psi1|, |I*psi2|*psi3)
                         self.wavelet_op._compute_and_store_cross_cov(
-                            data_l1m[j1][
-                                :, :, :, None, None, :, :
-                            ],  # [Nb,Nc,L1,1,1,N3]
-                            data_l1m_l2[j2][
-                                :, :, None, :, :, :, :
-                            ],  # [Nb,Nc,1,L2,L3,N3]
+                            data_l1m[j1][:, :, :, None, None],  # [Nb,Nc,L1,1,1,N3]
+                            data_l1m_l2[j2][:, :, None],  # [Nb,Nc,1,L2,L3,N3]
                             output=data_st.S4[:, :, :, j1, j2, j3, :, :, :],
                             compute_cross_matrix=compute_cross_matrix,
                             redundant_channels=False,
