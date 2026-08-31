@@ -28,11 +28,12 @@ Status w.r.t. the planar kernel
 Implemented: data class, wavelet convolution, smoothing, downsampling, the full
 statistics interface consumed by ST_Operator, and the angular cross-spectrum
 operator.
+Masked data are supported: passing `mask_full_res` (or simply feeding a map
+with NaNs) precomputes the invalid-pixel mask of every (layer, resolution) the
+chain visits, together with the reweighting maps that keep the decimation
+amplitude-correct. `nan_aware_stats=True` remains as a lighter, mask-free
+substitute based on nanmean.
 Not implemented yet:
-  - mask/NaN bookkeeping (mask_full_res): the planar kernel precomputes layer
-    masks and reweighting maps; the spherical equivalent (mask erosion by the
-    stencil support) is not written yet. `nan_aware_stats=True` gives a
-    lightweight substitute based on nanmean.
   - deconvolution of the mask-induced mode coupling in the partial-sky power
     spectrum: CS_operator_Healpix_Torch returns a pseudo-C_ell, with no MASTER
     matrix, exactly as the planar operator does not deconvolve its crop window.
@@ -312,8 +313,28 @@ class STL_Healpix_Kernel_Torch(Base_DataClass):
 
         The default number of scales stops at nside = 4, mirroring the planar
         convention which stops well before the map becomes a handful of pixels.
+
+        When the data carry NaNs and no mask is given, the mask is built from
+        them, exactly as the planar kernel does. Pass `mask_full_res=False` to
+        opt out of that inference and keep an unmasked operator.
         """
         J = J if J is not None else max(1, int(np.log2(self.N0[0])) - 1)
+
+        if mask_full_res is False:
+            mask_full_res = None
+        elif mask_full_res is None and bool(torch.any(self.array.isnan())):
+            if self.array.ndim != 1:
+                raise NotImplementedError(
+                    "The NaN mask can only be inferred from a single map; pass "
+                    "mask_full_res explicitly for batched or multi-channel data."
+                )
+            mask_full_res = STL_Healpix_Kernel_Torch(
+                array=self.array.isnan(),
+                nside=self.N0[0],
+                cell_ids=self.cell_ids,
+                nest=self.nest,
+                pbc=self.pbc,
+            )
 
         return WaveletOperatorHealpixKernel_torch(
             J=J,
@@ -466,19 +487,10 @@ class WaveletOperatorHealpixKernel_torch:
         self.j_to_dg = range(self.J)
 
         # --- NaNs / masks handling ---
-        # Kept for interface parity with the planar kernel. The spherical
-        # equivalent of the layer masks and reweighting maps is not written yet.
         self.mask_full_res = mask_full_res
-        if self.mask_full_res is not None:
-            raise NotImplementedError(
-                "mask_full_res is not supported yet by the HEALPix kernel. The "
-                "spherical counterpart of the planar layer masks (erosion of the "
-                "validity mask by the stencil support) still has to be written. "
-                "Use nan_aware_stats=True for a lightweight nanmean-based "
-                "substitute."
-            )
         self.downsample_nan_weight_threshold = downsample_nan_weight_threshold
         self.nan_aware_stats = bool(nan_aware_stats)
+        self._build_masks(cell_ids)
 
         # No border to crop on the sphere: kept so that the planar and spherical
         # operators expose the same attribute.
@@ -970,10 +982,13 @@ class WaveletOperatorHealpixKernel_torch:
         if dg_out == data.dg:
             return data if inplace else data.copy(empty=False)
 
-        if nan_aware is None:
-            nan_aware = (self.mask_full_res is not None) or self.nan_aware_stats
-
         data = data if inplace else data.copy(empty=False)
+
+        if self.mask_full_res is not None:
+            return self._downsample_masked(data, dg_out, replace_nan_value, smooth)
+
+        if nan_aware is None:
+            nan_aware = self.nan_aware_stats
 
         if smooth:
             while data.dg < dg_out:
@@ -996,6 +1011,54 @@ class WaveletOperatorHealpixKernel_torch:
         return data
 
     ###########################################################################
+    def _downsample_masked(self, data, dg_out, replace_nan_value, smooth):
+        """
+        Decimation driven by the precomputed masks, mirroring the planar kernel.
+
+        The invalid pixels are zeroed, the map is taken down one level at a
+        time, and each step is rescaled by the reweighting map so that the
+        remaining valid pixels keep their amplitude. Pixels that become invalid
+        are finally set to `replace_nan_value`.
+        """
+        layer = len(data.conv_history)
+        if layer == 0:
+            convolved_at = None
+        elif layer == 1:
+            convolved_at = int(data.conv_history[0])
+        else:
+            raise ValueError("data must be at layer 0 or 1 to be downsampled.")
+
+        if not smooth:
+            raise NotImplementedError(
+                "The masked decimation follows the anti-aliased path; "
+                "smooth=False is not supported when a mask is declared."
+            )
+
+        input_mask = self._find_mask(data)
+        data.array = torch.where(~input_mask, data.array, torch.zeros_like(data.array))
+
+        while data.dg < dg_out:
+            data = self._down_one_level(data, nan_aware=False)
+            reweight = (
+                self._reweight_smooth[data.dg]
+                if convolved_at is None
+                else self._reweight_wav[(data.dg, convolved_at)]
+            )
+            data.array = data.array * reweight.to(dtype=data.array.real.dtype)
+
+        if replace_nan_value is not None:
+            # WARNING: as in the planar kernel, writing a finite value here
+            # would let the invalid pixels contribute to the backward pass.
+            output_mask = self._find_mask(data)
+            data.array = torch.where(
+                ~output_mask,
+                data.array,
+                torch.full_like(data.array, replace_nan_value),
+            )
+
+        return data
+
+    ###########################################################################
     def nandownsample(self, data, dg_out, inplace=True, smooth=True):
         """
         NaN-aware downsampling. Kept for backward compatibility: this is
@@ -1011,17 +1074,196 @@ class WaveletOperatorHealpixKernel_torch:
         )
 
     ###########################################################################
+    #                     MASKS AND REWEIGHTING (NaN handling)                #
+    ###########################################################################
+    def _build_masks(self, cell_ids):
+        """
+        Precompute, once per operator, the invalid-pixel mask of every
+        (layer, resolution) the scattering chain will visit, together with the
+        reweighting maps that compensate the missing pixels when decimating.
+
+        This is the spherical counterpart of the planar
+        `_build_reweighting_maps_and_scattering_layer_masks`. Two things differ:
+
+        * there is no padding mode to enumerate -- the geometry is fixed by
+          `cell_ids`, so a single set of maps is enough;
+        * "convolving with the wavelet support" becomes a convolution with a
+          kernel of ones over the stencil, taken over all L gauges, so the mask
+          is eroded by the exact union of the supports actually used.
+
+        Layers follow the planar convention, indexed by len(conv_history):
+
+        * layer 0 -- the data themselves, possibly decimated;
+        * layer 1 -- |I * psi_j|, at resolution dg >= j;
+        * layer 2 -- |I * psi_j2| * psi_j3, at resolution dg = j3.
+
+        Everything is stored as boolean masks (True where the pixel is invalid)
+        on the operator's own grid, plus float reweighting maps that are zero on
+        the invalid pixels.
+        """
+        self._cell_ids_at = None
+        self._mask_smooth = None
+        self._reweight_smooth = None
+        self._layer1_mask = None
+        self._mask_wav = None
+        self._reweight_wav = None
+        self._layer2_mask = None
+
+        if self.mask_full_res is None:
+            return
+
+        m = self.mask_full_res.array
+        if m.ndim != 1:
+            raise NotImplementedError(
+                "For now, mask_full_res.array must be 1D (a single map of "
+                f"Npix pixels), got {tuple(m.shape)}."
+            )
+
+        invalid = m.to(torch.bool) if m.dtype == torch.bool else (m != 0)
+        invalid = invalid.to(self.device)
+
+        if cell_ids is None:
+            cell_ids = getattr(self.mask_full_res, "cell_ids", None)
+        if cell_ids is None:
+            raise ValueError(
+                "cell_ids are needed to build the masks; pass them to the "
+                "operator or carry them on mask_full_res."
+            )
+        cid0 = torch.as_tensor(cell_ids).view(-1).to(self.device)
+        if invalid.numel() != cid0.numel():
+            raise ValueError(
+                f"mask_full_res has {invalid.numel()} pixels but the operator "
+                f"grid has {cid0.numel()}."
+            )
+
+        threshold = float(self.downsample_nan_weight_threshold)
+        J = self.J
+
+        # ---- layer 0: successive decimations of the invalid mask ----------
+        cid = {0: cid0}
+        mask_smooth = {0: invalid}
+        reweight_smooth = {}
+
+        for dg in range(1, J):
+            frac, ids = self._down_field(
+                dg - 1, cid[dg - 1], mask_smooth[dg - 1].to(self.dtype)
+            )
+            cid[dg] = ids
+            mask_smooth[dg] = frac > threshold
+            reweight_smooth[dg] = self._reweight_from_fraction(frac, mask_smooth[dg])
+
+        # ---- layer 1: erosion by the wavelet support at every scale -------
+        layer1_mask = {
+            j: self._support_mask(j, cid[j], mask_smooth[j]) for j in range(J)
+        }
+
+        # ---- layer 1 decimated: |I * psi_j| taken down to dg > j ----------
+        mask_wav, reweight_wav = {}, {}
+        for j in range(J - 1):
+            previous = layer1_mask[j]
+            for dg in range(j + 1, J):
+                frac, _ = self._down_field(dg - 1, cid[dg - 1], previous.to(self.dtype))
+                mask_wav[(dg, j)] = frac > threshold
+                reweight_wav[(dg, j)] = self._reweight_from_fraction(
+                    frac, mask_wav[(dg, j)]
+                )
+                previous = mask_wav[(dg, j)]
+
+        # ---- layer 2: second erosion, at the resolution of the second scale
+        layer2_mask = {}
+        for j3 in range(J):
+            for j2 in range(j3 + 1):
+                source = layer1_mask[j3] if j2 == j3 else mask_wav[(j3, j2)]
+                layer2_mask[(j3, j2)] = self._support_mask(j3, cid[j3], source)
+
+        self._cell_ids_at = cid
+        self._mask_smooth = mask_smooth
+        self._reweight_smooth = reweight_smooth
+        self._layer1_mask = layer1_mask
+        self._mask_wav = mask_wav
+        self._reweight_wav = reweight_wav
+        self._layer2_mask = layer2_mask
+
+    ###########################################################################
+    @staticmethod
+    def _reweight_from_fraction(fraction, invalid, eps=1e-8):
+        """
+        Turn a local invalid fraction f into the factor 1/(1-f) that restores
+        the amplitude of a zero-filled average, and zero it where the output
+        pixel is itself declared invalid.
+        """
+        weight = 1.0 / (1.0 - fraction).clamp_min(eps)
+        return torch.where(invalid, torch.zeros_like(weight), weight)
+
+    ###########################################################################
+    def _down_field(self, dg, cell_ids, field):
+        """
+        Take one real field down by one level with the same operator the data
+        use, and return it together with the coarse pixel indices.
+        """
+        down = self._get_down(dg, cell_ids)
+        out, ids = down(field.reshape(1, -1))
+        return (
+            out.reshape(-1),
+            torch.as_tensor(np.asarray(ids), device=field.device, dtype=torch.long),
+        )
+
+    ###########################################################################
+    def _support_mask(self, dg, cell_ids, invalid):
+        """
+        Erode an invalid mask by the stencil support.
+
+        A convolution with a kernel of ones, evaluated on the L gauges, is
+        non-zero exactly on the pixels whose support touches an invalid pixel --
+        that is, on the pixels the wavelet convolution would contaminate.
+        """
+        ones = torch.ones_like(self.smooth_kernel)
+        conv = self._get_conv(dg, cell_ids, n_gauges=self.L, weights=ones)
+
+        touched = conv(invalid.to(self.dtype).reshape(1, 1, -1))  # (1, L, Npix)
+        return (touched.abs() > 1e-12).any(dim=1).reshape(-1)
+
+    ###########################################################################
     #                              STATISTICS                                 #
     ###########################################################################
     def _find_mask(self, data):
         """
-        Return the boolean mask (True where the data is invalid) associated with
-        the layer and the resolution of `data`.
+        Return the boolean mask (True where the pixel is invalid) matching the
+        layer and the resolution of `data`, or None when the operator carries no
+        mask.
 
-        Always None for now -- see the class docstring: the spherical
-        counterpart of the planar layer masks is not implemented yet.
+        The layer is read off `len(data.conv_history)`, exactly as in the planar
+        kernel: 0 for the data themselves, 1 after one wavelet convolution,
+        2 after two.
         """
-        return None
+        if self.mask_full_res is None:
+            return None
+
+        layer = len(data.conv_history)
+        dg = int(data.dg)
+
+        if layer == 0:
+            mask = self._mask_smooth[dg]
+        elif layer == 1:
+            j = int(data.conv_history[0])
+            mask = self._layer1_mask[j] if dg == j else self._mask_wav[(dg, j)]
+        elif layer == 2:
+            if dg != int(data.conv_history[-1]):
+                raise ValueError(
+                    "Layer-2 data are expected at the resolution of their last "
+                    f"convolution (dg={dg}, conv_history={data.conv_history})."
+                )
+            mask = self._layer2_mask[(dg, int(data.conv_history[0]))]
+        else:
+            raise ValueError("len(data.conv_history) must be 0, 1 or 2.")
+
+        if mask.shape[-1] != data.array.shape[-1]:
+            raise ValueError(
+                f"The stored mask has {mask.shape[-1]} pixels but the data have "
+                f"{data.array.shape[-1]}: the data are not on the grid the "
+                "operator was built for."
+            )
+        return mask
 
     @staticmethod
     def _nanmean(x, dim):
@@ -1078,13 +1320,21 @@ class WaveletOperatorHealpixKernel_torch:
                 "mask when doing it."
             )
 
-        # finding the appropriate mask: the deepest layer carries the largest one
+        # Choose the mask covering both operands. A deeper layer has been
+        # convolved more often, so its invalid region contains the shallower
+        # one; at equal depth but different scales -- S4 pairs |I*psi_j1|*psi_j3
+        # with |I*psi_j2|*psi_j3 -- neither contains the other and the union is
+        # required.
         if self.mask_full_res is None:
             mask = None
-        elif len(data1.conv_history) >= len(data2.conv_history):
+        elif len(data1.conv_history) > len(data2.conv_history):
+            mask = self._find_mask(data1)
+        elif len(data1.conv_history) < len(data2.conv_history):
+            mask = self._find_mask(data2)
+        elif list(data1.conv_history) == list(data2.conv_history):
             mask = self._find_mask(data1)
         else:
-            mask = self._find_mask(data2)
+            mask = self._find_mask(data1) | self._find_mask(data2)
 
         return self._reduce(data1.array * torch.conj(data2.array), dim=dim, mask=mask)
 
@@ -1533,8 +1783,8 @@ class CS_operator_Healpix_Torch:
         if bool(data.array.isnan().any()):
             raise ValueError(
                 "Data array contains NaN values; the angular power spectrum "
-                "cannot be computed on them. Mask them out through cell_ids "
-                "instead."
+                "cannot be computed on them. Restrict the map through "
+                "cell_ids, or build the ST operator with compute_PS=False."
             )
 
         method = (
