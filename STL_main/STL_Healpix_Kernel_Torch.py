@@ -34,6 +34,7 @@ Not implemented yet:
     lightweight substitute based on nanmean.
 """
 
+import inspect
 import math
 from dataclasses import dataclass
 from typing import Optional
@@ -521,6 +522,49 @@ class WaveletOperatorHealpixKernel_torch:
         cid_np = None if full_sky else cid.detach().cpu().numpy().astype(np.int64)
         return nside, level, cid_np
 
+    @staticmethod
+    def _instantiate(cls, nside, level, required, optional=None):
+        """
+        Build a healpix-analyse operator, adapting to the signature of the
+        installed release.
+
+        Across versions, the resolution argument has been spelled `level`,
+        `nside` or `nside_in`, and some options only exist in some releases.
+        `required` entries must be present in the signature -- dropping one
+        silently would change the result -- while `optional` ones are skipped
+        when the installed version does not know them.
+        """
+        params = inspect.signature(cls.__init__).parameters
+
+        call = {}
+        if "nside" in params:
+            call["nside"] = int(nside)
+        elif "nside_in" in params:
+            call["nside_in"] = int(nside)
+        if "level" in params:
+            call["level"] = int(level)
+
+        if not call:
+            raise TypeError(
+                f"{cls.__name__} exposes none of the expected resolution "
+                "arguments ('level', 'nside', 'nside_in'): this version of "
+                "healpix-analyse is not supported."
+            )
+
+        for name, value in required.items():
+            if name not in params:
+                raise TypeError(
+                    f"{cls.__name__} has no '{name}' argument: this version of "
+                    "healpix-analyse is not supported."
+                )
+            call[name] = value
+
+        for name, value in (optional or {}).items():
+            if name in params:
+                call[name] = value
+
+        return cls(**call)
+
     def _get_conv(self, dg, cell_ids, n_gauges, weights):
         """
         Return a cached HealPixConv for this resolution / grid / gauge count,
@@ -541,19 +585,24 @@ class WaveletOperatorHealpixKernel_torch:
         conv = self._conv_cache.get(key, None)
         if conv is None:
             nside, level, cid_np = self._grid_spec(dg, cid_t)
-            conv = HealPixConv(
+            conv = self._instantiate(
+                HealPixConv,
                 nside=nside,
-                in_channels=1,
-                out_channels=c_out,
-                kernel_sz=self.KERNELSZ,
-                n_gauges=n_gauges,
-                gauge_type=self.gauge_type,
-                cell_ids=cid_np,
-                level=None if cid_np is None else level,
-                nest=self.nest,
-                device=self.device,
-                dtype=self.dtype,
-                ellipsoid=self.ellipsoid,
+                level=level,
+                required=dict(
+                    in_channels=1,
+                    out_channels=c_out,
+                    kernel_sz=self.KERNELSZ,
+                    n_gauges=n_gauges,
+                    gauge_type=self.gauge_type,
+                    cell_ids=cid_np,
+                    nest=self.nest,
+                ),
+                optional=dict(
+                    device=self.device,
+                    dtype=self.dtype,
+                    ellipsoid=self.ellipsoid,
+                ),
             )
             conv.set_kernel(weights.detach().cpu().numpy())
             self._conv_cache[key] = conv
@@ -568,15 +617,17 @@ class WaveletOperatorHealpixKernel_torch:
         down = self._down_cache.get(key, None)
         if down is None:
             nside, level, cid_np = self._grid_spec(dg, cid_t)
-            down = HealPixDown(
-                nside_in=nside,
-                mode="smooth",
-                cell_ids=cid_np,
-                level=None if cid_np is None else level,
-                device=self.device,
-                dtype=self.dtype,
-                ellipsoid=self.ellipsoid,
-                **self.down_kwargs,
+            down = self._instantiate(
+                HealPixDown,
+                nside=nside,
+                level=level,
+                required=dict(mode="smooth", cell_ids=cid_np),
+                optional=dict(
+                    device=self.device,
+                    dtype=self.dtype,
+                    ellipsoid=self.ellipsoid,
+                    **self.down_kwargs,
+                ),
             )
             self._down_cache[key] = down
 
