@@ -12,8 +12,8 @@ dependencies = [
     "scipy",
     "matplotlib",
     "healpy",
-    # géométrie sphérique (convolution, up/down, SHT).
-    # Référence : le head du dépôt voisin, à installer en editable :
+    # spherical geometry (convolution, up/down, SHT).
+    # Reference is the head of the sibling checkout, installed in editable mode:
     #     pip install -e ../healpix-analyse
     "healpix-analyse",
 ]

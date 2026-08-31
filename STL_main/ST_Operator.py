@@ -725,7 +725,7 @@ class ST_Operator:
             if compute_PS:
                 kwargs["PS_ref_sqrt_chan_diag"] = PS_ref_sqrt_chan_diag
 
-            # Appel avec seulement les bons arguments
+            # call with the relevant arguments only
             data_st.to_norm(
                 norm_type="from_ref", norm_batch_mean=norm_batch_mean, **kwargs
             )

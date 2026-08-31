@@ -810,19 +810,25 @@ class WaveletOperatorHealpixKernel_torch:
         B = int(np.prod(leading)) if leading else 1
         x_flat = x.reshape(B, K)
 
+        def apply_down(t):
+            """Run the operator once, keeping the coarse ids it returns."""
+            if torch.is_complex(t):
+                re, ids = down(t.real)
+                im, _ = down(t.imag)
+                return torch.complex(re, im), ids
+            return down(t)
+
         if nan_aware:
             valid = self._valid_mask(x_flat)
             mask_f = valid.to(x.real.dtype if torch.is_complex(x) else x.dtype)
             x_filled = torch.where(valid, x_flat, torch.zeros_like(x_flat))
 
-            num = self._apply_linear(down, x_filled)
-            den = self._apply_linear(down, mask_f)
+            num, out_ids = apply_down(x_filled)
+            den, _ = apply_down(mask_f)
             out = num / (den + 1e-8)
             out = torch.where(den <= 0, torch.full_like(out, float("nan")), out)
-            _, out_ids = down(mask_f)
         else:
-            out = self._apply_linear(down, x_flat)
-            _, out_ids = down(x_flat.real if torch.is_complex(x_flat) else x_flat)
+            out, out_ids = apply_down(x_flat)
 
         data.array = out.reshape(*leading, out.shape[-1])
         data.cell_ids = torch.as_tensor(

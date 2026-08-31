@@ -92,7 +92,7 @@ class SphericalStencil:
         self.w_norm_t = None
         self.present_t = None
 
-        # Optionnel : on garde une copie des ids par défaut si fournis
+        # Optional: keep a copy of the default target ids when provided
         self.cell_ids_default = None
 
         # ---- Optional immediate preparation (Step A+B at init) ----
@@ -425,10 +425,10 @@ class SphericalStencil:
 
     def bind_support_torch_multi(self, ids_sorted_np, *, device=None, dtype=None):
         """
-        Multi-gauge sparse binding (Step B) AVEC logique 'domaine réduit':
-          - poids des voisins hors domaine mis à 0
-          - renormalisation par colonne à 1
-          - si colonne vide: fallback sur le pixel cible (centre du stencil)
+        Multi-gauge sparse binding (Step B) with 'restricted domain' logic:
+          - neighbours outside the domain get a zero weight
+          - each column is renormalised to 1
+          - empty column: fall back on the target pixel (stencil centre)
 
         Produit:
           self.pos_safe_t_multi : (G, 4, K*P)
@@ -464,14 +464,14 @@ class SphericalStencil:
             idx = self.idx_t_multi[g].to(device=device, dtype=torch.long)  # (4, M)
             w = self.w_t_multi[g].to(device=device, dtype=dtype)  # (4, M)
 
-            # positions dans ids_sorted
+            # positions within ids_sorted
             pos = torch.searchsorted(ids_sorted, idx.reshape(-1)).view(4, M)
             in_range = pos < ids_sorted.numel()
             cmp_vals = torch.full_like(idx, -1)
             cmp_vals[in_range] = ids_sorted[pos[in_range]]
             present = cmp_vals == idx  # (4, M) bool
 
-            # Colonnes sans AUCUN voisin présent
+            # columns with NO neighbour present at all
             empty_cols = ~present.any(dim=0)  # (M,)
             if empty_cols.any():
                 p_ref = (self.KERNELSZ // 2) * (self.KERNELSZ + 1)
@@ -481,7 +481,7 @@ class SphericalStencil:
                 ref_cols = k_id * P + p_ref
                 src = ref_cols[empty_cols]
 
-                # copie idx/w de la colonne 'centre'
+                # copy idx/w from the 'centre' column
                 idx[:, empty_cols] = idx[:, src]
                 w[:, empty_cols] = w[:, src]
 
@@ -498,7 +498,7 @@ class SphericalStencil:
                 present[:, empty_cols] = present_e.view(4, -1)
                 pos[:, empty_cols] = pos_e_clipped.view(4, -1)
 
-            # Met à zéro les poids absents puis renormalise à 1 par colonne
+            # zero the missing weights, then renormalise each column to 1
             w = w * present
             colsum = w.sum(dim=0, keepdim=True)
             zero_cols = colsum == 0
@@ -523,10 +523,10 @@ class SphericalStencil:
 
     def bind_support_torch(self, ids_sorted_np, *, device=None, dtype=None):
         """
-        Single-gauge sparse binding (Step B) AVEC logique 'domaine réduit':
-          - poids des voisins hors domaine mis à 0
-          - renormalisation par colonne à 1
-          - si colonne vide: fallback sur le pixel cible (centre du stencil)
+        Single-gauge sparse binding (Step B) with 'restricted domain' logic:
+          - neighbours outside the domain get a zero weight
+          - each column is renormalised to 1
+          - empty column: fall back on the target pixel (stencil centre)
         """
         if device is None:
             device = self.device
@@ -545,7 +545,7 @@ class SphericalStencil:
         P = self.P
         M = K * P
 
-        # positions dans ids_sorted
+        # positions within ids_sorted
         pos = torch.searchsorted(ids_sorted, idx.reshape(-1)).view(4, M)
         in_range = pos < ids_sorted.shape[0]
         cmp_vals = torch.full_like(idx, -1)
@@ -562,7 +562,7 @@ class SphericalStencil:
             ref_cols = k_id * P + p_ref
             src = ref_cols[empty_cols]
 
-            # copie idx/w de la colonne 'centre'
+            # copy idx/w from the 'centre' column
             idx[:, empty_cols] = idx[:, src]
             w[:, empty_cols] = w[:, src]
 
@@ -581,12 +581,12 @@ class SphericalStencil:
             present[:, empty_cols] = present_e.view(4, -1)
             pos[:, empty_cols] = pos_e_clipped.view(4, -1)
 
-        # Zéro poids absents + renormalisation à 1
+        # zero the missing weights, then renormalise to 1
         w = w * present
         colsum = w.sum(dim=0, keepdim=True)
         zero_cols = colsum == 0
         if zero_cols.any():
-            # force 1 sur la première ligne disponible (ici ligne 0)
+            # force a weight of 1 on the first available row (row 0 here)
             w[0, zero_cols[0]] = present[0, zero_cols[0]].to(w.dtype)
             colsum = w.sum(dim=0, keepdim=True)
         w_norm = w / colsum.clamp_min(1e-12)
@@ -1255,9 +1255,9 @@ class SphericalStencil:
                 pos = pos_g[:, cols_span].view(4, Kb, self.P)  # (4, Kb, P)
                 w = w_g[:, cols_span].view(4, Kb, self.P)  # (4, Kb, P)
 
-                # rows_gauge: indices de lignes pour cette jauge g
-                # Chaque jauge occupe un bloc de Co_g canaux de sortie pour CHAQUE pixel (K)
-                # donc offset = g*Co_g
+                # rows_gauge: row indices for this gauge g.
+                # Each gauge occupies a block of Co_g output channels for EVERY
+                # pixel (K), hence offset = g*Co_g
                 rows_gauge = (
                     torch.arange(Co_g, device=device, dtype=torch.long) + g * Co_g
                 )[:, None] * K + (
@@ -1281,7 +1281,7 @@ class SphericalStencil:
                 k_exp = ker_g.permute(1, 0, 2)  # (Co_g, Ci, P)
                 k_exp = k_exp[:, None, :, None, :]  # (Co_g, 1, Ci, 1, P)
 
-                # CORRECTION: remettre les axes de w en (Kb,4,P) avant broadcast
+                # put the axes of w back to (Kb,4,P) before broadcasting
                 # (1, Kb, 1, 4, P)
                 w_exp = w.permute(1, 0, 2)[None, :, None, :, :]
                 # (Co_g, Kb, Ci, 4, P)
@@ -1554,7 +1554,7 @@ class SphericalStencil:
             B = len(cell_ids)
             for b in range(B):
                 cid_b = self._to_numpy_1d(cell_ids[b])
-                # extraire le bon échantillon d'`im`
+                # pick the right sample out of `im`
                 if torch.is_tensor(im):
                     xb = im[b : b + 1]  # (1, C, N_b)
                     yb, ids_b = self._ud_grade_2(
@@ -1562,7 +1562,7 @@ class SphericalStencil:
                     )
                     outs.append(yb.squeeze(0))  # (C, N_b')
                 else:
-                    # si im est déjà une liste de (C, N_b)
+                    # `im` may already be a list of (C, N_b)
                     xb = im[b]
                     yb, ids_b = self._ud_grade_2(
                         xb[None, ...], cell_ids=cid_b, nside=nside, max_poll=max_poll
@@ -1573,7 +1573,7 @@ class SphericalStencil:
                 )
             return outs, outs_ids
 
-        # grille commune (un seul vecteur d'ids)
+        # shared grid (a single vector of ids)
         cid = self._to_numpy_1d(cell_ids)
         return self._ud_grade_2(im, cell_ids=cid, nside=nside, max_poll=max_poll)
 
@@ -1590,7 +1590,7 @@ class SphericalStencil:
         if nside is None:
             nside = self.nside
 
-        # var-length: listes parallèles
+        # var-length: parallel lists
         if self._is_varlength_batch(cell_ids):
             assert isinstance(o_cell_ids, (list, tuple)) and len(o_cell_ids) == len(
                 cell_ids
@@ -1614,7 +1614,7 @@ class SphericalStencil:
                     outs.append(yb.squeeze(0))
             return outs
 
-        # grille commune
+        # shared grid
         cid = self._to_numpy_1d(cell_ids)
         ocid = self._to_numpy_1d(o_cell_ids) if o_cell_ids is not None else None
         return self._up_grade_2(im, cell_ids=cid, nside=nside, o_cell_ids=ocid)
