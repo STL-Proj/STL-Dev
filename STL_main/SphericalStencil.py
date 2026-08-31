@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Author: J.-M. Delouis
-import foscat.scat_cov as sc
 import healpy as hp
 import numpy as np
 import torch
@@ -71,10 +70,10 @@ class SphericalStencil:
         self.gauge_type = gauge_type
 
         self.nest = bool(nest)
-        if scat_op is None:
-            self.f = sc.funct(KERNELSZ=self.KERNELSZ)
-        else:
-            self.f = scat_op
+        # `scat_op` is kept for backward compatibility only: Down/Up are now
+        # implemented in this module with healpy + torch, so no external
+        # scattering package is required.
+        self.f = scat_op
 
         # Torch defaults
         if device is None:
@@ -1327,7 +1326,7 @@ class SphericalStencil:
 
         indices = torch.stack(
             [cols, rows], dim=0
-        )  # (2, nnz) invert rows/cols for foscat needs
+        )  # (2, nnz) rows/cols inverted to match the sparse-matmul convention
 
         if return_sparse_tensor:
             M = torch.sparse_coo_tensor(
@@ -1366,22 +1365,185 @@ class SphericalStencil:
             return False
         return False
 
+    # ------------------------------------------------------------------
+    # Resolution changes (pure healpy + torch, no external dependency)
+    # ------------------------------------------------------------------
+    def _ud_grade_2(self, im, cell_ids=None, nside=None, max_poll=False):
+        """
+        Degrade a HEALPix map by one level (nside -> nside/2, i.e. 4 pixels
+        binned into 1) along the last axis.
+
+        In NESTED ordering the four children of a pixel are contiguous, so the
+        parent index is simply ``cell_id // 4``.
+
+        Parameters
+        ----------
+        im : torch.Tensor
+            Data of shape (..., N). Real or complex; differentiable.
+        cell_ids : array-like or None
+            NESTED pixel indices of the last axis. None means full sky in the
+            canonical order.
+        nside : int or None
+            Unused for the binning itself (kept for signature compatibility);
+            only the pixel indices matter.
+        max_poll : bool
+            Max-pooling instead of averaging (real data only).
+
+        Returns
+        -------
+        (torch.Tensor, torch.LongTensor)
+            The degraded data of shape (..., N') and the corresponding parent
+            pixel indices.
+        """
+        if not self.nest:
+            raise ValueError(
+                "Down()/_ud_grade_2 require NESTED ordering (nest=True): the "
+                "children of a pixel are only contiguous in that scheme."
+            )
+
+        x = im if torch.is_tensor(im) else torch.as_tensor(im)
+        *leading, N = x.shape
+        B = int(np.prod(leading)) if leading else 1
+        x_flat = x.reshape(B, N)
+
+        if cell_ids is None:
+            if N % 4 != 0:
+                raise ValueError(
+                    f"Cannot degrade {N} pixels by a factor 4 without cell_ids."
+                )
+            grouped = x_flat.reshape(B, N // 4, 4)
+            if max_poll:
+                if torch.is_complex(grouped):
+                    raise ValueError("max_poll is not defined for complex data.")
+                out = grouped.amax(dim=-1)
+            else:
+                out = grouped.mean(dim=-1)
+            out_ids = torch.arange(N // 4, device=x.device, dtype=torch.long)
+        else:
+            cid = (
+                torch.as_tensor(self._to_numpy_1d(cell_ids), device=x.device)
+                .view(-1)
+                .to(torch.long)
+            )
+            if cid.numel() != N:
+                raise ValueError(
+                    f"cell_ids length {cid.numel()} does not match the pixel axis {N}."
+                )
+
+            parents = torch.div(cid, 4, rounding_mode="floor")
+            out_ids, inv = torch.unique(parents, return_inverse=True)
+            Kc = out_ids.numel()
+            idx = inv.unsqueeze(0).expand(B, -1)
+
+            if max_poll:
+                if torch.is_complex(x_flat):
+                    raise ValueError("max_poll is not defined for complex data.")
+                out = torch.full(
+                    (B, Kc), float("-inf"), device=x.device, dtype=x.dtype
+                ).scatter_reduce(1, idx, x_flat, reduce="amax", include_self=False)
+            else:
+                sums = torch.zeros(B, Kc, device=x.device, dtype=x.dtype)
+                sums = sums.scatter_add(1, idx, x_flat)
+                counts = torch.bincount(inv, minlength=Kc)
+                out = sums / counts.to(x.real.dtype if torch.is_complex(x) else x.dtype)
+
+        return out.reshape(*leading, out.shape[-1]), out_ids
+
+    def _up_grade_2(self, im, cell_ids=None, nside=None, o_cell_ids=None):
+        """
+        Upgrade a HEALPix map by one level (nside -> 2*nside) along the last
+        axis, using healpy's 4-neighbour bilinear interpolation.
+
+        Output pixels whose interpolation stencil falls entirely outside the
+        provided `cell_ids` get 0; partially covered stencils are renormalized
+        over the available neighbours.
+
+        Parameters
+        ----------
+        im : torch.Tensor
+            Data of shape (..., N). Real or complex; differentiable.
+        cell_ids : array-like or None
+            Pixel indices of the input (coarse) map. None means full sky.
+        nside : int or None
+            Resolution of the input map. Defaults to self.nside.
+        o_cell_ids : array-like or None
+            Pixel indices wanted in the output (fine) map. None means the four
+            children of each input pixel (full sky if cell_ids is None too).
+
+        Returns
+        -------
+        torch.Tensor
+            Interpolated data of shape (..., N_out).
+        """
+        nside_in = self.nside if nside is None else int(nside)
+        nside_out = 2 * nside_in
+
+        x = im if torch.is_tensor(im) else torch.as_tensor(im)
+        *leading, N = x.shape
+        B = int(np.prod(leading)) if leading else 1
+        x_flat = x.reshape(B, N)
+
+        if cell_ids is None:
+            cid_np = np.arange(12 * nside_in**2, dtype=np.int64)
+        else:
+            cid_np = self._to_numpy_1d(cell_ids)
+        if cid_np.size != N:
+            raise ValueError(
+                f"cell_ids length {cid_np.size} does not match the pixel axis {N}."
+            )
+
+        if o_cell_ids is not None:
+            ocid_np = self._to_numpy_1d(o_cell_ids)
+        elif cell_ids is None:
+            ocid_np = np.arange(12 * nside_out**2, dtype=np.int64)
+        elif self.nest:
+            ocid_np = np.repeat(cid_np, 4) * 4 + np.tile(
+                np.arange(4, dtype=np.int64), cid_np.size
+            )
+        else:
+            raise ValueError(
+                "o_cell_ids must be given for a partial map in RING ordering."
+            )
+
+        # 4-neighbour bilinear stencil of every output pixel on the coarse grid
+        th, ph = hp.pix2ang(nside_out, ocid_np, nest=self.nest)
+        nbr, wgt = hp.get_interp_weights(nside_in, th, ph, nest=self.nest)
+        nbr = np.asarray(nbr, dtype=np.int64).reshape(4, -1)
+        wgt = np.asarray(wgt, dtype=np.float64).reshape(4, -1)
+
+        # global coarse ids -> positions along the pixel axis of `im`
+        order = np.argsort(cid_np)
+        sorted_ids = cid_np[order]
+        pos = np.clip(np.searchsorted(sorted_ids, nbr), 0, sorted_ids.size - 1)
+        present = sorted_ids[pos] == nbr
+        local = order[pos]
+
+        wgt = np.where(present, wgt, 0.0)
+        norm = wgt.sum(axis=0)
+        wgt = np.divide(wgt, norm, out=np.zeros_like(wgt), where=norm > 0)
+
+        real_dtype = x.real.dtype if torch.is_complex(x) else x.dtype
+        local_t = torch.as_tensor(local, device=x.device, dtype=torch.long)
+        wgt_t = torch.as_tensor(wgt, device=x.device, dtype=real_dtype)
+
+        n_out = ocid_np.size
+        gathered = x_flat[:, local_t.reshape(-1)].reshape(B, 4, n_out)
+        out = (gathered * wgt_t.unsqueeze(0)).sum(dim=1)
+
+        return out.reshape(*leading, n_out)
+
     def Down(self, im, cell_ids=None, nside=None, max_poll=False):
         """
         If `cell_ids` is a single set of ids -> return a single (Tensor, Tensor).
         If `cell_ids` is a list (var-length)           -> return (list[Tensor], list[Tensor]).
         """
-        if self.f is None:
-            if self.dtype == torch.float64:
-                self.f = sc.funct(KERNELSZ=self.KERNELSZ, all_type="float64")
-            else:
-                self.f = sc.funct(KERNELSZ=self.KERNELSZ, all_type="float32")
-
         if cell_ids is None:
-            dim, cdim = self.f.ud_grade_2(
-                im, cell_ids=self.cell_ids, nside=self.nside, max_poll=max_poll
+            return self._ud_grade_2(
+                im,
+                cell_ids=self.cell_ids_default,
+                nside=self.nside,
+                max_poll=max_poll,
             )
-            return dim, cdim
 
         if nside is None:
             nside = self.nside
@@ -1395,14 +1557,14 @@ class SphericalStencil:
                 # extraire le bon échantillon d'`im`
                 if torch.is_tensor(im):
                     xb = im[b : b + 1]  # (1, C, N_b)
-                    yb, ids_b = self.f.ud_grade_2(
+                    yb, ids_b = self._ud_grade_2(
                         xb, cell_ids=cid_b, nside=nside, max_poll=max_poll
                     )
                     outs.append(yb.squeeze(0))  # (C, N_b')
                 else:
                     # si im est déjà une liste de (C, N_b)
                     xb = im[b]
-                    yb, ids_b = self.f.ud_grade_2(
+                    yb, ids_b = self._ud_grade_2(
                         xb[None, ...], cell_ids=cid_b, nside=nside, max_poll=max_poll
                     )
                     outs.append(yb.squeeze(0))
@@ -1413,24 +1575,17 @@ class SphericalStencil:
 
         # grille commune (un seul vecteur d'ids)
         cid = self._to_numpy_1d(cell_ids)
-        return self.f.ud_grade_2(im, cell_ids=cid, nside=nside, max_poll=False)
+        return self._ud_grade_2(im, cell_ids=cid, nside=nside, max_poll=max_poll)
 
     def Up(self, im, cell_ids=None, nside=None, o_cell_ids=None):
         """
         If `cell_ids` / `o_cell_ids` are single arrays  -> return Tensor.
         If they are lists (var-length per sample)       -> return list[Tensor].
         """
-        if self.f is None:
-            if self.dtype == torch.float64:
-                self.f = sc.funct(KERNELSZ=self.KERNELSZ, all_type="float64")
-            else:
-                self.f = sc.funct(KERNELSZ=self.KERNELSZ, all_type="float32")
-
         if cell_ids is None:
-            dim = self.f.up_grade(
-                im, self.nside * 2, cell_ids=self.cell_ids, nside=self.nside
+            return self._up_grade_2(
+                im, cell_ids=self.cell_ids_default, nside=self.nside
             )
-            return dim
 
         if nside is None:
             nside = self.nside
@@ -1447,24 +1602,14 @@ class SphericalStencil:
                 ocid_b = self._to_numpy_1d(o_cell_ids[b])  # fine   ids
                 if torch.is_tensor(im):
                     xb = im[b : b + 1]  # (1, C, N_b_coarse)
-                    yb = self.f.up_grade(
-                        xb,
-                        nside * 2,
-                        cell_ids=cid_b,
-                        nside=nside,
-                        o_cell_ids=ocid_b,
-                        force_init_index=True,
+                    yb = self._up_grade_2(
+                        xb, cell_ids=cid_b, nside=nside, o_cell_ids=ocid_b
                     )
                     outs.append(yb.squeeze(0))  # (C, N_b_fine)
                 else:
                     xb = im[b]  # (C, N_b_coarse)
-                    yb = self.f.up_grade(
-                        xb[None, ...],
-                        nside * 2,
-                        cell_ids=cid_b,
-                        nside=nside,
-                        o_cell_ids=ocid_b,
-                        force_init_index=True,
+                    yb = self._up_grade_2(
+                        xb[None, ...], cell_ids=cid_b, nside=nside, o_cell_ids=ocid_b
                     )
                     outs.append(yb.squeeze(0))
             return outs
@@ -1472,14 +1617,7 @@ class SphericalStencil:
         # grille commune
         cid = self._to_numpy_1d(cell_ids)
         ocid = self._to_numpy_1d(o_cell_ids) if o_cell_ids is not None else None
-        return self.f.up_grade(
-            im,
-            nside * 2,
-            cell_ids=cid,
-            nside=nside,
-            o_cell_ids=ocid,
-            force_init_index=True,
-        )
+        return self._up_grade_2(im, cell_ids=cid, nside=nside, o_cell_ids=ocid)
 
     def to_tensor(self, x):
         return torch.tensor(x, device=self.device, dtype=self.dtype)
