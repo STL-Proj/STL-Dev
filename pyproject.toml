@@ -5,6 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "STL"
 dynamic = ["version"]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "scipy",
+    "matplotlib",
+    "healpy",
+    # spherical geometry (convolution, up/down, SHT).
+    # Reference is the head of the sibling checkout, installed in editable mode:
+    #     pip install -e ../healpix-analyse
+    "healpix-analyse",
+]
+
+[project.optional-dependencies]
+# needed only to run the notebooks under examples/
+examples = [
+    # resampling of unstructured lon/lat samples onto local HEALPix cell_ids
+    "healpix-resample",
+    "xarray",
+    "zarr",
+]
 
 [tool.setuptools.packages.find]
 include = ["STL_main*"]

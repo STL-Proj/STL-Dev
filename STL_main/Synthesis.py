@@ -33,8 +33,14 @@ class ScatteringMatchModel(nn.Module):
         super().__init__()
 
         # === Field configuration ===
+        # `DataClass` may be the data class itself (legacy) or an existing data
+        # object used as a prototype. The prototype form is what makes the
+        # synthesis data-type agnostic: geometries that are not described by the
+        # array shape alone -- HEALPix cell_ids, for instance -- are inherited
+        # from it instead of being rebuilt from scratch.
         self.st_op = st_op
         self.DataClass = DataClass
+        self.proto = None if isinstance(DataClass, type) else DataClass
         self.pbc = pbc
         self.init_shape = init_shape
         self.init_map = init_map
@@ -60,11 +66,10 @@ class ScatteringMatchModel(nn.Module):
             )
 
         if prefilter_Nyquist:
-            print("Prefiltering initial map to remove frequencies above Nyquist")
             assert (
                 not self.u.isnan().any()
-            ), "Cannot apply Nyquist filter on intial map with NaNs. Either remove NaNs from the initial map or specify prefilter_Nyquist=False."
-            self.u = apply_nyquist_filter(self.u)
+            ), "Cannot band-limit an initial map with NaNs. Either remove NaNs from the initial map or specify prefilter_Nyquist=False."
+            self.u = self._bandlimit(self.u)
 
         # === Apply mask constraints ===
         self.mask_full_res = st_op.wavelet_op.mask_full_res
@@ -85,9 +90,24 @@ class ScatteringMatchModel(nn.Module):
                 "NaN detected in the running synthesis mask, the synthesis takes it into account"
             )
 
+    def _bandlimit(self, array):
+        """Band-limit through the data type, falling back on the planar filter."""
+        if self.proto is not None:
+            return _bandlimit_and_report(self.proto, array, "initial map")
+
+        filtered = apply_nyquist_filter(array)
+        print("Prefiltering initial map to remove sub-pixel frequencies")
+        return filtered
+
+    def _make_data(self, array):
+        """Wrap `array` in a data object, keeping the prototype geometry."""
+        if self.proto is not None:
+            return self.proto.new_like(array, pbc=self.pbc)
+        return self.DataClass(array, pbc=self.pbc)
+
     def forward(self):
         # === Build data class ===
-        DC_u = self.DataClass(self.u, pbc=self.pbc)
+        DC_u = self._make_data(self.u)
 
         # === Compute scattering statistics ===
         st_u = self.st_op.apply(
@@ -110,6 +130,26 @@ class ScatteringMatchModel(nn.Module):
         )
 
         return s_flat_u
+
+
+def _bandlimit_and_report(data_like, array, what):
+    """
+    Band-limit `array` through the data type and say so only if it changed.
+
+    Not every data type can define a band limit -- a partial HEALPix sky, for
+    one -- and announcing a filtering that did not happen is worse than saying
+    nothing.
+    """
+    filtered = data_like.apply_bandlimit(array)
+    if filtered is not array and not torch.equal(filtered, array):
+        print("Prefiltering %s to remove sub-pixel frequencies" % what)
+    return filtered
+
+
+def _contains_nan(array):
+    """True if `array` (numpy or torch, on any device) holds a NaN."""
+    tensor = array if torch.is_tensor(array) else torch.as_tensor(np.asarray(array))
+    return bool(torch.isnan(tensor).any())
 
 
 def reweight(stats, weights):
@@ -198,32 +238,41 @@ def optimize_from_maps(
 
     # ------- Determine initial shape for u (from target) -------
     input_dim = target.array.ndim
+    ndim_pix = target.NDIM_PIX  # 2 for planar maps, 1 for HEALPix
 
-    if input_dim == 2:
+    def _check_running_shape(shape):
+        assert (
+            len(shape) == ndim_pix
+        ), f"running_shape should have {ndim_pix} entries for {target.DT}"
+
+    if input_dim == ndim_pix:  # a single map
         target_shape = (1, 1, *target.array.shape)
         if running_shape is None:
             init_shape = (nbatch, 1, *target.array.shape)
         else:
-            assert len(running_shape) == 2, "running_shape should be a tuple of (H,W)"
+            _check_running_shape(running_shape)
             init_shape = (nbatch, 1, *running_shape)
 
-    elif input_dim == 3:
+    elif input_dim == ndim_pix + 1:  # channels
         target_shape = (1, *target.array.shape)
         if running_shape is None:
             init_shape = (nbatch, *target.array.shape)
         else:
-            assert len(running_shape) == 2, "running_shape should be a tuple of (H,W)"
+            _check_running_shape(running_shape)
             init_shape = (nbatch, target.array.shape[0], *running_shape)
 
-    elif input_dim == 4:
+    elif input_dim == ndim_pix + 2:  # batch and channels
         target_shape = target.array.shape
         if running_shape is None:
-            init_shape = (nbatch, *target.array.shape[-3:])
+            init_shape = (nbatch, *target.array.shape[1:])
         else:
-            assert len(running_shape) == 2, "running_shape should be a tuple of (H,W)"
+            _check_running_shape(running_shape)
             init_shape = (nbatch, target.array.shape[1], *running_shape)
     else:
-        raise ValueError("target.array must be 2D, 3D or 4D tensor")
+        raise ValueError(
+            f"target.array should have {ndim_pix}, {ndim_pix + 1} or "
+            f"{ndim_pix + 2} dimensions, got {input_dim}"
+        )
     print("Initial shape for u:", init_shape)
 
     if not mean_field and target.array.shape[0] != init_shape[0]:
@@ -244,8 +293,7 @@ def optimize_from_maps(
                     "WARNING: prefiltering target above Nyquist is asked but target has NaNs. Only initial noise will be filtered."
                 )
             else:
-                print("Prefiltering target to remove frequencies above Nyquist")
-                l_target.array = apply_nyquist_filter(l_target.array)
+                l_target.array = _bandlimit_and_report(target, l_target.array, "target")
 
         l_target, mean_target, std_target = st_op_target.wavelet_op.standardize(
             l_target, mean_field=mean_field, inplace=True
@@ -280,7 +328,7 @@ def optimize_from_maps(
     # ------- Build model -------
     model = ScatteringMatchModel(
         st_op=st_op_running,
-        DataClass=target.__class__,
+        DataClass=target,  # prototype: carries the geometry as well as the class
         pbc=pbc_running,
         init_shape=init_shape,
         init_map=init_running,
@@ -309,7 +357,7 @@ def optimize_from_maps(
     )
 
     # ------- Post-process optimized u: unstandardize, apply mask constraints, reshape -------
-    DC_u_opt = target.__class__(array=u_opt, pbc=pbc_running)
+    DC_u_opt = target.new_like(u_opt, pbc=pbc_running)
     st_op_running.wavelet_op.unstandardize(
         DC_u_opt, mean=mean_target, std=std_target, inplace=True
     )
@@ -318,7 +366,7 @@ def optimize_from_maps(
     if st_op_running.wavelet_op.mask_full_res is not None:
         u_opt[..., st_op_running.wavelet_op.mask_full_res.array] = torch.nan
 
-    if input_dim == 2:
+    if input_dim == ndim_pix:
         u_opt = u_opt[:, 0, ...]  # remove channel dim
     if nbatch == 1:
         u_opt = u_opt[0]  # remove batch dim
@@ -360,7 +408,10 @@ def optimize_from_stats(
     print("Running synthesis on device:", device, "dtype:", dtype)
 
     # ------- Determine initial shape for u (from target stats) -------
-    Nb, Nc, N, M = target_stats.Nb, target_stats.Nc, *target_stats.N0
+    Nb, Nc = target_stats.Nb, target_stats.Nc
+    # the pixel grid, which is not the resolution descriptor for every data type
+    # (HEALPix stores nside in N0 but Npix pixels)
+    pix_shape = tuple(getattr(target_stats, "pix_shape", None) or target_stats.N0)
 
     if nbatch != Nb and not mean_field:
         raise ValueError(
@@ -370,7 +421,7 @@ def optimize_from_stats(
     if running_shape is not None:
         init_shape = (nbatch, Nc, *running_shape)
     else:
-        init_shape = (nbatch, Nc, N, M)
+        init_shape = (nbatch, Nc, *pix_shape)
 
     print(f"Initial shape for u: {init_shape}")
 
@@ -407,7 +458,7 @@ def optimize_from_stats(
     # ------- Build model -------
     model = ScatteringMatchModel(
         st_op=st_op_running,
-        DataClass=target_stats.DataClass,
+        DataClass=getattr(target_stats, "data_example", None) or target_stats.DataClass,
         pbc=pbc_running,
         init_shape=init_shape,
         init_map=init_running,
@@ -439,7 +490,12 @@ def optimize_from_stats(
 
     # ------- Post-process optimized u: unstandardize, apply mask constraints -------
     if target_stats.standardized:
-        DC_u_opt = target_stats.DataClass(u_opt, pbc=pbc_running)
+        proto = getattr(target_stats, "data_example", None)
+        DC_u_opt = (
+            proto.new_like(u_opt, pbc=pbc_running)
+            if proto is not None
+            else target_stats.DataClass(u_opt, pbc=pbc_running)
+        )
         st_op_running.wavelet_op.unstandardize(
             DC_u_opt,
             mean=target_stats.mean_pre_std,
@@ -523,6 +579,7 @@ def synthesize_from_maps(
     running_mask=None,
     has_fewer_convolutions=False,
     compute_cross_matrix=None,
+    compute_PS=None,
     mean_field=True,
     **optim_kwargs,
 ):
@@ -551,57 +608,71 @@ def synthesize_from_maps(
         For other types of syntheses, the same ST operator is used for both.
     """
 
+    ndim_pix = data_target.NDIM_PIX
+
     if running_mask is None:
         # Same mask for running and target
-        array = (
-            np.zeros(running_shape) if running_shape is not None else data_target.array
-        )
-        data_running = data_target.__class__(array=array, pbc=pbc_running)
+        if running_shape is not None:
+            data_running = data_target.__class__(
+                array=np.zeros(running_shape), pbc=pbc_running
+            )
+        else:
+            data_running = data_target.new_like(data_target.array, pbc=pbc_running)
     else:
-        if running_shape is None and data_target.array.shape[-2:] != running_mask.shape:
+        if running_shape is None and tuple(
+            data_target.array.shape[-ndim_pix:]
+        ) != tuple(running_mask.shape):
             raise ValueError("running_mask shape should match target array shape")
-        elif running_shape is not None and running_shape != running_mask.shape:
+        elif running_shape is not None and tuple(running_shape) != tuple(
+            running_mask.shape
+        ):
             raise ValueError("running_mask shape should match running_shape")
 
-        data_running = data_target.__class__(array=running_mask, pbc=pbc_running)
+        data_running = data_target.new_like(running_mask, pbc=pbc_running)
 
     # Select J used for synthesis
     J_target = data_target.get_wavelet_op().J - (not data_target.pbc)
     J_running = data_running.get_wavelet_op().J - (not data_running.pbc)
     J = min(J_target, J_running)
 
-    n_bins_target = data_target.get_CS_op().n_bins
-    n_bins_running = data_running.get_CS_op().n_bins
-    n_bins = min(n_bins_target, n_bins_running)
-
     if J_target != J_running:
         print(
             f"Warning: target.J = {J_target}, running.J = {J_running}. Synthesis will use J = {J}."
         )
 
-    # Get scattering operators for target and running data with selected J
-    st_op_target = data_target.get_ST_op(
-        J=J, n_bins=n_bins, has_fewer_convolutions=has_fewer_convolutions
-    )
-
-    st_op_running = data_running.get_ST_op(
-        J=J,
-        n_bins=n_bins,
-        has_fewer_convolutions=has_fewer_convolutions,
-        replace_nan_value=None,
-    )
-
-    # Disable power spectrum optimization if NaN values are present in target and/or running data
+    # Decide about the power spectrum *before* touching the spectrum operators:
+    # building one is expensive (a spherical harmonic transform at high
+    # resolution), so it must not happen when the spectrum will not be used.
     target_has_nan = data_target.array.isnan().any()
     running_has_nan = data_running.array.isnan().any()
 
-    if target_has_nan or running_has_nan:
-        print(
-            "⚠️ Warning: NaN detected in target and/or running data.\n"
-            "Power spectrum optimization is disabled because its computation is not yet implemented for NaN values in any dataclass. \n"
+    if compute_PS is None:
+        compute_PS = not (target_has_nan or running_has_nan)
+        if target_has_nan or running_has_nan:
+            print(
+                "⚠️ Warning: NaN detected in target and/or running data.\n"
+                "Power spectrum optimization is disabled because its computation is not yet implemented for NaN values in any dataclass. \n"
+            )
+    elif compute_PS and (target_has_nan or running_has_nan):
+        raise ValueError(
+            "compute_PS=True was requested but the data contain NaNs, on which "
+            "the power spectrum is undefined."
         )
 
-    compute_PS = not (target_has_nan or running_has_nan)
+    st_op_kwargs = {"has_fewer_convolutions": has_fewer_convolutions}
+    if compute_PS:
+        n_bins = min(data_target.get_CS_op().n_bins, data_running.get_CS_op().n_bins)
+        st_op_kwargs["n_bins"] = n_bins
+
+    # Get scattering operators for target and running data with selected J
+    st_op_target = data_target.get_ST_op(J=J, compute_PS=compute_PS, **st_op_kwargs)
+
+    st_op_running = data_running.get_ST_op(
+        J=J,
+        compute_PS=compute_PS,
+        replace_nan_value=None,
+        **st_op_kwargs,
+    )
 
     # Set default optimization parameters and update with user-provided values
     optim_params = dict(
@@ -612,7 +683,7 @@ def synthesize_from_maps(
         verbose=True,
         seed=26,
         prefilter_Nyquist=(
-            True if init_running is None else not init_running.isnan.any()
+            True if init_running is None else not _contains_nan(init_running)
         ),
         adhoc_weights={"S3": 3.5, "S4": 3.5**2},
     )
@@ -658,16 +729,29 @@ def synthesize_from_stats(
             array = torch.zeros(running_shape)
         else:
             if target_stats.mask_full_res is None:
-                array = torch.zeros(target_stats.N0)
+                array = torch.zeros(
+                    tuple(getattr(target_stats, "pix_shape", None) or target_stats.N0)
+                )
             else:
                 array = torch.where(target_stats.mask_full_res.array, torch.nan, 0.0)
         array = array.to(device=target_stats.device, dtype=target_stats.dtype)
 
-        data_running = target_stats.DataClass(array=array, pbc=pbc_running)
+        proto = getattr(target_stats, "data_example", None)
+        data_running = (
+            proto.new_like(array, pbc=pbc_running)
+            if proto is not None
+            else target_stats.DataClass(array=array, pbc=pbc_running)
+        )
     else:
-        if running_mask.shape != target_stats.N0:
-            raise ValueError("running_mask shape should match target_stats N0")
-        data_running = target_stats.DataClass(array=running_mask, pbc=pbc_running)
+        pix_shape = tuple(getattr(target_stats, "pix_shape", None) or target_stats.N0)
+        if tuple(running_mask.shape) != pix_shape:
+            raise ValueError("running_mask shape should match the target pixel grid")
+        proto = getattr(target_stats, "data_example", None)
+        data_running = (
+            proto.new_like(running_mask, pbc=pbc_running)
+            if proto is not None
+            else target_stats.DataClass(array=running_mask, pbc=pbc_running)
+        )
 
     running_has_nan = data_running.array.isnan().any()
 
