@@ -1578,11 +1578,18 @@ class CS_operator_Healpix_Torch:
             else torch.as_tensor(cell_ids).view(-1).to(torch.long)
         )
 
-        # --- spherical harmonic transform (cached, geometry is expensive) ---
+        # --- spherical harmonic transform ---
+        # Built lazily: its Legendre precompute is very expensive at high
+        # resolution, and callers routinely construct this operator only to read
+        # n_bins. lmax is therefore derived from the resolution here and checked
+        # against the transform the first time one is actually needed.
         self._sht = None
         self._requested_lmax = None if lmax is None else int(lmax)
-        sht = self._get_sht()
-        self.lmax = int(getattr(sht, "lmax"))
+        self.lmax = (
+            self._requested_lmax
+            if self._requested_lmax is not None
+            else 3 * self.nside - 1
+        )
 
         # --- multipole binning ---
         self.ell = torch.arange(self.lmax + 1, device=self.device, dtype=self.dtype)
@@ -1608,6 +1615,12 @@ class CS_operator_Healpix_Torch:
                 required=required,
                 optional=optional,
             )
+            built = int(getattr(self._sht, "lmax"))
+            if built != self.lmax:
+                raise ValueError(
+                    f"HEALPixSHT reports lmax={built} where this operator assumed "
+                    f"{self.lmax}; pass lmax={built} explicitly."
+                )
         return self._sht
 
     ###########################################################################

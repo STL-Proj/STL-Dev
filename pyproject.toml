@@ -18,6 +18,15 @@ dependencies = [
     "healpix-analyse",
 ]
 
+[project.optional-dependencies]
+# needed only to run the notebooks under examples/
+examples = [
+    # resampling of unstructured lon/lat samples onto local HEALPix cell_ids
+    "healpix-resample",
+    "xarray",
+    "zarr",
+]
+
 [tool.setuptools.packages.find]
 include = ["STL_main*"]
 

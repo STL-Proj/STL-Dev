@@ -66,7 +66,6 @@ class ScatteringMatchModel(nn.Module):
             )
 
         if prefilter_Nyquist:
-            print("Prefiltering initial map to remove sub-pixel frequencies")
             assert (
                 not self.u.isnan().any()
             ), "Cannot band-limit an initial map with NaNs. Either remove NaNs from the initial map or specify prefilter_Nyquist=False."
@@ -94,8 +93,11 @@ class ScatteringMatchModel(nn.Module):
     def _bandlimit(self, array):
         """Band-limit through the data type, falling back on the planar filter."""
         if self.proto is not None:
-            return self.proto.apply_bandlimit(array)
-        return apply_nyquist_filter(array)
+            return _bandlimit_and_report(self.proto, array, "initial map")
+
+        filtered = apply_nyquist_filter(array)
+        print("Prefiltering initial map to remove sub-pixel frequencies")
+        return filtered
 
     def _make_data(self, array):
         """Wrap `array` in a data object, keeping the prototype geometry."""
@@ -128,6 +130,26 @@ class ScatteringMatchModel(nn.Module):
         )
 
         return s_flat_u
+
+
+def _bandlimit_and_report(data_like, array, what):
+    """
+    Band-limit `array` through the data type and say so only if it changed.
+
+    Not every data type can define a band limit -- a partial HEALPix sky, for
+    one -- and announcing a filtering that did not happen is worse than saying
+    nothing.
+    """
+    filtered = data_like.apply_bandlimit(array)
+    if filtered is not array and not torch.equal(filtered, array):
+        print("Prefiltering %s to remove sub-pixel frequencies" % what)
+    return filtered
+
+
+def _contains_nan(array):
+    """True if `array` (numpy or torch, on any device) holds a NaN."""
+    tensor = array if torch.is_tensor(array) else torch.as_tensor(np.asarray(array))
+    return bool(torch.isnan(tensor).any())
 
 
 def reweight(stats, weights):
@@ -271,8 +293,7 @@ def optimize_from_maps(
                     "WARNING: prefiltering target above Nyquist is asked but target has NaNs. Only initial noise will be filtered."
                 )
             else:
-                print("Prefiltering target to remove sub-pixel frequencies")
-                l_target.array = target.apply_bandlimit(l_target.array)
+                l_target.array = _bandlimit_and_report(target, l_target.array, "target")
 
         l_target, mean_target, std_target = st_op_target.wavelet_op.standardize(
             l_target, mean_field=mean_field, inplace=True
@@ -558,6 +579,7 @@ def synthesize_from_maps(
     running_mask=None,
     has_fewer_convolutions=False,
     compute_cross_matrix=None,
+    compute_PS=None,
     mean_field=True,
     **optim_kwargs,
 ):
@@ -613,38 +635,44 @@ def synthesize_from_maps(
     J_running = data_running.get_wavelet_op().J - (not data_running.pbc)
     J = min(J_target, J_running)
 
-    n_bins_target = data_target.get_CS_op().n_bins
-    n_bins_running = data_running.get_CS_op().n_bins
-    n_bins = min(n_bins_target, n_bins_running)
-
     if J_target != J_running:
         print(
             f"Warning: target.J = {J_target}, running.J = {J_running}. Synthesis will use J = {J}."
         )
 
-    # Get scattering operators for target and running data with selected J
-    st_op_target = data_target.get_ST_op(
-        J=J, n_bins=n_bins, has_fewer_convolutions=has_fewer_convolutions
-    )
-
-    st_op_running = data_running.get_ST_op(
-        J=J,
-        n_bins=n_bins,
-        has_fewer_convolutions=has_fewer_convolutions,
-        replace_nan_value=None,
-    )
-
-    # Disable power spectrum optimization if NaN values are present in target and/or running data
+    # Decide about the power spectrum *before* touching the spectrum operators:
+    # building one is expensive (a spherical harmonic transform at high
+    # resolution), so it must not happen when the spectrum will not be used.
     target_has_nan = data_target.array.isnan().any()
     running_has_nan = data_running.array.isnan().any()
 
-    if target_has_nan or running_has_nan:
-        print(
-            "⚠️ Warning: NaN detected in target and/or running data.\n"
-            "Power spectrum optimization is disabled because its computation is not yet implemented for NaN values in any dataclass. \n"
+    if compute_PS is None:
+        compute_PS = not (target_has_nan or running_has_nan)
+        if target_has_nan or running_has_nan:
+            print(
+                "⚠️ Warning: NaN detected in target and/or running data.\n"
+                "Power spectrum optimization is disabled because its computation is not yet implemented for NaN values in any dataclass. \n"
+            )
+    elif compute_PS and (target_has_nan or running_has_nan):
+        raise ValueError(
+            "compute_PS=True was requested but the data contain NaNs, on which "
+            "the power spectrum is undefined."
         )
 
-    compute_PS = not (target_has_nan or running_has_nan)
+    st_op_kwargs = {"has_fewer_convolutions": has_fewer_convolutions}
+    if compute_PS:
+        n_bins = min(data_target.get_CS_op().n_bins, data_running.get_CS_op().n_bins)
+        st_op_kwargs["n_bins"] = n_bins
+
+    # Get scattering operators for target and running data with selected J
+    st_op_target = data_target.get_ST_op(J=J, compute_PS=compute_PS, **st_op_kwargs)
+
+    st_op_running = data_running.get_ST_op(
+        J=J,
+        compute_PS=compute_PS,
+        replace_nan_value=None,
+        **st_op_kwargs,
+    )
 
     # Set default optimization parameters and update with user-provided values
     optim_params = dict(
@@ -655,7 +683,7 @@ def synthesize_from_maps(
         verbose=True,
         seed=26,
         prefilter_Nyquist=(
-            True if init_running is None else not init_running.isnan.any()
+            True if init_running is None else not _contains_nan(init_running)
         ),
         adhoc_weights={"S3": 3.5, "S4": 3.5**2},
     )
