@@ -601,7 +601,8 @@ def synthesize_from_maps(
             "Power spectrum optimization is disabled because its computation is not yet implemented for NaN values in any dataclass. \n"
         )
 
-    compute_PS = not (target_has_nan or running_has_nan)
+    # compute_PS = not (target_has_nan or running_has_nan)
+    compute_PS = False  # Try to synthesis the PSD directly from S2 coefficients synthesis (plus an eventual PSD whitening of the target)
 
     # Set default optimization parameters and update with user-provided values
     optim_params = dict(
