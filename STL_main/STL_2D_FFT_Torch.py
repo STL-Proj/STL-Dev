@@ -556,6 +556,75 @@ class WaveletOperator2D_FFT_torch:
         return c_L * bump_window * angular_part
 
     @classmethod
+    def _periodic_bump_steerable_2d(
+        cls,
+        omega_grid,
+        scale_factor,
+        R,
+        L,
+        c_L,
+        xi0,
+    ):
+        filter_sum = torch.zeros_like(omega_grid[..., 0])
+
+        shifts = [
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 0),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ]
+
+        for nx, ny in shifts:
+            omega_shifted = omega_grid + 2 * math.pi * torch.tensor(
+                [nx, ny],
+                device=omega_grid.device,
+                dtype=omega_grid.dtype,
+            )
+
+            q = scale_factor * omega_shifted @ R.T
+
+            filter_sum += cls.analytic_bump_steerable_2d(
+                q,
+                L=L,
+                c_L=c_L,
+                xi0=xi0,
+            )
+
+        return filter_sum
+
+    # Design the oriented low-pass filters by convexly blending a purely isotropic energy
+    # at the origin with a directional energy away from it, thereby removing the origin
+    # singularity inherent to standalone oriented designs.
+    @staticmethod
+    def oriented_low_pass_filter_2d(omega_grid, low_pass_filter, sigma_r, L, c_L):
+
+        omega_sq = omega_grid[..., 0].square() + omega_grid[..., 1].square()
+
+        # Radial blending function
+        alpha = torch.exp(-omega_sq / (2.0 * (sigma_r**2)))
+
+        # Isotropic energy (same contribution for all orientations)
+        isotropic_energy = 1.0 / L
+
+        # Oriented energy (directional contribution)
+        oriented_amp = c_L * torch.abs(
+            torch.cos(torch.atan2(omega_grid[..., 1], omega_grid[..., 0]))
+        ) ** (L - 1)
+        oriented_energy = oriented_amp.square()
+
+        # Convex combination of isotropic and oriented energies
+        oriented_low_pass = low_pass_filter * torch.sqrt(
+            alpha * isotropic_energy + (1.0 - alpha) * oriented_energy
+        )
+
+        return oriented_low_pass
+
+    @classmethod
     def analytic_bump_steerable_bank(
         cls,
         J,
@@ -615,27 +684,8 @@ class WaveletOperator2D_FFT_torch:
                 if j == 0:
 
                     if oriented_low_pass_filter:
-
-                        # Design the oriented low-pass filters by convexly blending a purely isotropic energy
-                        # at the origin with a directional energy away from it, thereby removing the origin
-                        # singularity inherent to standalone oriented designs.
-
-                        # Radial blending function
-                        sigma_r = 1 * sigma_J  # width of the transition region
-                        alpha = torch.exp(-omega_sq / (2.0 * (sigma_r**2)))
-
-                        # Isotropic energy (same contribution for all orientations)
-                        isotropic_energy = 1.0 / L
-
-                        # Oriented energy (directional contribution)
-                        oriented_amp = c_L * torch.abs(
-                            torch.cos(torch.atan2(q[..., 1], q[..., 0]))
-                        ) ** (L - 1)
-                        oriented_energy = oriented_amp**2
-
-                        # Convex combination of isotropic and oriented energies
-                        filters_bank[J, l_idx] = low_pass_filter * torch.sqrt(
-                            alpha * isotropic_energy + (1.0 - alpha) * oriented_energy
+                        filters_bank[J, l_idx] = cls.oriented_low_pass_filter_2d(
+                            q, low_pass_filter, sigma_r=sigma_J, L=L, c_L=c_L
                         )
 
                     # Deform bump steerable wavelet at first scale to Littlewood-Paley condition
@@ -682,6 +732,71 @@ class WaveletOperator2D_FFT_torch:
             return filters_bank
 
         return low_pass_filter, filters_bank
+
+    @classmethod
+    def lp_normalized_bump_steerable_bank(
+        cls, J, L, size, xi0=math.sqrt(2) / 2 * math.pi
+    ):
+
+        #### Generate analytical the filters bank tensor including oriented low pass filters ####
+
+        # to preserve the tensor structure
+        Nx, Ny = size
+        filters_bank = torch.zeros((J + 1, L, Nx, Ny), dtype=torch.complex64)
+        omega_x = 2 * torch.pi * torch.fft.fftfreq(Nx)
+        omega_y = 2 * torch.pi * torch.fft.fftfreq(Ny)
+
+        Omega_x, Omega_y = torch.meshgrid(omega_x, omega_y, indexing="ij")
+        omega_sq = Omega_x**2 + Omega_y**2
+        omega_grid = torch.stack((Omega_x, Omega_y), dim=-1)
+
+        # Isotropic low-pass filter for the largest scale
+        sigma_J = (2 ** -(0.550)) * (2.0 ** (-J + 1)) * xi0
+        low_pass_filter = torch.exp(-omega_sq / (2.0 * (sigma_J**2)))
+
+        # Normalization constant c_L to respect Littlewood-Paley condition in the case of
+        # an infinite resolution and number of wavelets
+        c_L = (
+            math.sqrt(2)
+            * (1.29**-1)
+            * (2 ** (L - 1))
+            * math.factorial(L - 1)
+            / math.sqrt(L * math.factorial(2 * (L - 1)))
+        )
+
+        for j in range(J + 1):
+            scale_factor = 2**j
+            for l_idx, l in enumerate(range(L)):
+                theta = math.pi * l / L
+
+                cos_theta = torch.cos(torch.tensor(theta))
+                sin_theta = torch.sin(torch.tensor(theta))
+                R = torch.tensor(
+                    [[cos_theta, -sin_theta], [sin_theta, cos_theta]],
+                    dtype=omega_grid.dtype,
+                    device=omega_grid.device,
+                )
+
+                if j < J:
+                    filters_bank[j, l_idx] = cls._periodic_bump_steerable_2d(
+                        omega_grid, scale_factor, R, L, c_L, xi0
+                    )
+
+                else:  # j == J:
+                    filters_bank[j, l_idx] = cls.oriented_low_pass_filter_2d(
+                        omega_grid @ R, low_pass_filter, sigma_r=sigma_J, L=L, c_L=c_L
+                    )
+
+        #### Normalize the filters bank to respect the Littlewood-Paley condition ####
+        filters_mirrored = torch.flip(filters_bank, dims=(-2, -1))
+
+        spectral_coverage = 0.5 * (
+            (filters_bank.pow(2) + filters_mirrored.pow(2)).sum(dim=(0, 1))
+        )
+
+        filters_bank /= torch.sqrt(spectral_coverage + 1e-12)
+
+        return filters_bank
 
     @staticmethod
     def _get_crop_border_size_largest_scale_second_layer(data, wavelet_op):
