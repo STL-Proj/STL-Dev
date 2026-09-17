@@ -457,6 +457,7 @@ class WaveletOperatorHealpixKernel_torch:
         gauge_type="cosmo",
         ellipsoid="WGS84",
         down_kwargs=None,
+        pyramid_pixel_batch_size=16384,
     ):
         if J is None:
             raise ValueError(
@@ -484,6 +485,12 @@ class WaveletOperatorHealpixKernel_torch:
         self.gauge_type = gauge_type
         self.ellipsoid = ellipsoid
         self.down_kwargs = dict(down_kwargs or {})
+        if (
+            not isinstance(pyramid_pixel_batch_size, int)
+            or pyramid_pixel_batch_size < 1
+        ):
+            raise ValueError("pyramid_pixel_batch_size must be a positive integer")
+        self.pyramid_pixel_batch_size = pyramid_pixel_batch_size
 
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
@@ -728,7 +735,7 @@ class WaveletOperatorHealpixKernel_torch:
         """
         self._check_data(data)
 
-        if j != data.dg:
+        if self.j_to_dg[j] != data.dg:
             raise ValueError(
                 "j is not equal to data.dg; convolution not consistent with scale."
             )
@@ -756,6 +763,58 @@ class WaveletOperatorHealpixKernel_torch:
         out.cell_ids = cid.clone()
         out.conv_history = list(data.conv_history) + [j]
         return out
+
+    ###########################################################################
+    def apply_level(self, data, j):
+        """Native-resolution wavelet with bounded convolution workspace."""
+        from STL_main.AdjointOps import convolution_forward
+
+        self._check_data(data)
+        if data.dg != self.j_to_dg[j] or data.array.is_complex():
+            raise ValueError("Expected real data at the wavelet's native resolution")
+        conv = self._get_conv(data.dg, data.cell_ids, self.L, self._wav_weights)
+        leading, pixels = data.array.shape[:-1], data.array.shape[-1]
+        y = convolution_forward(
+            conv, data.array.reshape(-1, 1, pixels), self.pyramid_pixel_batch_size
+        )
+        y = y.reshape(*leading, self.L, 2, pixels)
+        out = data.copy(empty=True)
+        out.array = torch.complex(y[..., 0, :], y[..., 1, :])
+        out.dtype = out.array.dtype
+        out.conv_history = list(data.conv_history) + [j]
+        return out
+
+    def adjoint_level(self, gradient, data, j, pixel_batch_size=None):
+        """Explicit real-input VJP of apply_level; no automatic differentiation."""
+        from STL_main.AdjointOps import convolution_adjoint
+
+        if data.dg != self.j_to_dg[j]:
+            raise ValueError("Input template is not at the wavelet's native resolution")
+        conv = self._get_conv(data.dg, data.cell_ids, self.L, self._wav_weights)
+        leading, pixels = gradient.shape[:-2], gradient.shape[-1]
+        split = torch.stack((gradient.real, gradient.imag), dim=-2)
+        result = convolution_adjoint(
+            conv,
+            split.reshape(-1, 2 * self.L, pixels),
+            (
+                self.pyramid_pixel_batch_size
+                if pixel_batch_size is None
+                else pixel_batch_size
+            ),
+        )
+        return result.reshape(*leading, pixels)
+
+    def downsample_adjoint(self, gradient, fine_template):
+        """One-level adjoint using exactly the forward's anti-aliasing weights."""
+        from STL_main.AdjointOps import downsampling_adjoint
+
+        if self.mask_full_res is not None or self.nan_aware_stats:
+            raise NotImplementedError(
+                "Masked downsampling adjoints are not implemented"
+            )
+        return downsampling_adjoint(
+            self._get_down(fine_template.dg, fine_template.cell_ids), gradient
+        )
 
     ###########################################################################
     def apply_smooth(self, data, inplace: bool = True):

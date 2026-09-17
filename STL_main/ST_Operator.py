@@ -239,6 +239,30 @@ class ST_Operator:
         )
 
     ########################################
+    def build_plan(self, **kwargs):
+        """Describe explicit HEALPix coefficients, including their native_dg."""
+        from STL_main.PyramidScattering import build_plan
+
+        return build_plan(self, **kwargs)
+
+    def apply_pyramid(self, pyramid, **kwargs):
+        """Evaluate compact ScatCov statistics without a global gradient graph."""
+        from STL_main.PyramidScattering import apply_pyramid
+
+        return apply_pyramid(self, pyramid, **kwargs)
+
+    def vjp_pyramid(self, pyramid, gradient, **kwargs):
+        """Explicit VJP into independent Laplacian pyramid bands."""
+        from STL_main.PyramidScattering import vjp_pyramid
+
+        return vjp_pyramid(self, pyramid, gradient, **kwargs)
+
+    def loss_and_grad_pyramid(self, pyramid, target, **kwargs):
+        """Fused explicit weighted-square loss and gradient, streamed by batch."""
+        from STL_main.PyramidScattering import loss_and_grad_pyramid
+
+        return loss_and_grad_pyramid(self, pyramid, target, **kwargs)
+
     def apply(
         self,
         data,
