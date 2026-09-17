@@ -3,9 +3,9 @@
 ## [Unreleased]
 
 ### Added
-- Added the experimental `synthesize_healpix_from_patches` routine. It releases
-  the autograd graph after every overlapping NESTED patch, copies only the core
-  gradient into the full map, and reports CPU/CUDA peak-memory diagnostics.
+- Added the experimental `synthesize_healpix_from_patches` routine. It computes
+  successive pixel-block derivatives of one global ScatCov loss, assembles the
+  exact full-map gradient before each update, and reports CPU/CUDA peak memory.
 
 ### Removed
 - Removed the unused `STL_main.SphericalStencil` implementation and its API
