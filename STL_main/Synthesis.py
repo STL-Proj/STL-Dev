@@ -2,6 +2,9 @@
 # optimize_from_maps
 # optimize_from_stats
 
+import gc
+import math
+import threading
 import time
 
 import numpy as np
@@ -9,6 +12,66 @@ import torch
 import torch.nn as nn
 from torch import device, nn
 from torch.optim import LBFGS
+
+
+def _healpix_patch_domains(nside, patch_nside, halo_rings):
+    """Return disjoint NESTED cores and their overlapping halo domains."""
+    from healpix_geo.nested import kth_neighbourhood
+
+    nside = int(nside)
+    patch_nside = int(patch_nside)
+    halo_rings = int(halo_rings)
+    if nside < 1 or nside & (nside - 1):
+        raise ValueError("nside must be a positive power of two")
+    if patch_nside < 1 or patch_nside & (patch_nside - 1):
+        raise ValueError("patch_nside must be a positive power of two")
+    if patch_nside > nside or nside % patch_nside:
+        raise ValueError("patch_nside must divide nside")
+    if halo_rings < 0:
+        raise ValueError("halo_rings must be non-negative")
+
+    descendants = (nside // patch_nside) ** 2
+    patch_depth = int(math.log2(patch_nside))
+    domains = []
+    for parent in range(12 * patch_nside**2):
+        support_parents = kth_neighbourhood(
+            np.asarray([parent], dtype=np.uint64), patch_depth, halo_rings
+        ).reshape(-1)
+        support_parents = np.unique(
+            support_parents[support_parents >= 0].astype(np.int64, copy=False)
+        )
+
+        core = parent * descendants + np.arange(descendants, dtype=np.int64)
+        support = (
+            support_parents[:, None] * descendants
+            + np.arange(descendants, dtype=np.int64)[None, :]
+        ).reshape(-1)
+        support.sort()
+        core_positions = np.searchsorted(support, core)
+        domains.append((core, support, core_positions))
+    return domains
+
+
+def _start_rss_sampler(interval=0.01):
+    """Start an optional process-RSS sampler without making psutil mandatory."""
+    try:
+        import psutil
+    except ImportError:
+        return None, None, None
+
+    process = psutil.Process()
+    stop = threading.Event()
+    sample = {"start": process.memory_info().rss, "peak": 0}
+    sample["peak"] = sample["start"]
+
+    def run():
+        while not stop.wait(interval):
+            sample["peak"] = max(sample["peak"], process.memory_info().rss)
+        sample["peak"] = max(sample["peak"], process.memory_info().rss)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return stop, thread, sample
 
 
 # === Learnable field model ===
@@ -567,6 +630,338 @@ def apply_nyquist_filter(tensor, plot=False):
         plt.show()
 
     return tensor_filtered
+
+
+def synthesize_healpix_from_patches(
+    data_target,
+    patch_nside,
+    nbatch=1,
+    halo_rings=1,
+    J=None,
+    L=None,
+    init_running=None,
+    has_fewer_convolutions=False,
+    compute_cross_matrix=None,
+    mean_field=True,
+    lr=5e-2,
+    max_iter=20,
+    optimizer="adam",
+    print_iter=1,
+    verbose=True,
+    seed=26,
+    adhoc_weights={"S3": 3.5, "S4": 3.5**2},
+    wavelet_op_kwargs=None,
+    track_memory=True,
+    return_diagnostics=False,
+):
+    """Synthesize a full HEALPix map with one autograd graph per patch.
+
+    The full NESTED sphere is split into disjoint core patches.  Each local
+    ScatCov loss is evaluated on the core plus ``halo_rings`` neighbouring
+    patches, but only the gradient on the core is copied into the full map.
+    The local graph is released before the next patch is processed.
+
+    This deliberately optimizes an average of overlapping *local* ScatCov
+    losses.  It is therefore a memory experiment and an approximation of the
+    global ScatCov objective used by :func:`synthesize_from_maps`.  Increasing
+    the halo reduces boundary bias at the cost of a larger peak graph.
+
+    Parameters
+    ----------
+    data_target : STL_Healpix_Kernel_Torch
+        Full-sky, finite, NESTED target map.
+    patch_nside : int
+        Resolution of the parent grid defining the patches.  A patch contains
+        ``(nside / patch_nside)**2`` fine pixels.
+    halo_rings : int
+        Number of neighbouring parent-pixel rings included as context.
+    optimizer : {"adam", "sgd"}
+        Optimizer for the full map.  SGD has no full-map moment buffers and is
+        useful when the purpose of the run is strictly to measure memory.
+    track_memory : bool
+        Record CUDA allocator peaks and, when psutil is installed, process RSS.
+        The measurement starts after the target patch statistics are cached.
+    return_diagnostics : bool
+        If True, return ``(map, diagnostics)`` instead of the map alone.
+
+    Notes
+    -----
+    The optimizer state and the assembled gradient still have full-map size;
+    only the scattering autograd graph is bounded by the largest halo patch.
+    The angular power spectrum is intentionally excluded because it is global.
+    """
+    if getattr(data_target, "DT", None) != "HealpixKernel_torch":
+        raise TypeError("data_target must be an STL_Healpix_Kernel_Torch instance")
+    if not bool(data_target.nest):
+        raise ValueError("patch synthesis requires NESTED HEALPix ordering")
+    if data_target.dg != 0:
+        raise ValueError("data_target must be at its native resolution (dg=0)")
+    if not bool(torch.isfinite(data_target.array).all()):
+        raise ValueError("patch synthesis currently requires a finite target map")
+
+    nside = int(data_target.N0[0])
+    npix = 12 * nside**2
+    expected_ids = torch.arange(
+        npix, device=data_target.cell_ids.device, dtype=torch.long
+    )
+    if data_target.array.shape[-1] != npix or not torch.equal(
+        data_target.cell_ids, expected_ids
+    ):
+        raise ValueError("patch synthesis currently requires a complete full-sky map")
+
+    patch_nside = int(patch_nside)
+    if patch_nside < 1 or patch_nside & (patch_nside - 1):
+        raise ValueError("patch_nside must be a positive power of two")
+    if patch_nside > nside or nside % patch_nside:
+        raise ValueError("patch_nside must divide nside")
+    J = max(1, int(math.log2(nside)) - 1) if J is None else int(J)
+    pixels_across_core = nside // patch_nside
+    if pixels_across_core < 2 ** (J - 1):
+        raise ValueError(
+            "patch cores become empty before the coarsest scattering scale; "
+            "decrease patch_nside or J"
+        )
+    if nbatch < 1:
+        raise ValueError("nbatch must be positive")
+    if max_iter < 1:
+        raise ValueError("max_iter must be positive")
+    if print_iter < 1:
+        raise ValueError("print_iter must be positive")
+
+    torch.manual_seed(seed) if seed is not None else None
+    device = data_target.device
+    dtype = data_target.dtype
+    source = data_target.array
+    input_dim = source.ndim
+    if input_dim == 1:
+        target = source[None, None, :]
+    elif input_dim == 2:
+        target = source[None, ...]
+    elif input_dim == 3:
+        target = source
+    else:
+        raise ValueError(
+            "target array must have shape [Npix], [Nc,Npix] or [Nb,Nc,Npix]"
+        )
+
+    if not mean_field and target.shape[0] != nbatch:
+        raise ValueError(
+            "target and running batch sizes must match when mean_field is False"
+        )
+    mean_target = target.mean(dim=-1)
+    if mean_field:
+        mean_target = mean_target.mean(dim=0, keepdim=True)
+    centred = target - mean_target[..., None]
+    var_target = (centred * centred.conj()).real.mean(dim=-1)
+    if mean_field:
+        var_target = var_target.mean(dim=0, keepdim=True)
+    std_target = torch.sqrt(var_target)
+    if bool((std_target <= torch.finfo(std_target.dtype).eps).any()):
+        raise ValueError("every target channel must have non-zero variance")
+    target_standardized = centred / std_target[..., None]
+
+    nc = target.shape[1]
+    if init_running is None:
+        running = torch.randn((nbatch, nc, npix), device=device, dtype=dtype)
+    else:
+        running = torch.as_tensor(init_running, device=device, dtype=dtype)
+        if running.ndim == 1:
+            running = running[None, None, :]
+        elif running.ndim == 2:
+            running = running[None, ...]
+        elif running.ndim != 3:
+            raise ValueError("init_running has an unsupported number of dimensions")
+        if running.shape[0] == 1 and nbatch != 1:
+            running = running.expand(nbatch, -1, -1).clone()
+        if tuple(running.shape) != (nbatch, nc, npix):
+            raise ValueError(
+                f"init_running must expand to {(nbatch, nc, npix)}, got "
+                f"{tuple(running.shape)}"
+            )
+        running = (running - mean_target[..., None]) / std_target[..., None]
+
+    domains = _healpix_patch_domains(nside, patch_nside, halo_rings)
+    wavelet_op_kwargs = dict(wavelet_op_kwargs or {})
+
+    def make_patch(array, ids):
+        return data_target.__class__(
+            array=array,
+            nside=nside,
+            cell_ids=ids,
+            nest=True,
+            pbc=False,
+        )
+
+    def make_operator(patch):
+        return patch.get_ST_op(
+            J=J,
+            L=L,
+            compute_PS=False,
+            has_fewer_convolutions=has_fewer_convolutions,
+            replace_nan_value=None,
+            wavelet_op_kwargs=wavelet_op_kwargs,
+        )
+
+    # Cache only compact coefficient vectors and normalization references.  The
+    # geometry operators themselves are rebuilt so their per-patch caches cannot
+    # accumulate and hide the graph-memory reduction being measured.
+    target_cache = []
+    with torch.no_grad():
+        for _, support_np, _ in domains:
+            support = torch.as_tensor(support_np, device=device, dtype=torch.long)
+            patch = make_patch(target_standardized.index_select(-1, support), support)
+            st_op = make_operator(patch)
+            stats = st_op.apply(
+                patch,
+                has_fewer_convolutions=has_fewer_convolutions,
+                compute_cross_matrix=compute_cross_matrix,
+                compute_PS=False,
+                norm="store_ref",
+                norm_batch_mean=mean_field,
+            )
+            if adhoc_weights is not None:
+                reweight(stats, adhoc_weights)
+            flat = (
+                stats.to_flatten(mean_along_batch=mean_field, keepnans=False)
+                .detach()
+                .cpu()
+            )
+            refs = {}
+            for name in ("S2_ref_sqrt_chan_diag", "var_ref"):
+                value = getattr(st_op, name)
+                refs[name] = None if value is None else value.detach().cpu()
+            target_cache.append((flat, refs))
+            del stats, st_op, patch, support
+
+    running = nn.Parameter(running)
+    optimizer_name = str(optimizer).lower()
+    if optimizer_name == "adam":
+        optim = torch.optim.Adam([running], lr=lr)
+    elif optimizer_name == "sgd":
+        optim = torch.optim.SGD([running], lr=lr)
+    else:
+        raise ValueError("optimizer must be 'adam' or 'sgd'")
+
+    gc.collect()
+    if device.type == "cuda" and track_memory:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+    stop = thread = rss = None
+    if track_memory:
+        stop, thread, rss = _start_rss_sampler()
+
+    loss_history = []
+    max_support_pixels = max(len(support) for _, support, _ in domains)
+    start = time.perf_counter()
+    try:
+        for iteration in range(max_iter):
+            grad_full = torch.zeros_like(running)
+            loss_value = 0.0
+            for patch_index, (core_np, support_np, core_pos_np) in enumerate(domains):
+                support = torch.as_tensor(support_np, device=device, dtype=torch.long)
+                core = torch.as_tensor(core_np, device=device, dtype=torch.long)
+                core_pos = torch.as_tensor(core_pos_np, device=device, dtype=torch.long)
+                local = (
+                    running.detach()
+                    .index_select(-1, support)
+                    .clone()
+                    .requires_grad_(True)
+                )
+                patch = make_patch(local, support)
+                st_op = make_operator(patch)
+                target_flat_cpu, refs = target_cache[patch_index]
+                for name, value in refs.items():
+                    setattr(
+                        st_op,
+                        name,
+                        None if value is None else value.to(device=device),
+                    )
+                stats = st_op.apply(
+                    patch,
+                    has_fewer_convolutions=has_fewer_convolutions,
+                    compute_cross_matrix=compute_cross_matrix,
+                    compute_PS=False,
+                    norm="load_ref",
+                )
+                if adhoc_weights is not None:
+                    reweight(stats, adhoc_weights)
+                flat = stats.to_flatten(mean_along_batch=mean_field, keepnans=False)
+                target_flat = target_flat_cpu.to(device=device)
+                patch_loss = ((flat - target_flat).abs() ** 2).sum()
+                local_grad = torch.autograd.grad(patch_loss / len(domains), local)[0]
+                grad_full.index_copy_(-1, core, local_grad.index_select(-1, core_pos))
+                loss_value += patch_loss.detach().item() / len(domains)
+                del (
+                    local_grad,
+                    patch_loss,
+                    target_flat,
+                    flat,
+                    stats,
+                    st_op,
+                    patch,
+                    local,
+                    core_pos,
+                    core,
+                    support,
+                )
+
+            optim.zero_grad(set_to_none=True)
+            running.grad = grad_full
+            optim.step()
+            loss_history.append(loss_value)
+            if verbose and (
+                (iteration + 1) % print_iter == 0 or iteration + 1 == max_iter
+            ):
+                print(
+                    f"[patch-{optimizer_name}] iter {iteration + 1}/{max_iter}, "
+                    f"mean local loss = {loss_value:.6e}"
+                )
+    finally:
+        if stop is not None:
+            stop.set()
+            thread.join()
+    elapsed = time.perf_counter() - start
+
+    output = running.detach() * std_target[..., None] + mean_target[..., None]
+    if input_dim == 1:
+        output = output[:, 0]
+    if nbatch == 1:
+        output = output[0]
+
+    diagnostics = {
+        "objective": "mean overlapping local ScatCov losses",
+        "loss_history": loss_history,
+        "elapsed_seconds": elapsed,
+        "patch_count": len(domains),
+        "core_pixels": len(domains[0][0]),
+        "max_graph_pixels": max_support_pixels,
+        "full_sky_pixels": npix,
+        "halo_rings": halo_rings,
+        "patch_nside": patch_nside,
+        "optimizer": optimizer_name,
+        "rss_start_bytes": None if rss is None else rss["start"],
+        "rss_peak_bytes": None if rss is None else rss["peak"],
+        "rss_peak_increase_bytes": (
+            None if rss is None else max(0, rss["peak"] - rss["start"])
+        ),
+        "cuda_peak_allocated_bytes": (
+            torch.cuda.max_memory_allocated(device)
+            if device.type == "cuda" and track_memory
+            else None
+        ),
+        "cuda_peak_reserved_bytes": (
+            torch.cuda.max_memory_reserved(device)
+            if device.type == "cuda" and track_memory
+            else None
+        ),
+    }
+    if verbose:
+        ratio = max_support_pixels / npix
+        print(
+            f"Patch synthesis: {elapsed:.3f} s; largest graph domain "
+            f"{max_support_pixels}/{npix} pixels ({100 * ratio:.1f}%)."
+        )
+    return (output, diagnostics) if return_diagnostics else output
 
 
 # === User-friendly wrapper for synthesis from target maps (high level) ===

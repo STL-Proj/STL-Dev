@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Added the experimental `synthesize_healpix_from_patches` routine. It releases
+  the autograd graph after every overlapping NESTED patch, copies only the core
+  gradient into the full map, and reports CPU/CUDA peak-memory diagnostics.
+
+### Removed
+- Removed the unused `STL_main.SphericalStencil` implementation and its API
+  documentation. HEALPix scattering uses `healpix-analyse` geometry exclusively.
+  Direct users of the removed class must migrate to the corresponding
+  `healpix_analyse` convolution and resampling operators; the APIs differ.
+
+
 ## [v1.0.0] - 2026-01-27
 ### Added
 - Calculation of scattering and cross-channel statistics

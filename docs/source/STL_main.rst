@@ -76,14 +76,6 @@ STL\_main.ST\_Statistics module
    :undoc-members:
    :show-inheritance:
 
-STL\_main.SphericalStencil module
----------------------------------
-
-.. automodule:: STL_main.SphericalStencil
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
 STL\_main.StlData module
 ------------------------
 
