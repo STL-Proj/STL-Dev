@@ -15,6 +15,7 @@ Characteristics:
     - N0 gives x and y sizes for array shaped (..., Nx, Ny).
     - masks are supported in convolutions
 """
+
 import math
 from dataclasses import dataclass
 
@@ -153,6 +154,14 @@ class STL_2D_Kernel_Torch(Base_DataClass):
         data1.dtype = data1.array.dtype
 
         return data1
+
+    def apply_bandlimit(self, array):
+        """
+        Keep only the frequencies inside the Nyquist radius of the pixel grid.
+        """
+        from STL_main.Synthesis import apply_nyquist_filter
+
+        return apply_nyquist_filter(array)
 
     def get_wavelet_op(
         self,

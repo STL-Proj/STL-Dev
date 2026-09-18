@@ -96,6 +96,8 @@ class ST_Statistics:
         standardized,
         mean_pre_std,
         std_pre_std,
+        data_example=None,
+        pix_shape=None,
     ):
         """
         Constructor, see details above.
@@ -104,6 +106,11 @@ class ST_Statistics:
         # Main parameters
         self.DataClass = DataClass
         self.N0 = N0  ######################################## not used?
+        # An empty copy of the input data, kept so that DT-independent code can
+        # rebuild companion fields on the very same geometry, and the shape of
+        # the pixel grid, which is not N0 for every data type.
+        self.data_example = data_example
+        self.pix_shape = pix_shape
         self.Nb = Nb
         self.Nc = Nc
 

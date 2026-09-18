@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Added the experimental `synthesize_healpix_from_patches` routine. It computes
+  successive pixel-block derivatives of one global ScatCov loss, assembles the
+  exact full-map gradient before each update, and reports CPU/CUDA peak memory.
+
+### Removed
+- Removed the unused `STL_main.SphericalStencil` implementation and its API
+  documentation. HEALPix scattering uses `healpix-analyse` geometry exclusively.
+  Direct users of the removed class must migrate to the corresponding
+  `healpix_analyse` convolution and resampling operators; the APIs differ.
+
+
 ## [v1.0.0] - 2026-01-27
 ### Added
 - Calculation of scattering and cross-channel statistics

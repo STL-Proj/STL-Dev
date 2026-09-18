@@ -213,7 +213,13 @@ def maskmean(x, dim=(-2, -1), mask=None):
     if mask is None:
         return x.mean() if dim is None else x.mean(dim=dim)
     else:
-        assert dim == (-2, -1)
+        # Accept any set of trailing dimensions, so that the same helper serves
+        # planar data (dim=(-2,-1)) and HEALPix data (dim=-1).
+        dims = (dim,) if isinstance(dim, int) else tuple(dim)
+        assert sorted(dims) == list(
+            range(-len(dims), 0)
+        ), f"masked mean requires trailing dims, got {dim}"
+        dim = dims
         assert (
             mask.shape[-len(dim) :] == x.shape[-len(dim) :]
         )  # check mask shape matches x shape on masked dims
