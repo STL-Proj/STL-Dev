@@ -11,7 +11,12 @@ from STL_main.AdjointOps import (
     modulus_vjp,
     root_modulus_vjp,
 )
-from STL_main.LossOptim import PyramidOptimizer, PyramidSynthesis, SquaredStatisticsLoss
+from STL_main.LossOptim import (
+    PyramidLBFGS,
+    PyramidOptimizer,
+    PyramidSynthesis,
+    SquaredStatisticsLoss,
+)
 from STL_main.Pyramid import HealpixPyramid
 from STL_main.PyramidScattering import MemoryTracker, PyramidStatistics
 from STL_main.STL_Healpix_Kernel_Torch import STL_Healpix_Kernel_Torch
@@ -184,6 +189,33 @@ def test_synthesis_decreases_loss():
     assert after < before
     assert len(history) == 12
     assert solver.reconstruct().shape == data.array.shape
+
+
+def test_explicit_pyramid_lbfgs_decreases_loss_without_autograd(monkeypatch):
+    data, op, target_p = setup_problem(nside=2, J=1)
+    target = op.apply_pyramid(target_p)
+    optimizer = PyramidLBFGS(lr=0.5, history_size=3)
+    solver = PyramidSynthesis(
+        op,
+        target,
+        optimizer=optimizer,
+        coefficient_batch_size=8,
+        strategy="recompute",
+    )
+    p = solver.initialize_from_noise(data, seed=24)
+    before = solver.loss.value(op.apply_pyramid(p), target)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Pyramid LBFGS invoked automatic differentiation")
+
+    monkeypatch.setattr(torch.autograd, "grad", forbidden)
+    monkeypatch.setattr(torch.Tensor, "backward", forbidden)
+    history = solver.run(p, niter=4)
+    after = solver.loss.value(op.apply_pyramid(p), target)
+
+    assert after < before
+    assert history and len(history) == optimizer.evaluations
+    assert all(not band.requires_grad for band in p.levels)
 
 
 def test_invalid_modes_and_loss_weights():

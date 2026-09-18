@@ -120,6 +120,107 @@ class PyramidOptimizer:
                 p.addcdiv_(m, v.sqrt().add_(self.eps), value=-float(rate))
 
 
+class PyramidLBFGS:
+    """Limited-memory BFGS driven by explicit pyramid gradients.
+
+    PyTorch is used only for the optimizer and strong-Wolfe line search.  The
+    closure receives loss values and gradients from ``loss_and_grad_pyramid``;
+    it never calls backward and never builds an automatic-differentiation
+    graph.  LBFGS history vectors span all pyramid bands, so a deliberately
+    small history is preferable for very large maps.
+    """
+
+    def __init__(
+        self,
+        lr=1.0,
+        history_size=10,
+        tolerance_grad=1e-12,
+        tolerance_change=1e-15,
+        line_search_fn="strong_wolfe",
+    ):
+        if (
+            not math.isfinite(float(lr))
+            or lr <= 0
+            or not isinstance(history_size, int)
+            or history_size < 1
+            or tolerance_grad < 0
+            or tolerance_change < 0
+            or line_search_fn not in (None, "strong_wolfe")
+        ):
+            raise ValueError("Invalid pyramid LBFGS settings")
+        self.lr = float(lr)
+        self.history_size = history_size
+        self.tolerance_grad = float(tolerance_grad)
+        self.tolerance_change = float(tolerance_change)
+        self.line_search_fn = line_search_fn
+        self.evaluations = 0
+        self._pyramid = None
+
+    def minimize(self, pyramid, evaluate, max_iter, callback=None):
+        """Minimize with at most ``max_iter`` LBFGS iterations.
+
+        ``evaluate(pyramid)`` must return ``(scalar_loss, band_gradients)``.
+        The returned history contains every closure evaluation, including the
+        extra evaluations requested by the line search.
+        """
+        if not isinstance(max_iter, int) or max_iter < 1:
+            raise ValueError("max_iter must be a positive integer")
+        if self._pyramid is not None and self._pyramid is not pyramid:
+            raise ValueError("Create a separate optimizer for each pyramid")
+        self._pyramid = pyramid
+        parameters = list(pyramid.levels)
+        if not all(parameter.is_leaf for parameter in parameters):
+            raise ValueError("Pyramid bands must be independent leaf tensors")
+        previous_requires_grad = [parameter.requires_grad for parameter in parameters]
+        for parameter in parameters:
+            parameter.requires_grad_(True)
+
+        optimizer = torch.optim.LBFGS(
+            parameters,
+            lr=self.lr,
+            max_iter=max_iter,
+            history_size=self.history_size,
+            line_search_fn=self.line_search_fn,
+            tolerance_grad=self.tolerance_grad,
+            tolerance_change=self.tolerance_change,
+        )
+        history = []
+
+        def closure():
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                value, gradients = evaluate(pyramid)
+                if len(gradients) != len(parameters):
+                    raise ValueError("One gradient per pyramid band is required")
+                if not bool(torch.isfinite(value)):
+                    raise FloatingPointError("Non-finite synthesis loss")
+                for parameter, gradient in zip(parameters, gradients):
+                    if (
+                        parameter.shape != gradient.shape
+                        or parameter.dtype != gradient.dtype
+                        or parameter.device != gradient.device
+                        or not bool(torch.isfinite(gradient).all())
+                    ):
+                        raise ValueError(
+                            "Gradient shape/dtype/device must match each band and be finite"
+                        )
+                    parameter.grad = gradient
+            loss = value.detach()
+            history.append(float(loss))
+            self.evaluations += 1
+            if callback is not None:
+                callback(self.evaluations - 1, history[-1])
+            return loss
+
+        try:
+            optimizer.step(closure)
+        finally:
+            for parameter, requires_grad in zip(parameters, previous_requires_grad):
+                parameter.grad = None
+                parameter.requires_grad_(requires_grad)
+        return history
+
+
 class PyramidSynthesis:
     """End-to-end explicit synthesis; target statistics are copied and detached."""
 
@@ -162,7 +263,7 @@ class PyramidSynthesis:
         return self.pyramid
 
     @torch.no_grad()
-    def step(self, pyramid):
+    def _loss_and_gradient(self, pyramid):
         if type(self.loss) is SquaredStatisticsLoss:
             value, gradients = self.operator.loss_and_grad_pyramid(
                 pyramid, self.target, weights=self.loss.weights, **self.options
@@ -177,6 +278,13 @@ class PyramidSynthesis:
             )
         if not bool(torch.isfinite(value)):
             raise FloatingPointError("Non-finite synthesis loss")
+        return value, gradients
+
+    @torch.no_grad()
+    def step(self, pyramid):
+        if isinstance(self.optimizer, PyramidLBFGS):
+            raise TypeError("Use run() to execute a PyramidLBFGS optimization")
+        value, gradients = self._loss_and_gradient(pyramid)
         self.optimizer.step(pyramid, gradients)
         self.pyramid = pyramid
         return float(value)
@@ -184,6 +292,14 @@ class PyramidSynthesis:
     def run(self, pyramid, niter=100, callback=None):
         if not isinstance(niter, int) or niter < 0:
             raise ValueError("niter must be a nonnegative integer")
+        if isinstance(self.optimizer, PyramidLBFGS):
+            if niter == 0:
+                return []
+            history = self.optimizer.minimize(
+                pyramid, self._loss_and_gradient, niter, callback
+            )
+            self.pyramid = pyramid
+            return history
         history = []
         for iteration in range(niter):
             history.append(self.step(pyramid))
