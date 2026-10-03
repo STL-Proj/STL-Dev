@@ -1286,7 +1286,6 @@ class CS_operator_2D_FFT_torch:
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
         get_crop_border_size_method="flexible_crop",
-        nan_aware=False,
     ):
         """
         Initialize a frequency binning object.
@@ -1310,17 +1309,14 @@ class CS_operator_2D_FFT_torch:
         if self.binnig_type not in {"legacy", "gaussian_rings"}:
             raise ValueError("binnig_type must be either 'legacy' or 'gaussian_rings'")
         self.spectum_method = str(spectum_method).lower().strip()
-        if self.spectum_method not in {"fft"}:
-            raise ValueError("spectum_method must be 'fft'")
+        if self.spectum_method not in {"fft", "masked_bands"}:
+            raise ValueError("spectum_method must be 'fft' or 'masked_bands'")
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
         # --- PBC (periodic boundary conditions) ---
         self.get_crop_border_size_method = get_crop_border_size_method
         self.estimate_crop_borders()
-
-        # --- NaN awareness ---
-        self.nan_aware = bool(nan_aware)
 
         # --- radial frequency binning ---
         self.kmax = min(self.shape) // 2
@@ -1555,7 +1551,7 @@ class CS_operator_2D_FFT_torch:
     def apply(
         self,
         data,
-        spectum_method=None,
+        spectrum_method=None,
         compute_cross_spectrum_matrix=None,
         get_crop_border_size_method=None,
         pbc_mask_type=None,
@@ -1568,6 +1564,10 @@ class CS_operator_2D_FFT_torch:
         ----------
         - data : STL_2D_FFT_Torch
             Input data at dg=0.
+        - spectrum_method : str or None
+            Method to compute the spectrum. Supported values are "fft" and "masked_bands".
+            If None, uses the default method specified in the operator constructor. It is
+            advised to use "fft" for periodic data and "masked_bands" for non-periodic data.
         - compute_cross_spectrum_matrix : torch.BoolTensor of shape [Nc, Nc]
             Which channel pairs to compute. None means auto-spectra only.
         - get_crop_border_size_method : str or None
@@ -1635,10 +1635,10 @@ class CS_operator_2D_FFT_torch:
             raise ValueError(f"Expected data of dimension 2, 3 or 4, got {x.ndim}.")
         Nb, Nc, _, _ = x.shape
 
-        method = (
-            self.spectum_method
-            if spectum_method is None
-            else str(spectum_method).lower().strip()
+        spectrum_method = (
+            self.spectrum_method
+            if spectrum_method is None
+            else str(spectrum_method).lower().strip()
         )
 
         if compute_cross_spectrum_matrix is None:
@@ -1666,12 +1666,14 @@ class CS_operator_2D_FFT_torch:
         if not pairs:
             return out
 
-        if data.pbc:
+        if spectrum_method == "fft":
             values = self._apply_fft(data, pairs)
-        elif not data.pbc:
+        elif spectrum_method == "masked_bands":
             values = self._apply_masked_bands(
                 x, data, pairs, pbc_mask_type, get_border_size_method
             )
+        else:
+            raise ValueError(f"Unknown spectrum method: {spectrum_method}")
 
         for (c1, c2), cs in zip(pairs, values):
             # C_l is real and symmetric in the two channels
