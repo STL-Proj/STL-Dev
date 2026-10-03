@@ -1309,8 +1309,8 @@ class CS_operator_2D_FFT_torch:
         if self.binnig_type not in {"legacy", "gaussian_rings"}:
             raise ValueError("binnig_type must be either 'legacy' or 'gaussian_rings'")
         self.spectum_method = str(spectum_method).lower().strip()
-        if self.spectum_method not in {"fft", "masked_bands"}:
-            raise ValueError("spectum_method must be 'fft' or 'masked_bands'")
+        if self.spectum_method not in {"fft", "pbc_mask"}:
+            raise ValueError("spectum_method must be 'fft' or 'pbc_mask'")
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
@@ -1565,9 +1565,9 @@ class CS_operator_2D_FFT_torch:
         - data : STL_2D_FFT_Torch
             Input data at dg=0.
         - spectrum_method : str or None
-            Method to compute the spectrum. Supported values are "fft" and "masked_bands".
+            Method to compute the spectrum. Supported values are "fft" and "pbc_mask".
             If None, uses the default method specified in the operator constructor. It is
-            advised to use "fft" for periodic data and "masked_bands" for non-periodic data.
+            advised to use "fft" for periodic data and "pbc_mask" for non-periodic data.
         - compute_cross_spectrum_matrix : torch.BoolTensor of shape [Nc, Nc]
             Which channel pairs to compute. None means auto-spectra only.
         - get_crop_border_size_method : str or None
@@ -1668,8 +1668,8 @@ class CS_operator_2D_FFT_torch:
 
         if spectrum_method == "fft":
             values = self._apply_fft(data, pairs)
-        elif spectrum_method == "masked_bands":
-            values = self._apply_masked_bands(
+        elif spectrum_method == "pbc_mask":
+            values = self._apply_pbc_mask(
                 x, data, pairs, pbc_mask_type, get_border_size_method
             )
         else:
@@ -1765,6 +1765,7 @@ class CS_operator_2D_FFT_torch:
 
     ###########################################################################
     def _apply_fft(self, data, pairs):
+
         fft = torch.fft.rfft2(data)  # [Nb, Nc, N, M//2 + 1]
 
         return [
@@ -1773,9 +1774,7 @@ class CS_operator_2D_FFT_torch:
         ]
 
     ###########################################################################
-    def _apply_masked_bands(
-        self, data, pairs, pbc_mask_type, get_crop_border_size_method
-    ):
+    def _apply_pbc_mask(self, data, pairs, pbc_mask_type, get_crop_border_size_method):
         """
         Frequency bands reconstructed in real space, with a spatial mask applied to remove or mitigate
         the effect of contaminated pixels introduced by the spatial convolution associated with the
