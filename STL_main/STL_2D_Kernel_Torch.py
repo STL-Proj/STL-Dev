@@ -1303,17 +1303,17 @@ class CS_operator_2D_Kernel_Torch:
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
-        # --- PBC (periodic boundary conditions) ---
-        self.get_crop_border_size_method = get_crop_border_size_method
-        self.estimate_crop_borders()
-
         # --- radial frequency binning ---
-        self.kmax = min(self.shape) // 2
+        self.kmax = 0.5
         self.radial_k = torch.arange(
-            self.kmax + 1, device=self.device, dtype=self.dtype
+            self.kmax * min(self.shape) + 1, device=self.device, dtype=self.dtype
         )
         self.n_bins = n_bins
         self._build_bin_windows()
+
+        # --- PBC (periodic boundary conditions) ---
+        self.get_crop_border_size_method = get_crop_border_size_method
+        self.estimate_pbc_border_crop()
 
     ###########################################################################
     def _build_bin_windows(self):
@@ -1424,35 +1424,64 @@ class CS_operator_2D_Kernel_Torch:
         return windows
 
     ###########################################################################
-    def estimate_crop_borders(self):
+    def estimate_pbc_border_crop(self, energy_fraction=0.60):
 
-        N, M = self.shape
+        r = torch.arange(
+            min(self.shape[-2], self.shape[-1]) // 2 + 1,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
-        # Create impulse at right border, centered vertically
-        impulse = torch.zeros((N, M), device=self.device, dtype=self.dtype)
-        impulse[N // 2, M // 2] = 1.0
+        dk = self.radial_k[1] - self.radial_k[0]
 
-        # FFT of impulse
-        impulse_ft = torch.fft.fftshift(torch.fft.fft2(impulse, norm="ortho"))  # [N, M]
+        kernel = (
+            2
+            * torch.pi
+            * self.radial_k[None, :]
+            * torch.special.bessel_j0(
+                2 * torch.pi * r[:, None] * self.radial_k[None, :]
+            )
+            * dk
+        )  # [n_r, n_k]
 
-        # Apply all masks in batch
-        impulse_ft = impulse_ft.unsqueeze(0)  # [1, N, M] for broadcasting
-        psfs = torch.fft.ifft2(
-            torch.fft.ifftshift(impulse_ft * self.bin_masks, dim=(-2, -1)),
-            norm="ortho",
-            dim=(-2, -1),
-        ).real  # [n_bins, N, M]
+        psf_radial = (
+            self.bin_windows[:, None, :] @ kernel[None, :, :].transpose(-1, -2)
+        ).squeeze(1)
+        # [n_bins, n_r]
 
-        # Extract horizontal traces from pixel source
-        traces = psfs[:, N // 2, : M // 2].abs()  # [n_bins, M//2]
+        # Estimate the crop borders based on the PSF radial profile.
+        energy_density = 2 * torch.pi * psf_radial.abs().square()  # [n_bin, n_r]
 
-        # Determine border where PSF drops below threshold_percent of the trace at the source pixel (maximum value)
-        threshold_percent = 0.1
-        threshold = threshold_percent * traces[:, -1].unsqueeze(1)  # [n_bins, 1]
-        above_thresh = traces > threshold  # [n_bins, M//2]
-        self.crop_borders = math.ceil(M / 2) - (
-            above_thresh.float().argmax(dim=1) + 1
-        )  # [n_bins]
+        # Cumulative energy
+        cumulative_energy = torch.cumulative_trapezoid(
+            energy_density,
+            r,
+            dim=-1,
+        )
+
+        # Add E(0) = 0 (cumulative energy at radius 0 not returned by torch.cumulative_trapezoid)
+        cumulative_energy = torch.cat(
+            [
+                torch.zeros(
+                    (psf_radial.shape[0], 1),
+                    device=self.device,
+                    dtype=self.dtype,
+                ),
+                cumulative_energy,
+            ],
+            dim=-1,
+        )
+
+        # Fraction of total energy
+        energy_fraction_r = cumulative_energy / cumulative_energy[:, -1:]
+
+        # First radius reaching the desired fraction
+        support_idx = torch.argmax(
+            (energy_fraction_r >= energy_fraction).long(),
+            dim=-1,
+        )
+
+        self.crop_borders = r[support_idx].long()
 
     ###########################################################################
     def build_pbc_mask(self, array, border, pbc_mask_type="smooth"):

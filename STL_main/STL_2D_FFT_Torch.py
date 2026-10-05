@@ -1281,50 +1281,64 @@ class CS_operator_2D_FFT_torch:
         n_bins=None,
         J=None,
         Jmin=0,
-        binnig_type="gaussian_rings",
-        spectum_method="fft",
+        binning_type="gaussian_rings",
+        spectrum_method="fft",
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
         get_crop_border_size_method="flexible_crop",
+        pbc_mask_type="hard",
     ):
         """
         Initialize a frequency binning object.
 
         Args:
-            N0 (tuple): Image size (N, M)
+            shape (tuple): Image size (N, M)
             n_bins (int): Number of radial frequency bins
             device: torch device
             dtype: torch dtype
             get_crop_border_size_method : str ("flexible_crop" or "largest_crop")
+            pbc_mask_type : str ("hard" or "smooth")
         """
         self.shape = shape
-        self.J = int(np.log2(min(shape))) - 2 if J is None else J
+        self.N = min(shape)
+        self.J = int(np.log2(self.N)) - 2 if J is None else J
         if Jmin < 0 or Jmin > self.J - 2:
             raise ValueError(
                 f"Jmin must satisfy 0 <= Jmin <= J - 2 "
                 f"(got Jmin={Jmin}, J={self.J})."
             )
         self.Jmin = Jmin
-        self.binnig_type = str(binnig_type).lower().strip()
-        if self.binnig_type not in {"legacy", "gaussian_rings"}:
-            raise ValueError("binnig_type must be either 'legacy' or 'gaussian_rings'")
-        self.spectum_method = str(spectum_method).lower().strip()
-        if self.spectum_method not in {"fft", "pbc_mask"}:
-            raise ValueError("spectum_method must be 'fft' or 'pbc_mask'")
+        self.binning_type = str(binning_type).lower().strip()
+        if self.binning_type not in {"legacy", "gaussian_rings"}:
+            raise ValueError("binning_type must be either 'legacy' or 'gaussian_rings'")
+        self.spectrum_method = str(spectrum_method).lower().strip()
+        if self.spectrum_method not in {"fft", "pbc_mask"}:
+            raise ValueError("spectrum_method must be 'fft' or 'pbc_mask'")
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
 
-        # --- PBC (periodic boundary conditions) ---
-        self.get_crop_border_size_method = get_crop_border_size_method
-        self.estimate_crop_borders()
-
         # --- radial frequency binning ---
-        self.kmax = min(self.shape) // 2
-        self.radial_k = torch.arange(
-            self.kmax + 1, device=self.device, dtype=self.dtype
+        self.kmax = 0.5
+        self.radial_k = torch.linspace(
+            0,
+            self.kmax,
+            self.N // 2 + 1,
+            device=self.device,
+            dtype=self.dtype,
         )
+
         self.n_bins = n_bins
         self._build_bin_windows()
+
+        # --- flat FFT index for cross-spectra ---
+        self._build_fft_index()
+
+        # --- PBC (periodic boundary conditions) ---
+        self.get_crop_border_size_method = get_crop_border_size_method
+        self.pbc_mask_type = str(pbc_mask_type).lower().strip()
+        if self.pbc_mask_type not in {"hard", "smooth"}:
+            raise ValueError("pbc_mask_type must be 'hard' or 'smooth'")
+        self.estimate_pbc_border_crop()
 
     ###########################################################################
     def _build_bin_windows(self):
@@ -1344,6 +1358,71 @@ class CS_operator_2D_FFT_torch:
             )
         self.n_bins = int(self.n_bins)
 
+        # --- dispatch to the appropriate bin windows builder ---
+        if self.binning_type == "gaussian_rings":
+            windows = self._build_log_gaussian_bin_masks()
+        else:
+            windows = self._build_legacy_bin_masks()
+
+        self.bin_windows = windows  # [n_bins, kmax+1]
+
+        # --- bin weights ---
+        K = torch.arange(
+            -self.N // 2,
+            self.N // 2,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        KX, KY = torch.meshgrid(K, K, indexing="ij")
+
+        radial_freq_2d = torch.sqrt(KX**2 + KY**2)
+
+        radial_bin_2d = torch.round(radial_freq_2d).long()
+
+        mask = radial_bin_2d <= self.N * self.kmax
+
+        _, self.n_modes_radial = torch.unique(
+            radial_bin_2d[mask],
+            return_counts=True,
+        )
+
+        self.bin_weights = windows * self.n_modes_radial[None, :]  # [n_bins, N//2+1]
+
+        # --- bin normalization ---
+        self.bin_norm = torch.sum(self.bin_weights, dim=-1)  # [n_bins]
+
+    ###########################################################################
+    def _build_legacy_bin_masks(self):
+
+        lam = (self.k_max / self.k_min) ** (1 / (self.n_bins + 1))
+
+        scales_j = torch.arange(1, self.n_bins + 1)
+        self.bin_centers = self.k_min * lam**scales_j
+
+        windows = torch.stack(
+            [
+                torch.stack(
+                    [
+                        torch.as_tensor(
+                            self.kappa_lambda(
+                                k / self.bin_centers[j - 1],
+                                lam,
+                            ),
+                            device=self.device,
+                            dtype=self.dtype,
+                        )
+                        for k in self.radial_k
+                    ]
+                )
+                for j in scales_j
+            ]
+        )
+        return windows
+
+    ###########################################################################
+    def _build_log_gaussian_bin_masks(self):
+
         # --- binning edges and centers ---
         log_edges = torch.linspace(
             np.log(self.k_min),
@@ -1355,61 +1434,6 @@ class CS_operator_2D_FFT_torch:
 
         log_centers = 0.5 * (log_edges[:-1] + log_edges[1:])
         self.bin_centers = torch.exp(log_centers)
-
-        # --- dispatch to the appropriate bin windows builder ---
-        if self.binnig_type == "gaussian_rings":
-            windows = self._build_log_gaussian_bin_masks(log_edges)
-        else:
-            windows = self._build_legacy_bin_masks()
-
-        windows = torch.where(
-            (self.radial_k >= self.k_min)[None, :],
-            windows,
-            torch.zeros_like(windows),
-        )
-
-        self.bin_windows = windows  # [n_bins, kmax+1]
-
-        # --- bin weights ---
-        k = torch.cat(
-            [
-                -self.radial_k[:0:-1],
-                self.radial_k,
-            ]
-        )
-        radial_freq_2d = torch.sqrt(k[:, None] ** 2 + k[None, :] ** 2)
-        _, self.n_modes_radial = torch.unique(
-            torch.round(radial_freq_2d).flatten(),
-            return_counts=True,
-        )
-        self.bin_weights = windows * self.n_modes_radial[None, :]  # [n_bins, kmax+1]
-
-        # --- bin normalization ---
-        self.bin_norm = torch.sum(self.bin_weights, dim=-1)  # [n_bins]
-
-    ###########################################################################
-    def _build_legacy_bin_masks(self):
-
-        lam = (self.k_max / self.k_min) ** (1 / (self.n_bins + 1))
-
-        windows = torch.stack(
-            [
-                self.kappa_lambda(
-                    self.radial_k
-                    / self.bin_centers[j]
-                    * lam ** (-0.5 - (j + 0.5) / self.n_bins),
-                    lam,
-                )
-                for j in range(self.n_bins)
-            ]
-        )
-
-        return windows
-
-    ###########################################################################
-    def _build_log_gaussian_bin_masks(self, log_edges):
-
-        log_centers = 0.5 * (log_edges[1:] + log_edges[:-1])
 
         log_sigma = torch.abs(log_edges[1:] - log_edges[:-1])
         log_sigma = torch.where(
@@ -1435,35 +1459,57 @@ class CS_operator_2D_FFT_torch:
         return windows
 
     ###########################################################################
-    def estimate_crop_borders(self):
+    def estimate_pbc_border_crop(self, energy_fraction=0.60):
 
-        N, M = self.shape
+        r = torch.arange(
+            self.N // 2 + 1,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
-        # Create impulse at right border, centered vertically
-        impulse = torch.zeros((N, M), device=self.device, dtype=self.dtype)
-        impulse[N // 2, M // 2] = 1.0
+        dk = self.radial_k[1] - self.radial_k[0]
 
-        # FFT of impulse
-        impulse_ft = torch.fft.fftshift(torch.fft.fft2(impulse, norm="ortho"))  # [N, M]
+        kernel = (
+            2
+            * torch.pi
+            * self.radial_k[None, :]
+            * torch.special.bessel_j0(
+                2 * torch.pi * r[:, None] * self.radial_k[None, :]
+            )
+            * dk
+        )  # [N//2+1, n_k]
 
-        # Apply all masks in batch
-        impulse_ft = impulse_ft.unsqueeze(0)  # [1, N, M] for broadcasting
-        psfs = torch.fft.ifft2(
-            torch.fft.ifftshift(impulse_ft * self.bin_masks, dim=(-2, -1)),
-            norm="ortho",
-            dim=(-2, -1),
-        ).real  # [n_bins, N, M]
+        psf_radial = (
+            self.bin_windows[:, None, :] @ kernel[None, :, :].transpose(-1, -2)
+        ).squeeze(1)
+        # [n_bins, N//2+1]
 
-        # Extract horizontal traces from pixel source
-        traces = psfs[:, N // 2, : M // 2].abs()  # [n_bins, M//2]
+        # Estimate the crop borders based on the PSF radial profile.
+        energy_density = 2 * torch.pi * r * psf_radial.abs().square()  # [n_bin, N//2+1]
 
-        # Determine border where PSF drops below threshold_percent of the trace at the source pixel (maximum value)
-        threshold_percent = 0.1
-        threshold = threshold_percent * traces[:, -1].unsqueeze(1)  # [n_bins, 1]
-        above_thresh = traces > threshold  # [n_bins, M//2]
-        self.crop_borders = math.ceil(M / 2) - (
-            above_thresh.float().argmax(dim=1) + 1
-        )  # [n_bins]
+        # Cumulative energy
+        cumulative_energy = torch.cat(
+            [
+                torch.zeros_like(energy_density[..., :1]),
+                torch.cumulative_trapezoid(
+                    energy_density,
+                    r,
+                    dim=-1,
+                ),
+            ],
+            dim=-1,
+        )
+
+        # Fraction of total energy
+        energy_fraction_r = cumulative_energy / cumulative_energy[:, -1:]
+
+        # First radius reaching the desired fraction
+        support_idx = torch.argmax(
+            (energy_fraction_r >= energy_fraction).long(),
+            dim=-1,
+        )
+
+        self.crop_borders = r[support_idx].long()
 
     ###########################################################################
     def build_pbc_mask(self, array, border, pbc_mask_type="smooth"):
@@ -1529,15 +1575,12 @@ class CS_operator_2D_FFT_torch:
 
     ###########################################################################
     def _build_hard_pbc_mask(self, array, border):
-        n_bins_dim, N, M = array.shape[-3], array.shape[-2], array.shape[-1]
-        if border.shape[0] != n_bins_dim:
-            raise ValueError(
-                f"border length ({border.shape[0]}) does not match n_bins ({n_bins_dim})"
-            )
+        N, M = array.shape[-2:]
 
         rows = torch.arange(N, device=array.device).view(1, N, 1)
         cols = torch.arange(M, device=array.device).view(1, 1, M)
-        border_broadcast = border.to(device=array.device).view(n_bins_dim, 1, 1)
+        border_broadcast = border.to(device=array.device).view(-1, 1, 1)
+
         mask = (
             (rows >= border_broadcast)
             & (rows < (N - border_broadcast))
@@ -1545,7 +1588,7 @@ class CS_operator_2D_FFT_torch:
             & (cols < (M - border_broadcast))
         )
 
-        return mask
+        return mask  # [n_bins, N, M]
 
     ###########################################################################
     def apply(
@@ -1555,7 +1598,6 @@ class CS_operator_2D_FFT_torch:
         compute_cross_spectrum_matrix=None,
         get_crop_border_size_method=None,
         pbc_mask_type=None,
-        get_border_size_method=None,
     ):
         """
         Compute the binned radial cross-spectrum of the input data.
@@ -1576,8 +1618,8 @@ class CS_operator_2D_FFT_torch:
         - pbc_mask_type : str or None
             Type of spatial mask used to mitigate PBC contamination when data is not periodic.
             Supported values are "hard" and "smooth". If None, uses the default specified in the operator constructor.
-        - get_border_size_method : str or None
-            Method to determine the border size for the PBC mask.
+        - get_crop_border_size_method : str or None
+            Method to determine the crop border size for non-PBC data.
             If None, uses the default method specified in the operator constructor.
 
         Returns
@@ -1619,21 +1661,21 @@ class CS_operator_2D_FFT_torch:
             else str(pbc_mask_type).lower().strip()
         )
 
-        get_border_size_method = (
-            self.get_border_size_method
-            if get_border_size_method is None
-            else get_border_size_method
+        get_crop_border_size_method = (
+            self.get_crop_border_size_method
+            if get_crop_border_size_method is None
+            else get_crop_border_size_method
         )
 
         # --- put the data in the expected (Nb, Nc, N, M) shape ---
-        x = data.array
-        if x.ndim == 2:
-            x = x[None, None, :, :]
-        elif x.ndim == 3:
-            x = x[None, :, :, :]
-        elif x.ndim != 4:
-            raise ValueError(f"Expected data of dimension 2, 3 or 4, got {x.ndim}.")
-        Nb, Nc, _, _ = x.shape
+        array = data.array
+        if array.ndim == 2:
+            array = array[None, None, :, :]
+        elif array.ndim == 3:
+            array = array[None, :, :, :]
+        elif array.ndim != 4:
+            raise ValueError(f"Expected data of dimension 2, 3 or 4, got {array.ndim}.")
+        Nb, Nc, _, _ = array.shape
 
         spectrum_method = (
             self.spectrum_method
@@ -1643,17 +1685,17 @@ class CS_operator_2D_FFT_torch:
 
         if compute_cross_spectrum_matrix is None:
             compute_cross_spectrum_matrix = torch.eye(
-                Nc, dtype=torch.bool, device=x.device
+                Nc, dtype=torch.bool, device=array.device
             )
         else:
             compute_cross_spectrum_matrix = compute_cross_spectrum_matrix.to(
-                device=x.device
+                device=array.device
             )
 
         out = torch.full(
             (Nb, Nc, Nc, self.n_bins),
             float("nan"),
-            device=x.device,
+            device=array.device,
             dtype=torch.promote_types(self.dtype, torch.complex64),
         )
 
@@ -1663,14 +1705,15 @@ class CS_operator_2D_FFT_torch:
             for c2 in range(c1, Nc)
             if bool(compute_cross_spectrum_matrix[c1, c2])
         ]
+
         if not pairs:
             return out
 
         if spectrum_method == "fft":
-            values = self._apply_fft(data, pairs)
+            values = self._apply_fft(array, pairs)
         elif spectrum_method == "pbc_mask":
             values = self._apply_pbc_mask(
-                x, data, pairs, pbc_mask_type, get_border_size_method
+                array, pairs, pbc_mask_type, get_crop_border_size_method
             )
         else:
             raise ValueError(f"Unknown spectrum method: {spectrum_method}")
@@ -1695,13 +1738,13 @@ class CS_operator_2D_FFT_torch:
         """
         N, M = self.shape
 
-        ky = torch.fft.fftfreq(
+        ky = N * torch.fft.fftfreq(
             N,
             device=self.device,
             dtype=self.dtype,
         )
 
-        kx = torch.fft.rfftfreq(
+        kx = M * torch.fft.rfftfreq(
             M,
             device=self.device,
             dtype=self.dtype,
@@ -1710,12 +1753,14 @@ class CS_operator_2D_FFT_torch:
         KY, KX = torch.meshgrid(ky, kx, indexing="ij")
         radial_freq = torch.sqrt(KX**2 + KY**2)
         self.radial_bin_of_k = torch.round(radial_freq).long()
-        self.radial_bin_of_k[radial_freq > self.kmax] = -1
+        # same cut as n_modes_radial (on the rounded radius), so counts and sums match
+        outside = self.radial_bin_of_k > self.N // 2
+        self.radial_bin_of_k[outside] = -1
 
         weight_of_k = torch.ones_like(KX)
         weight_of_k[:, 1:-1] = 2.0
         self._weight_of_k = weight_of_k
-        self._weight_of_k[radial_freq > self.kmax] = 0
+        self._weight_of_k[outside] = 0
 
     ###########################################################################
     def _cross_pk(self, fft1, fft2):
@@ -1740,17 +1785,21 @@ class CS_operator_2D_FFT_torch:
         """
         contrib = (fft1 * fft2.conj()).real * self._weight_of_k
 
-        shape = contrib.shape[:-2] + (self.kmax + 1,)
+        shape = contrib.shape[:-2] + (self.N // 2 + 1,)
+
         pk = torch.zeros(
             shape,
             device=contrib.device,
             dtype=contrib.dtype,
         )
 
+        radial_bin = self.radial_bin_of_k.flatten()
+        valid = radial_bin >= 0
+
         pk = pk.index_add(
             -1,
-            self.radial_bin_of_k.flatten(),
-            contrib.flatten(start_dim=-2),
+            radial_bin[valid],
+            contrib.flatten(start_dim=-2)[..., valid],
         )
 
         return pk / self.n_modes_radial
@@ -1764,9 +1813,10 @@ class CS_operator_2D_FFT_torch:
         )
 
     ###########################################################################
-    def _apply_fft(self, data, pairs):
+    def _apply_fft(self, array, pairs):
 
-        fft = torch.fft.rfft2(data)  # [Nb, Nc, N, M//2 + 1]
+        # "ortho" norm so that P_b matches the pbc_mask estimator (per-pixel variance units)
+        fft = torch.fft.rfft2(array, norm="ortho")  # [Nb, Nc, N, M//2 + 1]
 
         return [
             self._bin_pk(self._cross_pk(fft[:, c1], fft[:, c2]))  # [Nb, n_bins]
@@ -1774,22 +1824,27 @@ class CS_operator_2D_FFT_torch:
         ]
 
     ###########################################################################
-    def _apply_pbc_mask(self, data, pairs, pbc_mask_type, get_crop_border_size_method):
+    def _apply_pbc_mask(self, array, pairs, pbc_mask_type, get_crop_border_size_method):
         """
         Frequency bands reconstructed in real space, with a spatial mask applied to remove or mitigate
         the effect of contaminated pixels introduced by the spatial convolution associated with the
         frequency filtering due to non-PBC.
 
-        P_b^(f,g) = (N * M / sum_x M_b(x)) * <M_b * f_b, g>_l2
+        P_b^(f,g) = (N * M / sum_x M_b(x)) * <M_b * f_b, g_b>_l2
                     / [sum_k N_k * W_b(k)]
 
-        where M_b(x) is the spatial mask for band b, f_b is the band-filtered version of f,
-        and <., .>_l2 denotes the discrete L2 inner product over the spatial domain.
+        where M_b(x) is the spatial mask for band b, f_b is f filtered by sqrt(W_b) (so that
+        <f_b, g_b> = sum_k W_b(k) F(k) G*(k) on the full domain), and <., .>_l2 denotes the
+        discrete L2 inner product over the spatial domain.
+
+        Both fields are band-filtered: <M_b * f_b, g> would include the out-of-band part of g,
+        which is only orthogonal to f_b on the full domain. On a masked domain this term is
+        dominated by the large-scale energy and makes the estimate noisy (even negative).
 
         Parameters
         ----------
-        data : torch.Tensor
-            Input data array of shape [Nb, Nc, M, N].
+        array: torch.Tensor
+            Input array of shape [Nb, Nc, M, N].
         pairs : list of tuple
             List of channel pairs for which to compute the cross-power spectrum.
         pbc_mask_type : str
@@ -1803,13 +1858,19 @@ class CS_operator_2D_FFT_torch:
         values : list of torch.Tensor
             List of cross-power spectra for each channel pair, with the spatial mask applied.
         """
-        fft = torch.fft.rfft2(data.array, norm="ortho")  # [Nb, Nc, M, Kx = N//2 + 1]
+        fft = torch.fft.rfft2(array, norm="ortho")  # [Nb, Nc, M, Kx = N//2 + 1]
         Nb, Nc, M, Kx = fft.shape
 
-        window_k = self.bin_windows[:, self.radial_bin_of_k]  # [n_bins, M, Kx]
+        # modes beyond N//2 (radial_bin_of_k == -1) must not pick up the last window value
+        window_k = torch.where(
+            self.radial_bin_of_k >= 0,
+            self.bin_windows[:, self.radial_bin_of_k],
+            torch.zeros((), device=self.device, dtype=self.bin_windows.dtype),
+        )  # [n_bins, M, Kx]
 
+        # sqrt(W_b) on each field so that the product of the two bands carries W_b
         fft_binned = (
-            fft[:, :, None, :, :] * window_k[None, None, :, :, :]
+            fft[:, :, None, :, :] * window_k.clamp_min(0).sqrt()[None, None, :, :, :]
         )  # [Nb, Nc, n_bins, M, Kx]
 
         band = torch.fft.irfft2(
@@ -1831,18 +1892,18 @@ class CS_operator_2D_FFT_torch:
             )
 
         pbc_mask = self.build_pbc_mask(
-            data.array, border=border, pbc_mask_type=pbc_mask_type
+            array, border=border, pbc_mask_type=pbc_mask_type
         )  # [n_bins, N, M]
+
         pbc_mask = pbc_mask.to(dtype=band.dtype)
 
-        prefactor = (pbc_mask.numel() / pbc_mask.sum()) / self.bin_norm  # [n_bins]
+        N_pix = pbc_mask.shape[-2] * pbc_mask.shape[-1]
+        prefactor = (N_pix / pbc_mask.sum(dim=(-2, -1))) / self.bin_norm  # [n_bins]
 
         values = []
         for c1, c2 in pairs:
             cs = prefactor * (
-                pbc_mask[None, :, :, :]
-                * band[:, c1, :, :, :]
-                * data.array[:, c2, None, :, :].conj()
+                pbc_mask[None, :, :, :] * band[:, c1, :, :, :] * band[:, c2, :, :, :]
             ).sum(dim=(-2, -1))
             values.append(cs)
 
