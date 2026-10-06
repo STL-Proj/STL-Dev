@@ -439,7 +439,7 @@ class ST_Operator:
         # Systematic statistics (data supposed to be real)
         assert (
             data.array.is_complex() == False
-        ), "Data should be real for now, otherwise mean and var computation should be adapted"
+        ), "Data should be real for now, otherwise mean, var and cross spectrum (if to be computed) computation should be adapted"
         data_st.mean = self.wavelet_op.mean(l_data).real  # [Nb,Nc]
         data_st.var = self.wavelet_op.cov(l_data, l_data).real  # [Nb,Nc]
 

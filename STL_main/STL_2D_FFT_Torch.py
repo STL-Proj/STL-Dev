@@ -1455,6 +1455,8 @@ class CS_operator_2D_FFT_torch:
             * (log_radial[None, :] - log_centers[:, None]) ** 2
             / log_sigma[:, None] ** 2
         )
+        # log(k) is undefined at k=0: the mean (DC) mode belongs to no bin
+        windows[:, self.radial_k == 0] = 0.0
 
         return windows
 
