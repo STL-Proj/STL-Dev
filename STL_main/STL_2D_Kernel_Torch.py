@@ -185,6 +185,15 @@ class STL_2D_Kernel_Torch(Base_DataClass):
     ###############################################################################
     def get_CS_op(self, *args, **kwargs):
 
+        # If not given, infer spectrum_method from the PBC and NaN content of this data (pbc=None is treated as periodic)
+        if kwargs.get("spectrum_method") is None:
+            has_nan = bool(self.array.isnan().any())
+            non_pbc = self.pbc is False
+            if has_nan:
+                kwargs["spectrum_method"] = "pbc_nan_mask" if non_pbc else "nan_mask"
+            else:
+                kwargs["spectrum_method"] = "pbc_mask" if non_pbc else "fft"
+
         return CS_operator_2D_Kernel_Torch(
             shape=self.N0, device=self.device, dtype=self.dtype, *args, **kwargs
         )
@@ -1279,8 +1288,8 @@ class CS_operator_2D_Kernel_Torch:
             pbc_mask_type : str ("hard" or "smooth")
         """
         self.shape = shape
-        self.N = min(shape)
-        self.J = int(np.log2(self.N)) - 2 if J is None else J
+        self.N_max = min(shape) // 2  # largest radial Fourier index
+        self.J = int(np.log2(self.N_max)) - 1 if J is None else J
         if Jmin < 0 or Jmin > self.J - 2:
             raise ValueError(
                 f"Jmin must satisfy 0 <= Jmin <= J - 2 "
@@ -1310,16 +1319,16 @@ class CS_operator_2D_Kernel_Torch:
         self.radial_k = torch.linspace(
             0,
             self.kmax,
-            self.N // 2 + 1,
+            self.N_max + 1,
             device=self.device,
             dtype=self.dtype,
         )
 
+        # --- flat FFT index for cross-spectra (also gives n_modes_radial) ---
+        self._build_fft_index()
+
         self.n_bins = n_bins
         self._build_bin_windows()
-
-        # --- flat FFT index for cross-spectra ---
-        self._build_fft_index()
 
         # --- PBC (periodic boundary conditions) ---
         self.get_crop_border_size_method = get_crop_border_size_method
@@ -1352,30 +1361,10 @@ class CS_operator_2D_Kernel_Torch:
         else:
             windows = self._build_legacy_bin_masks()
 
-        self.bin_windows = windows  # [n_bins, kmax+1]
+        self.bin_windows = windows  # [n_bins, N_max+1]
 
-        # --- bin weights ---
-        K = torch.arange(
-            -self.N // 2,
-            self.N // 2,
-            device=self.device,
-            dtype=self.dtype,
-        )
-
-        KX, KY = torch.meshgrid(K, K, indexing="ij")
-
-        radial_freq_2d = torch.sqrt(KX**2 + KY**2)
-
-        radial_bin_2d = torch.round(radial_freq_2d).long()
-
-        mask = radial_bin_2d <= self.N * self.kmax
-
-        _, self.n_modes_radial = torch.unique(
-            radial_bin_2d[mask],
-            return_counts=True,
-        )
-
-        self.bin_weights = windows * self.n_modes_radial[None, :]  # [n_bins, N//2+1]
+        # --- bin weights --- (n_modes_radial is built in _build_fft_index)
+        self.bin_weights = windows * self.n_modes_radial[None, :]  # [n_bins, N_max+1]
 
         # --- bin normalization ---
         self.bin_norm = torch.sum(self.bin_weights, dim=-1)  # [n_bins]
@@ -1452,7 +1441,7 @@ class CS_operator_2D_Kernel_Torch:
     def estimate_pbc_border_crop(self, energy_fraction=0.60):
 
         r = torch.arange(
-            self.N // 2 + 1,
+            self.N_max + 1,
             device=self.device,
             dtype=self.dtype,
         )
@@ -1472,10 +1461,12 @@ class CS_operator_2D_Kernel_Torch:
         psf_radial = (
             self.bin_windows[:, None, :] @ kernel[None, :, :].transpose(-1, -2)
         ).squeeze(1)
-        # [n_bins, N//2+1]
+        # [n_bins, N_max+1]
 
         # Estimate the crop borders based on the PSF radial profile.
-        energy_density = 2 * torch.pi * r * psf_radial.abs().square()  # [n_bin, N//2+1]
+        energy_density = (
+            2 * torch.pi * r * psf_radial.abs().square()
+        )  # [n_bin, N_max+1]
 
         # Cumulative energy
         cumulative_energy = torch.cat(
@@ -1749,14 +1740,23 @@ class CS_operator_2D_Kernel_Torch:
         KY, KX = torch.meshgrid(ky, kx, indexing="ij")
         radial_freq = torch.sqrt(KX**2 + KY**2)
         self.radial_bin_of_k = torch.round(radial_freq).long()
-        # same cut as n_modes_radial (on the rounded radius), so counts and sums match
-        outside = self.radial_bin_of_k > self.N // 2
+        outside = self.radial_bin_of_k > self.N_max
         self.radial_bin_of_k[outside] = -1
 
+        # If M is even, the last column corresponds to the Nyquist frequency and does not need to be doubled
         weight_of_k = torch.ones_like(KX)
-        weight_of_k[:, 1:-1] = 2.0
+        weight_of_k[:, 1:] = 2.0
+        if M % 2 == 0:
+            weight_of_k[:, -1] = 1.0
         self._weight_of_k = weight_of_k
         self._weight_of_k[outside] = 0
+
+        # Number of Fourier modes from 0 to N_max in each radial bin
+        self.n_modes_radial = torch.zeros(
+            self.N_max + 1,
+            device=self.device,
+            dtype=self.dtype,
+        ).index_add(0, self.radial_bin_of_k[~outside], self._weight_of_k[~outside])
 
     ###########################################################################
     def _cross_pk(self, fft1, fft2):
@@ -1777,11 +1777,11 @@ class CS_operator_2D_Kernel_Torch:
         Returns
         -------
         torch.Tensor
-            Real radial cross-power spectrum of shape (..., kmax + 1).
+            Real radial cross-power spectrum of shape (..., N_max + 1).
         """
         contrib = (fft1 * fft2.conj()).real * self._weight_of_k
 
-        shape = contrib.shape[:-2] + (self.N // 2 + 1,)
+        shape = contrib.shape[:-2] + (self.N_max + 1,)
 
         pk = torch.zeros(
             shape,
@@ -1802,7 +1802,7 @@ class CS_operator_2D_Kernel_Torch:
 
     ###########################################################################
     def _bin_pk(self, pk):
-        """Bin P_k into the n_bins radial frequency bands. (..., kmax+1) -> (..., n_bins)."""
+        """Bin P_k into the n_bins radial frequency bands. (..., N_max+1) -> (..., n_bins)."""
         weights = self.bin_weights.to(dtype=pk.dtype)
         return torch.einsum("...k,bk->...b", pk, weights) / self.bin_norm.to(
             dtype=pk.dtype
