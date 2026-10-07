@@ -70,3 +70,15 @@
   
 ### Fixed
 - Updated wavelet filters for both FFT & Kernel backends to improve Littlewood-Paley condition. Updated smoothing filter with better anti-aliasing propoerties for Kernel backend.
+
+
+## [v1.6.0] - 2026-10-06
+### Changed
+- Unified the cross-spectrum operator across the FFT (`STL_2D_FFT_Torch`) and Kernel (`STL_2D_Kernel_Torch`) backends, consistently with the one used in `STL_Healpix_Kernel`.
+
+### Added
+- Added a cross-spectrum estimator for PBC maps containing NaN values in the `STL_2D_Kernel_Torch` backend.
+- Added cross-spectrum estimators for non PBC maps containing NaN values in the `STL_2D_Kernel_Torch` backend.
+
+### Fixed
+- Fixed the cross-spectrum estimators for no PBC maps improving its recovery in both the `STL_2D_Kernel_Torch` and `STL_2D_FFT_Torch` backends.

@@ -122,7 +122,7 @@ class ST_Operator:
         get_crop_border_size_method=None,
         # Optional power spectrum args
         n_bins=None,
-        power_spectrum_method=None,
+        spectrum_method=None,
         Jmin=None,
     ):
         """
@@ -185,8 +185,8 @@ class ST_Operator:
             cross_spectrum_op_kwargs["n_bins"] = n_bins
         if J is not None:
             cross_spectrum_op_kwargs["J"] = J
-        if power_spectrum_method is not None:
-            cross_spectrum_op_kwargs["power_spectrum_method"] = power_spectrum_method
+        if spectrum_method is not None:
+            cross_spectrum_op_kwargs["spectrum_method"] = spectrum_method
         if Jmin is not None:
             cross_spectrum_op_kwargs["Jmin"] = Jmin
         self.CS_op = data_example.get_CS_op(**cross_spectrum_op_kwargs)
@@ -439,7 +439,7 @@ class ST_Operator:
         # Systematic statistics (data supposed to be real)
         assert (
             data.array.is_complex() == False
-        ), "Data should be real for now, otherwise mean and var computation should be adapted"
+        ), "Data should be real for now, otherwise mean, var and cross spectrum (if to be computed) computation should be adapted"
         data_st.mean = self.wavelet_op.mean(l_data).real  # [Nb,Nc]
         data_st.var = self.wavelet_op.cov(l_data, l_data).real  # [Nb,Nc]
 
