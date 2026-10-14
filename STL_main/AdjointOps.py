@@ -133,7 +133,9 @@ def downsampling_adjoint(down, gradient):
     """
     from STL_main.PatchOps import down_adjoint_full
 
-    if down.mode != "smooth" or not hasattr(down, "_M_indices"):
+    if down.mode != "smooth" or not (
+        hasattr(down, "_M_indices") or hasattr(down, "_stl_csr_tensors")
+    ):
         raise NotImplementedError(
             "Explicit downsampling requires the smooth sparse operator"
         )

@@ -44,7 +44,7 @@ from healpix_analyse.down import HealPixDown
 from healpix_geo.nested import kth_neighbourhood
 
 from STL_main.AdjointOps import convolution_adjoint, downsampling_adjoint, modulus_vjp
-from STL_main.PatchOps import down_forward_full
+from STL_main.PatchOps import _csr_tensor, down_forward_full
 from STL_main.Pyramid import HealpixPyramid
 from STL_main.PyramidScattering import PyramidStatistics
 from STL_main.S3Multiscale import _join, _split, s3_pair_plan
@@ -175,20 +175,36 @@ class LocalGeometry:
         )
         self.built["down"] += 1
         if self.cache_downs:
+            # Keep only the two CSR tensors (forward and transpose); the COO
+            # buffers and the row-restriction views would triple the footprint.
+            _csr_tensor(down, False, w.dtype)
+            _csr_tensor(down, True, w.dtype)
+            for name in ("_M_indices", "_M_values", "_stl_patch_csr", "_stl_patch_csr_t"):
+                if name in down._buffers:
+                    del down._buffers[name]
+                elif hasattr(down, name):
+                    delattr(down, name)
             self._downs[key] = down
         return down
 
     @staticmethod
     def out_ids(down):
-        return torch.as_tensor(
-            np.asarray(down.cell_ids_out), dtype=torch.long, device=down._M_indices.device
-        )
+        cached = getattr(down, "_stl_out_ids", None)
+        if cached is None:
+            cached = down._stl_out_ids = torch.as_tensor(
+                np.asarray(down.cell_ids_out), dtype=torch.long, device=down.device
+            )
+        return cached
 
     # -- exact block-wise pyramid operations ---------------------------------
     def decimate(self, x, dg):
-        """``maps[dg] -> maps[dg + 1]`` with the full-sky weights, block by block."""
+        """``maps[dg] -> maps[dg + 1]`` with the full-sky weights, block by block.
+
+        The domain uses the doubled halo of the transposed decimation and of
+        the chain pieces so that one partial operator per block serves all.
+        """
         out = x.new_zeros(*x.shape[:-1], self.pixels(dg + 1))
-        rings = self.down_rings(dg)
+        rings = 2 * self.down_rings(dg)
         for block in self.blocks(dg):
             domain = dilate_fine(block, self.nside(dg), rings)
             down = self.down(dg, domain)

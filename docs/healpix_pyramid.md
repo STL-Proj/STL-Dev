@@ -268,16 +268,19 @@ iterations, `benchmark_s3_multiscale --iterations 2`):
 
 | geometry | process RSS before the gradient | first iteration | second iteration |
 |---|---|---|---|
-| full sky (all levels prebuilt) | 1.37 GB | 1.0 s | 1.1 s |
-| local (coarse level only) | 0.47 GB | 7.7 s | 2.6 s |
+| full sky (all levels prebuilt) | 1.37 GB | 1.1 s | 1.1 s |
+| local (coarse level only) | 0.48 GB | 5.3 s | 3.1 s |
 
 Both give the same gradient norm. The 0.9 GB difference is the full-sky
 fine geometry that the local mode never builds, and it grows as
-`nside**2`. The first local iteration builds the partial decimations
-(cached afterwards) and the partial convolutions; the second rebuilds only
-the convolutions (24 blocks here). Their build temporaries are host-side
-numpy arrays of healpix-analyse and dominate the transient increment;
-`cache_dir` amortises them from disk.
+`nside**2`. The first local iteration builds the partial decimations (one
+per block and level, shared by the decimation, its transpose and the chain
+pieces, cached as two CSR tensors) and the partial convolutions; the second
+rebuilds only the convolutions (24 blocks here). On a GPU at `nside=256`,
+`J=6`, the CUDA memory held before the gradient fell from 3.96 GB to 0.49 GB
+with the local geometry. The partial `HealPixDown` construction is the slow
+part of the first iteration (about 0.4 s per block at `nside=256`); the
+build temporaries are host-side numpy arrays of healpix-analyse.
 
 ## Memory and performance
 

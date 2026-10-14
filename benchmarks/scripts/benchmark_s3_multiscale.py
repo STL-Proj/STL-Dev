@@ -107,8 +107,12 @@ def main():
     thread = threading.Thread(target=sample, daemon=True)
     thread.start()
     started = time.perf_counter()
-    timings = []
+    timings, cuda_iteration_peaks = [], []
     for _ in range(max(1, args.iterations)):
+        if cuda:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            iteration_allocated = torch.cuda.memory_allocated()
         iteration_start = time.perf_counter()
         if args.mode == "full":
             bands = op.vjp_pyramid(p, g, plan=plan, tracker=tracker)
@@ -127,6 +131,12 @@ def main():
             bands = p.analysis_vjp(maps_gradient)
         if cuda:
             torch.cuda.synchronize()
+            cuda_iteration_peaks.append(
+                dict(
+                    allocated_at_start=iteration_allocated,
+                    peak_increment=torch.cuda.max_memory_allocated() - iteration_allocated,
+                )
+            )
         timings.append(round(time.perf_counter() - iteration_start, 2))
     elapsed = time.perf_counter() - started
     peak[0] = max(peak[0], process.memory_info().rss)
@@ -144,8 +154,8 @@ def main():
         sky_pixels=12 * args.nside**2, device=str(data.device),
         rss_baseline=baseline, rss_increment=peak[0] - baseline,
         cuda_baseline_allocated=cuda_baseline if cuda else None,
-        cuda_peak_allocated=torch.cuda.max_memory_allocated() if cuda else None,
-        cuda_peak_increment=(torch.cuda.max_memory_allocated() - cuda_baseline) if cuda else None,
+        cuda_allocated_after=torch.cuda.memory_allocated() if cuda else None,
+        cuda_iterations=cuda_iteration_peaks if cuda else None,
         cuda_peak_reserved=torch.cuda.max_memory_reserved() if cuda else None,
     )))
 

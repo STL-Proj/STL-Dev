@@ -284,6 +284,11 @@ def _csr_tensor(down, transposed, dtype):
         cache = down._stl_csr_tensors = {}
     key = (transposed, dtype)
     if key not in cache:
+        same = [v for (t, _), v in cache.items() if t == transposed]
+        if same and not hasattr(down, "_M_indices"):
+            # Slimmed operator (LocalGeometry): convert the cached dtype.
+            cache[key] = same[0].to(dtype)
+            return cache[key]
         crow, col, val = _down_csr_t(down) if transposed else _down_csr(down)
         rows, cols = down._M_size
         if transposed:
