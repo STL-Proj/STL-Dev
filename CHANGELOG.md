@@ -3,6 +3,16 @@
 ## [Unreleased]
 
 ### Added
+- Added the patch-localised explicit HEALPix ScatCov engine
+  (`STL_main.PatchScattering`, `STL_main.PatchOps`): exact statistics and band
+  gradients accumulated over spatial patches whose halos are derived from the
+  full-sky operator indices, so wavelet fields never cover the whole sphere.
+  Available through `ST_Operator.apply_patched/vjp_patched/loss_and_grad_patched`
+  and `PyramidSynthesis(patch_pixels=...)`.
+- Added `STL_main.S3Multiscale.s3_scale_pair`: one S3 scale pair at a time with
+  the fine modulus streamed by fine sub-patches through the linear decimation
+  chain, so the gradient of S3(0, J-1) never holds a fine field larger than
+  one sub-patch. Benchmark: `benchmarks/scripts/benchmark_s3_multiscale.py`.
 - Added the experimental `synthesize_healpix_from_patches` routine. It computes
   successive pixel-block derivatives of one global ScatCov loss, assembles the
   exact full-map gradient before each update, and reports CPU/CUDA peak memory.

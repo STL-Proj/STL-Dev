@@ -263,6 +263,24 @@ class ST_Operator:
 
         return loss_and_grad_pyramid(self, pyramid, target, **kwargs)
 
+    def apply_patched(self, pyramid, **kwargs):
+        """Same statistics as apply_pyramid, accumulated over spatial patches."""
+        from STL_main.PatchScattering import apply_patched
+
+        return apply_patched(self, pyramid, **kwargs)
+
+    def vjp_patched(self, pyramid, gradient, **kwargs):
+        """Explicit band VJP whose wavelet fields never exceed one patch."""
+        from STL_main.PatchScattering import vjp_patched
+
+        return vjp_patched(self, pyramid, gradient, **kwargs)
+
+    def loss_and_grad_patched(self, pyramid, target, **kwargs):
+        """Fused weighted-square loss and gradient, two patch sweeps per batch."""
+        from STL_main.PatchScattering import loss_and_grad_patched
+
+        return loss_and_grad_patched(self, pyramid, target, **kwargs)
+
     def apply(
         self,
         data,

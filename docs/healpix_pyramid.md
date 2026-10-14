@@ -105,6 +105,129 @@ for the independent reconstruction bands. U transpose is a sum of children;
 it is not D transpose. The j1=0, j3=J-1 branch necessarily reaches fine pixels
 through the derivative of the fine-scale modulus.
 
+## Patch-localised statistics and gradients
+
+`STL_main.PatchScattering` computes the same coefficients and the same band
+gradients as the engine above, but no wavelet field ever covers the whole
+sphere. Select it with `patch_pixels`:
+
+```python
+solver = PyramidSynthesis(st, target, patch_pixels=4096, coefficient_batch_size=16)
+stats = st.apply_patched(p, patch_pixels=4096)
+bands = st.vjp_patched(p, grad_stats, patch_pixels=4096)
+```
+
+Every coefficient is a pixel mean, so its value is a sum of partial sums over
+disjoint *cores* of the native-resolution grid, and the gradient is the sum
+over cores of the adjoint chain applied to the cotangent restricted to that
+core. For one core, the chain reads a bounded neighbourhood that is derived
+exactly from the index structure of the full-sky operators (`PatchOps`):
+the native wavelet stencil, then the decimation rows, then the first wavelet
+stencil at each inner scale. Restricted operators reuse the full-sky gather
+indices and weights, so no boundary renormalisation occurs and the patch
+result equals the full-sky result to roundoff. Tests compare every family,
+both S3/S4 definitions, partial unsorted grids and multi-channel batches.
+
+The receptive field of a cross-scale term is inherent: one native pixel of
+S3(j1, j3) reads about `4**(dg3 - dg1)` fine pixels times the stencil halo.
+`patch_pixels` is therefore a budget at the finest scale of each coefficient
+batch; the core at the native level is shrunk by `4**(n - dg_min)` so that
+the fine-scale fields stay near that budget (a halo of a few native pixels
+around the core adds `halo * 4**(n - dg_min)` fine pixels, which dominates
+for very coarse native levels). Choose `patch_pixels` as an aligned power of
+four so that cores are NESTED super-pixels.
+
+The analysis maps (`4N/3` pixels, no field), the map cotangent accumulators
+and one dense index table per level (5 bytes per pixel) remain global;
+everything with an orientation axis is local. Batches that share a native
+and a finest level are processed together with the patch loop outside the
+batch loop, so the index structures of a patch are built once per level
+while fields are recomputed per batch and per patch. The fused loss performs
+two patch sweeps per level (statistics, then cotangents). Patch
+contributions are additive: `vjp_patched(..., patches=...,
+return_maps_gradient=True)` and `apply_patched(..., patches=...)` evaluate a
+subset of patches, so disjoint subsets can run on different workers and be
+summed before `HealpixPyramid.analysis_vjp`. The driver shipped here is
+sequential. `PatchGeometry(op, p, patch_pixels, cache=True)` keeps the
+per-patch contexts across iterations when memory allows; without it the
+context build costs about a quarter of a VJP at `nside=64`.
+
+`python -m benchmarks.scripts.patch_field_sizes` reports the largest local
+field per level. With `kernel_size=3`, `nside=64`, `J=5`, `patch_pixels=1024`
+and S3 only, the largest fine-scale field is 18884 of 49152 pixels: the halo
+of the coarsest native level (about three native pixels, i.e. 48 fine pixels
+on each side) dominates the 1024-pixel core. The saving grows with `nside`
+because the halo in fine pixels scales with `2**(n - dg_min)` while the sky
+scales with `nside**2`; at `nside=2048`, `J=8` the same halo is about 1.6% of
+the sky. The benchmark accepts `--mode patched --patch-pixels N`.
+
+### Measured status (CPU, float64, `J=5`, `L=2`, `kernel_size=5`, one map)
+
+| nside | mode | patch_pixels | time | RSS baseline | RSS increment |
+|---|---|---|---|---|---|
+| 128 | fused | - | 9.0 s | 1.27 GB | 57 MB |
+| 128 | patched | 4096 | 100 s | 1.28 GB | 234 MB |
+| 128 | patched | 16384 | 53 s | 1.28 GB | 274 MB |
+
+Loss and gradient norm agree to all printed digits. Two conclusions:
+
+- The patched engine is exact and bounds the wavelet fields, but at these
+  resolutions it is slower (halo overlap and per-block index translation)
+  and its process increment is dominated by index temporaries, not fields.
+  `pyramid_pixel_batch_size` bounds those temporaries.
+- The baseline is the full-sky healpix-analyse geometry (`_pos_safe` and
+  `_w_norm`: `4 * G * P * 16` bytes, about 3.2 kB per pixel for `L=2`,
+  `kernel_size=5`), about one hundred times the size of a complex wavelet
+  field. Neither engine avoids it; at `nside=2048` it would be 160 GB. The
+  next step for large maps is therefore patch-local geometry: build partial
+  `HealPixConv`/`HealPixDown` operators on each patch domain (ring halos from
+  `healpix_geo.nested.kth_neighbourhood`, as in `_healpix_patch_domains`)
+  instead of restricting the full-sky operators, which the present engine
+  requires in memory. The patch domains, the chain structure, the partial
+  sums and the additivity of patch contributions carry over unchanged.
+
+## One S3 scale pair at a time, fine scale streamed by sub-patches
+
+`STL_main.S3Multiscale.s3_scale_pair(op, p, j1, j3, gradient=..., fine_patch_pixels=N)`
+is the multiscale form of the cross term that reads every pixel,
+S3(j1=0, j3=J-1): the coarse level is handled globally (or by coarse cores
+with `coarse_patch_pixels`), and the fine modulus `|psi_j1 * x|` is computed
+by fine sub-patches and pushed through the decimation chain restricted to
+each sub-patch support (`PatchOps.DownPiece`), which is exact because the
+chain is linear:
+
+    D^(n-d1) |psi_j1 * x| = sum_k D^(n-d1) ( |psi_j1 * x| . 1_{F_k} )
+
+The reverse pass redistributes the coarse cotangent through the transposed
+pieces sub-patch by sub-patch. No field with an orientation axis therefore
+exceeds one fine sub-patch plus its stencil halo, whatever `j3 - j1`. The
+function returns the statistics of the pair and per-level map cotangents;
+several pairs accumulate into the same `maps_gradient` before
+`pyramid.analysis_vjp`. Tests compare every pair of a `J=3` operator, both
+S3 definitions, partial unsorted grids and coarse cores against the full-sky
+engine for sub-patches of 5, 64 and the whole region.
+
+Measured with `benchmarks.scripts.benchmark_s3_multiscale` (CPU, `nside=128`,
+`J=5`, pair (0, 4), one map, `L=2`, `kernel_size=5`; sparse structures
+prebuilt):
+
+| mode | fine_patch | largest fine field (pixels) | time | RSS increment |
+|---|---|---|---|---|
+| full-sky explicit | - | 196608 | 0.4 s | 77 MB |
+| multiscale | 65536 | 65536 | 1.1 s | 234 MB |
+| multiscale | 16384 | 16384 | 1.3 s | 121 MB |
+| multiscale | 4096 | 4096 | 1.3 s | 68 MB |
+| multiscale | 1024 | 1024 | 1.7 s | 54 MB |
+
+The gradient norm is identical in every row. The fine field follows the
+sub-patch size exactly; the process increment follows it once the sub-patch
+is small enough for the per-block index temporaries (bounded by
+`pyramid_pixel_batch_size`) to stop dominating. The full-sky geometry of
+healpix-analyse (the 1.3 GB baseline) is still shared by every mode: at
+`nside=256`, `J=6`, building that geometry alone exceeded 15 GB of RAM and
+was killed before any gradient was computed, in every mode. Patch-local
+geometry is therefore the prerequisite for large maps.
+
 ## Memory and performance
 
 - No production `backward()` or `torch.autograd.grad`, and no global tape.

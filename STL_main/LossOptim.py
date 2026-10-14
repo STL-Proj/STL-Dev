@@ -232,7 +232,12 @@ class PyramidSynthesis:
         loss=None,
         coefficient_batch_size=64,
         strategy="recompute",
+        patch_pixels=None,
     ):
+        """``patch_pixels`` selects the patch-localised engine (PatchScattering):
+        wavelet fields are then bounded by that pixel budget at the finest
+        scale of each coefficient batch instead of covering the whole sphere.
+        """
         self.operator = scat_operator
         self.target = PyramidStatistics(
             tuple(target_statistics.plan), target_statistics.values.detach().clone()
@@ -241,9 +246,16 @@ class PyramidSynthesis:
             raise ValueError("Target statistics must be finite")
         self.optimizer = optimizer if optimizer is not None else PyramidOptimizer()
         self.loss = loss if loss is not None else SquaredStatisticsLoss()
-        self.options = dict(
-            coefficient_batch_size=coefficient_batch_size, strategy=strategy
-        )
+        self.patch_pixels = patch_pixels
+        if patch_pixels is None:
+            self.options = dict(
+                coefficient_batch_size=coefficient_batch_size, strategy=strategy
+            )
+        else:
+            self.options = dict(
+                coefficient_batch_size=coefficient_batch_size,
+                patch_pixels=patch_pixels,
+            )
         self.pyramid = None
 
     def initialize_from_noise(self, data_example, seed=0, amplitude=1.0):
@@ -264,16 +276,27 @@ class PyramidSynthesis:
 
     @torch.no_grad()
     def _loss_and_gradient(self, pyramid):
+        op = self.operator
+        if self.patch_pixels is None:
+            fused, evaluate, vjp = (
+                op.loss_and_grad_pyramid,
+                op.apply_pyramid,
+                op.vjp_pyramid,
+            )
+        else:
+            fused, evaluate, vjp = (
+                op.loss_and_grad_patched,
+                op.apply_patched,
+                op.vjp_patched,
+            )
         if type(self.loss) is SquaredStatisticsLoss:
-            value, gradients = self.operator.loss_and_grad_pyramid(
+            value, gradients = fused(
                 pyramid, self.target, weights=self.loss.weights, **self.options
             )
         else:
-            stats = self.operator.apply_pyramid(
-                pyramid, plan=self.target.plan, **self.options
-            )
+            stats = evaluate(pyramid, plan=self.target.plan, **self.options)
             value = self.loss.value(stats, self.target)
-            gradients = self.operator.vjp_pyramid(
+            gradients = vjp(
                 pyramid, self.loss.gradient(stats, self.target), **self.options
             )
         if not bool(torch.isfinite(value)):

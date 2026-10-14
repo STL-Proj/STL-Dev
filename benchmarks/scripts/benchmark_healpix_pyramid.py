@@ -3,6 +3,7 @@
 python -m benchmarks.scripts.benchmark_healpix_pyramid --mode legacy --nside 64
 python -m benchmarks.scripts.benchmark_healpix_pyramid --mode pyramid --nside 64
 python -m benchmarks.scripts.benchmark_healpix_pyramid --mode fused --nside 64
+python -m benchmarks.scripts.benchmark_healpix_pyramid --mode patched --nside 64 --patch-pixels 1024
 
 Geometry and target setup are outside the timed interval. CPU RSS is sampled
 every 2 ms; CUDA allocator peaks are exact. 'pyramid' reports separate forward
@@ -25,7 +26,10 @@ from STL_main.STL_Healpix_Kernel_Torch import STL_Healpix_Kernel_Torch
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("legacy", "pyramid", "fused"), required=True)
+    parser.add_argument(
+        "--mode", choices=("legacy", "pyramid", "fused", "patched"), required=True
+    )
+    parser.add_argument("--patch-pixels", type=int, default=4096)
     parser.add_argument("--nside", type=int, default=64)
     parser.add_argument("--J", type=int, default=3)
     parser.add_argument("--L", type=int, default=2)
@@ -99,10 +103,18 @@ def main():
         gradients = op.vjp_pyramid(
             p, 2 * residual, plan=target.plan, coefficient_batch_size=args.batch_size
         )
-    else:
+    elif args.mode == "fused":
         middle = started
         loss, gradients = op.loss_and_grad_pyramid(
             p, target, coefficient_batch_size=args.batch_size
+        )
+    else:
+        middle = started
+        loss, gradients = op.loss_and_grad_patched(
+            p,
+            target,
+            coefficient_batch_size=args.batch_size,
+            patch_pixels=args.patch_pixels,
         )
     sync()
     ended = time.perf_counter()
@@ -117,6 +129,7 @@ def main():
                 J=args.J,
                 L=args.L,
                 batch_size=args.batch_size,
+                patch_pixels=args.patch_pixels if args.mode == "patched" else None,
                 device=str(data.device),
                 torch_version=torch.__version__,
                 loss=float(loss.detach()),
