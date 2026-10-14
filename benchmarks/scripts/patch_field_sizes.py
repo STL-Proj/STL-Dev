@@ -38,7 +38,7 @@ def main():
         c for c in op.build_plan() if c.family in args.families.split(",")
     )
     tracker = MemoryTracker()
-    g = torch.randn(1, len(plan), dtype=torch.complex128)
+    g = torch.randn(1, len(plan), dtype=torch.complex128, device=data.device)
     vjp_patched(op, p, g, plan=plan, patch_pixels=args.patch_pixels, tracker=tracker)
     for dg in range(args.J):
         npix = p.levels[dg].shape[-1]

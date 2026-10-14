@@ -54,9 +54,15 @@ def main():
     if args.mode == "multiscale":
         op.wavelet_op.pyramid_pixel_batch_size = min(16384, args.fine_patch)
     plan = s3_pair_plan(op, 1, args.j1, j3)
-    g = torch.randn(1, len(plan), dtype=torch.complex128)
+    g = torch.randn(1, len(plan), dtype=torch.complex128, device=data.device)
     tracker = MemoryTracker()
+    cuda = data.array.is_cuda
     gc.collect()
+    if cuda:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        cuda_baseline = torch.cuda.memory_allocated()
     process = psutil.Process()
     baseline = process.memory_info().rss
     peak, stop = [baseline], threading.Event()
@@ -75,6 +81,8 @@ def main():
             op, p, args.j1, j3, gradient=g, fine_patch_pixels=args.fine_patch, tracker=tracker
         )
         bands = p.analysis_vjp(maps_gradient)
+    if cuda:
+        torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
     peak[0] = max(peak[0], process.memory_info().rss)
     stop.set()
@@ -87,8 +95,12 @@ def main():
         gradient_norm=float(sum(b.square().sum() for b in bands).sqrt()),
         largest_fine_field_pixels=max(e["shape"][-1] for e in fine),
         largest_fine_field_bytes=max(e["bytes"] for e in fine),
-        sky_pixels=12 * args.nside**2,
+        sky_pixels=12 * args.nside**2, device=str(data.device),
         rss_baseline=baseline, rss_increment=peak[0] - baseline,
+        cuda_baseline_allocated=cuda_baseline if cuda else None,
+        cuda_peak_allocated=torch.cuda.max_memory_allocated() if cuda else None,
+        cuda_peak_increment=(torch.cuda.max_memory_allocated() - cuda_baseline) if cuda else None,
+        cuda_peak_reserved=torch.cuda.max_memory_reserved() if cuda else None,
     )))
 
 

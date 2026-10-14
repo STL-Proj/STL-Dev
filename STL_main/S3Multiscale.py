@@ -113,6 +113,9 @@ def s3_scale_pair(
     if gradient is not None:
         if gradient.shape != (batch, len(plan)):
             raise ValueError("Gradient must have shape [batch, len(plan)]")
+        gradient = gradient.to(maps[0].device)
+        if not bool(torch.isfinite(gradient).all()):
+            raise ValueError("Gradient must be finite")
         if maps_gradient is None:
             maps_gradient = [torch.zeros_like(x) for x in maps]
     L, fewer = w.L, operator.has_fewer_convolutions
