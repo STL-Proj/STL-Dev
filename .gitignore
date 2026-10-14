@@ -4,4 +4,4 @@ __pycache__/
 docs/build/
 *.pyc
 my_tests.ipynb
-STL.egg-info/
+STL.egg-info/benchmarks/results/

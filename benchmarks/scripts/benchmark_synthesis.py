@@ -33,6 +33,59 @@ from STL_main.PyramidScattering import PyramidStatistics
 from STL_main.STL_Healpix_Kernel_Torch import STL_Healpix_Kernel_Torch
 
 
+def equirectangular(values, nside, height=None):
+    """Average a NESTED full-sky map on a longitude/latitude raster (no healpy)."""
+    import numpy as np
+    from healpix_geo.nested import healpix_to_lonlat
+
+    npix = 12 * nside**2
+    lon, lat = healpix_to_lonlat(np.arange(npix, dtype=np.uint64), int(np.log2(nside)))
+    lon, lat = np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64)
+    # About six HEALPix pixels per raster bin, so bins are never empty.
+    height = height or max(16, nside)
+    width = 2 * height
+    row = np.clip(((90.0 - lat) / 180.0 * height).astype(int), 0, height - 1)
+    col = np.clip(((lon % 360.0) / 360.0 * width).astype(int), 0, width - 1)
+    image = np.zeros((height, width))
+    count = np.zeros((height, width))
+    np.add.at(image, (row, col), values)
+    np.add.at(count, (row, col), 1.0)
+    with np.errstate(invalid="ignore"):
+        image = np.where(count > 0, image / np.maximum(count, 1), np.nan)
+    return image
+
+
+def save_figure(path, args, history, target_map, result_map, nside, J):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4.8))
+    axes[0].semilogy(np.arange(1, len(history) + 1), history, marker=".", lw=1)
+    axes[0].set_xlabel("loss evaluation")
+    axes[0].set_ylabel("sum |S - S_target|^2")
+    axes[0].set_title(f"{args.mode}: nside={nside}, J={J}, {len(history)} evaluations")
+    axes[0].grid(True, which="both", alpha=0.3)
+    vmin, vmax = np.percentile(target_map, [1, 99])
+    for ax, values, title in (
+        (axes[1], target_map, "target"),
+        (axes[2], result_map, f"synthesis ({args.mode})"),
+    ):
+        im = ax.imshow(
+            equirectangular(values, nside), cmap="RdBu_r", vmin=vmin, vmax=vmax,
+            extent=[0, 360, -90, 90], aspect="auto", interpolation="nearest",
+        )
+        ax.set_title(title)
+        ax.set_xlabel("longitude [deg]")
+        ax.set_ylabel("latitude [deg]")
+        fig.colorbar(im, ax=ax, fraction=0.03)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -57,6 +110,12 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument(
+        "--output", default=None,
+        help="PNG with the loss curve, the target and the final map "
+        "(default synthesis_<mode>_nside<N>.png); 'none' disables it",
+    )
+    parser.add_argument("--quiet", action="store_true", help="do not print the loss per evaluation")
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
     J = args.J if args.J is not None else max(1, args.nside.bit_length() - 2)
@@ -122,6 +181,14 @@ def main():
     history = []
     started = time.perf_counter()
 
+    def report(index, loss):
+        if not args.quiet:
+            print(
+                f"[{args.mode}] evaluation {index + 1:4d}  loss = {loss:.6e}  "
+                f"t = {time.perf_counter() - started:7.1f} s",
+                flush=True,
+            )
+
     if args.mode == "legacy":
         u = initial_map.reshape(1, 1, npix).clone().requires_grad_(True)
         optimizer = torch.optim.LBFGS(
@@ -143,6 +210,7 @@ def main():
             loss = (values - target_stats.values).abs().square().sum()
             loss.backward()
             history.append(float(loss.detach()))
+            report(len(history) - 1, history[-1])
             return loss
 
         optimizer.step(closure)
@@ -161,7 +229,7 @@ def main():
             pyramid = geometry.pyramid_from_map(initial)
         else:
             pyramid = HealpixPyramid.from_map(initial, w)
-        history = solver.run(pyramid, niter=args.niter)
+        history = solver.run(pyramid, niter=args.niter, callback=report)
         result = solver.reconstruct()
 
     sync()
@@ -178,6 +246,14 @@ def main():
                 HealpixPyramid.from_map(final_data, w), coefficient_batch_size=args.batch_size
             )
         final_loss = float((final.values - target_stats.values).abs().square().sum())
+    output = args.output
+    if output is None:
+        output = f"synthesis_{args.mode}_nside{args.nside}.png"
+    if output != "none":
+        save_figure(
+            output, args, history, target_map.cpu().numpy(),
+            result.reshape(-1).detach().cpu().numpy(), args.nside, J,
+        )
     print(
         json.dumps(
             dict(
@@ -197,6 +273,8 @@ def main():
                 loss_first=history[0] if history else None,
                 loss_last=history[-1] if history else None,
                 loss_final_map=final_loss,
+                loss_history=history,
+                figure=None if output == "none" else output,
                 rss_baseline=rss_baseline,
                 rss_peak_increment=peak[0] - rss_baseline,
                 cuda_baseline_allocated=cuda_baseline if cuda else None,
