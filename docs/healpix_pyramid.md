@@ -306,8 +306,12 @@ The tests disable healpix-analyse's on-disk geometry cache
 (`conv_cache_dir=None` on the wavelet operator): that cache stores the
 interpolation weights in float32 and casts them back, so a float64
 full-sky operator loaded from it carries ~6e-8 relative rounding (reported
-in GRID4EARTH/healpix-analyse#59). The partial operators are always built
-exactly.
+in GRID4EARTH/healpix-analyse#59). The partial operators are built exactly;
+with `LocalGeometry(..., cache_dir=...)` they are also re-saved in the
+operator dtype, in the library's own cache layout, so the next build of
+the same block reloads them exactly (0.27 s to build versus 12 ms to
+reload a 4096-pixel block at `nside=64`). A synthesis rebuilds every block
+at every evaluation, so this cache is what makes the local mode usable.
 
 ## Synthesis benchmark: legacy full sky versus explicit patch-wise
 
@@ -323,6 +327,26 @@ loss evaluations, the loss of the final map re-evaluated by the explicit
 engine, CPU RSS and CUDA peaks relative to a baseline taken after the
 geometry of every level is built (for `local`, after the coarse levels
 only), plus the baseline itself, which is where the modes differ most.
+
+Measured (CPU, 4 threads, `nside=64`, `J=5`, `L=2`, `kernel_size=5`, 362
+coefficients, 50 LBFGS iterations = 57 evaluations, blocks of 4096):
+
+| mode | time | per evaluation | RSS before | RSS increment | final loss |
+|---|---|---|---|---|---|
+| legacy (autograd, map) | 55 s | 1.0 s | 595 MB | 371 MB | 2.1e-8 |
+| pyramid (explicit, bands) | 102 s | 1.8 s | 597 MB | 96 MB | 7.7e-8 |
+| patched (explicit, patches) | 1960 s | 34 s | 604 MB | 263 MB | 7.7e-8 |
+| local, no cache | 1024 s | 18 s | 471 MB | 275 MB | 7.7e-8 |
+| local, exact cache | 373 s | 6.5 s | 432 MB | 123 MB | 7.7e-8 |
+
+The explicit modes share one trajectory (bands as variables); legacy
+optimises the map and reaches a lower loss in 50 iterations. At this
+resolution the full-sky geometry is small, so the baselines are close; the
+local mode is the only one whose baseline does not contain the fine-level
+geometry, and it is the mode to use when the geometry is the limit. Its
+time is the partial convolution reloads (18 geometries, 359 MB on disk)
+plus the block overlap; the `patched` mode is dominated by halo overlap
+and index translation and is not recommended.
 
 ## Memory and performance
 

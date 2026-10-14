@@ -140,7 +140,9 @@ class LocalGeometry:
         # healpix-analyse's on-disk cache is on by default and stores the
         # interpolation weights in float32 whatever the operator dtype, which
         # silently degrades float64 runs once a geometry has been cached.
-        # It is therefore opt-in here (``cache_dir=...``), off by default.
+        # With ``cache_dir`` set, a dedicated directory is used and the
+        # buffers are re-saved in the operator dtype right after a build, so
+        # the library loader (a plain ``.to(dtype)``) returns them exactly.
         optional = dict(
             device=w.device, dtype=w.dtype, ellipsoid=w.ellipsoid, cache_dir=self.cache_dir
         )
@@ -161,7 +163,47 @@ class LocalGeometry:
         )
         conv.set_kernel(w._wav_weights.detach().cpu().numpy())
         self.built["conv"] += 1
+        if self.cache_dir is not None:
+            self._save_exact(conv, ids)
         return conv
+
+    def _save_exact(self, conv, ids):
+        """Re-save a freshly built geometry in the operator dtype (library layout)."""
+        try:
+            from pathlib import Path
+
+            from healpix_analyse import convol
+
+            key = convol._geometry_cache_key(
+                nside=conv.nside,
+                kernel_sz=conv.kernel_sz,
+                G=conv.G,
+                gauge_type=conv.gauge_type,
+                ref_direction=getattr(conv, "ref_direction", None),
+                nest=conv.nest,
+                cell_ids=ids.detach().cpu().numpy().astype(np.int64),
+                ellipsoid=conv.ellipsoid,
+            )
+            path = convol._cache_path(Path(self.cache_dir), key)
+            if path.exists() and torch.load(path, map_location="cpu", weights_only=True)[
+                "w_norm"
+            ].dtype == conv._w_norm.dtype:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            torch.save(
+                dict(
+                    pos_safe=conv._pos_safe.cpu().to(torch.long),
+                    w_norm=conv._w_norm.cpu(),
+                    sort_order=conv._sort_order.cpu(),
+                    inv_order=conv._inv_order.cpu(),
+                ),
+                tmp,
+            )
+            tmp.replace(path)
+            self.built["saved"] = self.built.get("saved", 0) + 1
+        except Exception:  # cache is an optimisation only; never fail a build
+            pass
 
     def down(self, dg, ids):
         key = (dg, ids.numel(), int(ids[0]), int(ids[-1]), int(ids.sum()))

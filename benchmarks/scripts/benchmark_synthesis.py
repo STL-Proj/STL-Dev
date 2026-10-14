@@ -41,6 +41,10 @@ def main():
     parser.add_argument(
         "--block-pixels", type=int, default=16384, help="local mode: block size per level"
     )
+    parser.add_argument(
+        "--cache-dir", default=None,
+        help="local mode: directory for the exact (operator dtype) partial geometry cache",
+    )
     parser.add_argument("--nside", type=int, default=64)
     parser.add_argument("--J", type=int, default=None, help="default log2(nside) - 1")
     parser.add_argument("--L", type=int, default=2)
@@ -77,7 +81,7 @@ def main():
     if args.mode == "local":
         from STL_main.LocalGeometry import LocalGeometry
 
-        geometry = LocalGeometry(w, block_pixels=args.block_pixels)
+        geometry = LocalGeometry(w, block_pixels=args.block_pixels, cache_dir=args.cache_dir)
         target_stats = op.apply_local(geometry.pyramid_from_map(target), geometry=geometry)
     else:
         geometry = None

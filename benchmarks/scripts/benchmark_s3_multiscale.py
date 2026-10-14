@@ -37,6 +37,7 @@ def main():
         help="'local': partial operators per sub-patch, no full-sky fine geometry",
     )
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--cache-dir", default=None, help="local geometry: exact disk cache")
     parser.add_argument(
         "--iterations", type=int, default=1,
         help="repeat the gradient; the last iteration shows the amortised cost",
@@ -57,7 +58,9 @@ def main():
     if args.geometry == "local":
         from STL_main.LocalGeometry import LocalGeometry
 
-        geometry = LocalGeometry(op.wavelet_op, block_pixels=args.fine_patch)
+        geometry = LocalGeometry(
+            op.wavelet_op, block_pixels=args.fine_patch, cache_dir=args.cache_dir
+        )
         p = geometry.pyramid_from_map(data)
         # Only the coarse level keeps a full-sky operator; build it outside
         # the timed region like the full geometry of the other modes.

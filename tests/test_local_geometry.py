@@ -72,6 +72,21 @@ def test_local_s3_pair_matches_full_sky(kernel_size, fewer, pair, fine_patch):
         torch.testing.assert_close(a, b, atol=1e-10, rtol=1e-9)
 
 
+def test_exact_geometry_cache_roundtrip(tmp_path):
+    _, op, _ = setup_problem(nside=16, J=2, kernel_size=5)
+    cached = LocalGeometry(op.wavelet_op, block_pixels=256, cache_dir=str(tmp_path))
+    fresh = LocalGeometry(op.wavelet_op, block_pixels=256)
+    ids = cached.blocks(0)[2]
+    first = cached.conv(0, ids)
+    assert cached.built.get("saved") == 1
+    reloaded = cached.conv(0, ids)
+    reference = fresh.conv(0, ids)
+    assert reloaded._w_norm.dtype == reference._w_norm.dtype == torch.float64
+    torch.testing.assert_close(reloaded._w_norm, reference._w_norm, atol=0, rtol=0)
+    assert torch.equal(reloaded._pos_safe, reference._pos_safe)
+    assert torch.equal(first._pos_safe, reference._pos_safe)
+
+
 def test_local_s3_pair_larger_map_and_cached_downs():
     """Halos of several rings at intermediate levels (nside 64, J=5)."""
     _, op, p = setup_problem(nside=64, J=5, channels=1, kernel_size=5)
