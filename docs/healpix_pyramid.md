@@ -232,6 +232,53 @@ is still shared by every mode: at `nside=256`, `J=6` it is about 4 GB on
 the GPU and exceeded 15 GB of host RAM when built on CPU. Patch-local
 geometry is therefore the prerequisite for large maps.
 
+## Patch-local geometry (no full-sky fine geometry)
+
+`STL_main.LocalGeometry` removes the full-sky healpix-analyse geometry from
+the fine levels. Every fine-level operation (decimation of the maps, the
+transposed decimation of the analysis VJP, the fine wavelet and its adjoint,
+the pieces of the multiscale S3 chain) runs on a NESTED block through a
+*partial* `HealPixConv` or `HealPixDown` built on the block plus a ring
+halo (`healpix_geo.nested.kth_neighbourhood`), and only the rows whose
+stencil or cone is complete are kept, so the result equals the full-sky one
+to roundoff. Halos: `conv_rings = (kernel_size - 1) // 2 + 2`,
+`down_rings = ceil(radius / pixel) + 1`, doubled for the pieces and the
+transposed decimation (every row touched by the block must be complete).
+Fine dilations are computed at the parent level.
+
+```python
+from STL_main.LocalGeometry import LocalGeometry, s3_scale_pair_local
+geo = LocalGeometry(st.wavelet_op, block_pixels=16384)
+p = geo.pyramid_from_map(data)              # no full-sky decimation matrix
+stats, maps_gradient = s3_scale_pair_local(st, p, 0, J - 1, gradient=g, geometry=geo)
+bands = geo.analysis_vjp(p, maps_gradient)  # transposed decimation by blocks
+```
+
+The coarse level `dg(j3)` keeps the full-sky operator of that (small)
+level. Levels are assumed full sky in canonical NESTED order. Partial
+operators are rebuilt per block and per call (twice per iteration for the
+S3 chain); healpix-analyse caches `HealPixConv` geometries on disk
+(`cache_dir`), keyed by the cell ids, which amortises them across
+iterations. Tests compare every block operation and four S3 scale pairs
+(both definitions, kernel sizes 3 and 5, two block sizes) with the full-sky
+engine. The benchmark accepts `--geometry local`.
+
+Measured (CPU, `nside=128`, `J=5`, pair (0, 4), `fine_patch=16384`, two
+iterations, `benchmark_s3_multiscale --iterations 2`):
+
+| geometry | process RSS before the gradient | first iteration | second iteration |
+|---|---|---|---|
+| full sky (all levels prebuilt) | 1.37 GB | 1.0 s | 1.1 s |
+| local (coarse level only) | 0.47 GB | 7.7 s | 2.6 s |
+
+Both give the same gradient norm. The 0.9 GB difference is the full-sky
+fine geometry that the local mode never builds, and it grows as
+`nside**2`. The first local iteration builds the partial decimations
+(cached afterwards) and the partial convolutions; the second rebuilds only
+the convolutions (24 blocks here). Their build temporaries are host-side
+numpy arrays of healpix-analyse and dominate the transient increment;
+`cache_dir` amortises them from disk.
+
 ## Memory and performance
 
 - No production `backward()` or `torch.autograd.grad`, and no global tape.

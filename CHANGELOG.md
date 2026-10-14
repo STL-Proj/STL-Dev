@@ -9,6 +9,10 @@
   full-sky operator indices, so wavelet fields never cover the whole sphere.
   Available through `ST_Operator.apply_patched/vjp_patched/loss_and_grad_patched`
   and `PyramidSynthesis(patch_pixels=...)`.
+- Added `STL_main.LocalGeometry`: patch-local partial `HealPixConv`/`HealPixDown`
+  operators with ring halos, exact on block interiors, for block-wise
+  decimation, analysis VJP, pyramid construction and the multiscale S3 chain
+  (`s3_scale_pair_local`). The full-sky fine-level geometry is never built.
 - Added `STL_main.S3Multiscale.s3_scale_pair`: one S3 scale pair at a time with
   the fine modulus streamed by fine sub-patches through the linear decimation
   chain, so the gradient of S3(0, J-1) never holds a fine field larger than
