@@ -43,7 +43,7 @@ def test_scale_pair_matches_full_sky(fewer, partial, pair, fine_patch_pixels):
     op, p = setup_problem(fewer=fewer, partial=partial)
     plan = s3_pair_plan(op, 2, *pair)
     assert plan
-    g = torch.randn(1, len(plan), dtype=torch.complex128)
+    g = torch.randn(1, len(plan), dtype=torch.complex128, device=p.device)
     reference_stats = op.apply_pyramid(p, plan=plan)
     reference = op.vjp_pyramid(p, g, plan=plan)
     stats, maps_gradient = s3_scale_pair(
@@ -59,7 +59,7 @@ def test_coarse_cores_and_accumulation():
     op, p = setup_problem(nside=16, J=3)
     g = {pair: None for pair in [(0, 2), (1, 2)]}
     full_plan = sum((s3_pair_plan(op, 2, *pair) for pair in g), ())
-    cot = torch.randn(1, len(full_plan), dtype=torch.complex128)
+    cot = torch.randn(1, len(full_plan), dtype=torch.complex128, device=p.device)
     reference = op.vjp_pyramid(p, cot, plan=full_plan)
     maps_gradient = None
     start = 0
@@ -77,7 +77,7 @@ def test_coarse_cores_and_accumulation():
 def test_fine_fields_scale_with_the_sub_patch():
     op, p = setup_problem(nside=16, J=3, channels=1)
     plan = s3_pair_plan(op, 1, 0, 2)
-    g = torch.ones(1, len(plan), dtype=torch.complex128)
+    g = torch.ones(1, len(plan), dtype=torch.complex128, device=p.device)
     sizes = {}
     for fine in (16, 64, 256):
         tracker = MemoryTracker()

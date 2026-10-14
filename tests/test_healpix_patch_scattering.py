@@ -51,8 +51,9 @@ def test_row_restricted_operators_match_full_operators(partial):
     _, op, p = setup_problem(partial=partial)
     w = op.wavelet_op
     conv = w._get_conv(0, p.templates[0].cell_ids, w.L, w._wav_weights)
-    x = torch.randn(2, 1, conv.K, dtype=torch.float64)
-    rows_out = torch.tensor([3, 5, 11, 40, 41, conv.K - 1])
+    dev = p.device
+    x = torch.randn(2, 1, conv.K, dtype=torch.float64, device=dev)
+    rows_out = torch.tensor([3, 5, 11, 40, 41, conv.K - 1], device=dev)
     rows = ConvRows(conv, rows_out)
     full = w.apply_level(p.wrap(x[:, 0], 0), 0).array  # [2, L, K] complex
     local = conv_forward_rows(rows, x.index_select(-1, rows.in_domain), 5)
@@ -60,20 +61,20 @@ def test_row_restricted_operators_match_full_operators(partial):
     local = torch.complex(local[..., 0, :], local[..., 1, :])
     torch.testing.assert_close(local, full.index_select(-1, rows_out))
     # Adjoint identity <conv x, g> = <x, conv^T g> on the restricted rows.
-    g = torch.randn(2, 2 * w.L, rows_out.numel(), dtype=torch.float64)
+    g = torch.randn(2, 2 * w.L, rows_out.numel(), dtype=torch.float64, device=dev)
     y = conv_forward_rows(rows, x.index_select(-1, rows.in_domain), 4)
     gx = conv_adjoint_rows(rows, g, 4)
     torch.testing.assert_close(
         (y * g).sum(), (x.index_select(-1, rows.in_domain) * gx).sum()
     )
     down = w._get_down(0, p.templates[0].cell_ids)
-    coarse = torch.tensor([0, 7, p.levels[1].shape[-1] - 1])
+    coarse = torch.tensor([0, 7, p.levels[1].shape[-1] - 1], device=dev)
     drows = DownRows(down, coarse)
-    z = torch.randn(3, conv.K, dtype=torch.complex128)
+    z = torch.randn(3, conv.K, dtype=torch.complex128, device=dev)
     full_down = p.down(z, 0, 1)
     local_down = down_forward_rows(drows, z.index_select(-1, drows.in_domain))
     torch.testing.assert_close(local_down, full_down.index_select(-1, coarse))
-    gc = torch.randn(3, coarse.numel(), dtype=torch.complex128)
+    gc = torch.randn(3, coarse.numel(), dtype=torch.complex128, device=dev)
     back = down_adjoint_rows(drows, gc)
     torch.testing.assert_close(
         (local_down.conj() * gc).sum().real,
@@ -103,7 +104,7 @@ def test_patched_vjp_matches_full_sky(fewer, partial):
     for band in p.levels:
         band.add_(0.2 * torch.randn_like(band))
     plan = op.build_plan(channels=2)
-    g = torch.randn(1, len(plan), dtype=torch.complex128)
+    g = torch.randn(1, len(plan), dtype=torch.complex128, device=p.device)
     reference = op.vjp_pyramid(p, g, plan=plan, coefficient_batch_size=31)
     actual = vjp_patched(
         op, p, g, plan=plan, patch_pixels=16, coefficient_batch_size=31
@@ -116,7 +117,7 @@ def test_patched_vjp_matches_full_sky(fewer, partial):
 def test_patch_contributions_are_additive_and_fields_are_patch_sized():
     _, op, p = setup_problem(nside=16, J=3)
     plan = tuple(c for c in op.build_plan() if c.family in ("S2", "S3"))
-    g = torch.randn(1, len(plan), dtype=torch.complex128)
+    g = torch.randn(1, len(plan), dtype=torch.complex128, device=p.device)
     geometry = PatchGeometry(op, p, patch_pixels=32, cache=True)
     full = vjp_patched(op, p, g, plan=plan, geometry=geometry, return_maps_gradient=True)
     n_patches = len(geometry.cores(0, 0))
@@ -160,7 +161,7 @@ def test_fused_loss_matches_and_uses_no_autograd(monkeypatch):
     _, op, p = setup_problem(channels=2, batch=2, partial=True)
     stats = op.apply_pyramid(p)
     target = PyramidStatistics(stats.plan, stats.values * 0.7)
-    weights = torch.linspace(0, 2, len(stats.plan), dtype=torch.float64)
+    weights = torch.linspace(0, 2, len(stats.plan), dtype=torch.float64, device=p.device)
     ref_value, ref_gradient = op.loss_and_grad_pyramid(
         p, target, weights=weights, coefficient_batch_size=17
     )
@@ -186,7 +187,7 @@ def test_shared_native_resolutions_against_legacy_autograd():
     chosen = tuple(
         c for c in op.build_plan() if c.family in ("S3", "S4") and c.j3 == 2
     )
-    g = torch.randn(1, len(chosen), dtype=torch.complex128)
+    g = torch.randn(1, len(chosen), dtype=torch.complex128, device=p.device)
     actual = vjp_patched(op, p, g, plan=chosen, patch_pixels=48)
     leaves = [b.clone().requires_grad_() for b in p.levels]
     pp = HealpixPyramid(leaves, p.templates, op.wavelet_op)
