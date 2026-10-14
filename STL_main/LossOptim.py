@@ -233,10 +233,14 @@ class PyramidSynthesis:
         coefficient_batch_size=64,
         strategy="recompute",
         patch_pixels=None,
+        geometry=None,
     ):
         """``patch_pixels`` selects the patch-localised engine (PatchScattering):
         wavelet fields are then bounded by that pixel budget at the finest
         scale of each coefficient batch instead of covering the whole sphere.
+        ``geometry`` (a ``LocalGeometry``) selects the patch-local geometry
+        engine (LocalScattering): no full-sky fine geometry at all, blocks of
+        ``geometry.block_pixels`` at every level.
         """
         self.operator = scat_operator
         self.target = PyramidStatistics(
@@ -247,7 +251,12 @@ class PyramidSynthesis:
         self.optimizer = optimizer if optimizer is not None else PyramidOptimizer()
         self.loss = loss if loss is not None else SquaredStatisticsLoss()
         self.patch_pixels = patch_pixels
-        if patch_pixels is None:
+        self.geometry = geometry
+        if geometry is not None:
+            if patch_pixels is not None:
+                raise ValueError("Use either patch_pixels or geometry, not both")
+            self.options = dict(geometry=geometry)
+        elif patch_pixels is None:
             self.options = dict(
                 coefficient_batch_size=coefficient_batch_size, strategy=strategy
             )
@@ -269,15 +278,23 @@ class PyramidSynthesis:
             )
             * amplitude
         )
-        self.pyramid = HealpixPyramid.from_map(
-            data_example.new_like(noise), self.operator.wavelet_op
-        )
+        noise_data = data_example.new_like(noise)
+        if self.geometry is not None:
+            self.pyramid = self.geometry.pyramid_from_map(noise_data)
+        else:
+            self.pyramid = HealpixPyramid.from_map(noise_data, self.operator.wavelet_op)
         return self.pyramid
 
     @torch.no_grad()
     def _loss_and_gradient(self, pyramid):
         op = self.operator
-        if self.patch_pixels is None:
+        if self.geometry is not None:
+            fused, evaluate, vjp = (
+                op.loss_and_grad_local,
+                op.apply_local,
+                op.vjp_local,
+            )
+        elif self.patch_pixels is None:
             fused, evaluate, vjp = (
                 op.loss_and_grad_pyramid,
                 op.apply_pyramid,

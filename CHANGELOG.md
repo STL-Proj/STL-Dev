@@ -9,6 +9,14 @@
   full-sky operator indices, so wavelet fields never cover the whole sphere.
   Available through `ST_Operator.apply_patched/vjp_patched/loss_and_grad_patched`
   and `PyramidSynthesis(patch_pixels=...)`.
+- Added `STL_main.LocalScattering`: the complete ScatCov (mean, var, S1, S2,
+  S3, S4) with patch-local geometry (`apply_local`, `vjp_local`,
+  `loss_and_grad_local`, `PyramidSynthesis(geometry=...)`), level by level and
+  block by block, with stored decimated moduli per pair of levels.
+- Added `conv_cache_dir` to the HEALPix wavelet operator to control (or
+  disable) healpix-analyse's float32 on-disk geometry cache.
+- Added `benchmarks/scripts/benchmark_synthesis.py`: legacy autograd LBFGS
+  versus explicit pyramid, patched and local-geometry LBFGS syntheses.
 - Added `STL_main.LocalGeometry`: patch-local partial `HealPixConv`/`HealPixDown`
   operators with ring halos, exact on block interiors, for block-wise
   decimation, analysis VJP, pyramid construction and the multiscale S3 chain

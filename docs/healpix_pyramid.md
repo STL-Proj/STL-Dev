@@ -282,6 +282,48 @@ with the local geometry. The partial `HealPixDown` construction is the slow
 part of the first iteration (about 0.4 s per block at `nside=256`); the
 build temporaries are host-side numpy arrays of healpix-analyse.
 
+## Complete ScatCov with patch-local geometry
+
+`STL_main.LocalScattering` extends the local geometry to every family:
+`apply_local`, `vjp_local`, `loss_and_grad_local` (also as `ST_Operator`
+methods) and `PyramidSynthesis(..., geometry=LocalGeometry(...))`. The
+wavelet field depends only on the level, so the decimated moduli
+`m[d][n] = D**(n-d) |psi * maps[d]|` are stored for every pair of levels
+`d < n` (real maps, four times smaller per level) and filled by a forward
+sweep over levels ascending, each level cut into blocks of
+`block_pixels`: one partial convolution per block gives the first wavelet
+on the block plus its halo and every second wavelet on the block, the
+moduli of finer levels are read from the stored maps, and the block's own
+modulus is pushed through the chain pieces into the coarser maps. The
+reverse sweep goes through the levels descending, so the cotangents of the
+stored moduli are complete when a level reverses its own chain. A level
+smaller than one block is handled whole, which is the "old mode" for the
+large scales. Tests compare every family, both S3/S4 definitions, batches
+and channels, shared resolutions and the fused loss with the full-sky
+engine, and run a synthesis without autograd.
+
+The tests disable healpix-analyse's on-disk geometry cache
+(`conv_cache_dir=None` on the wavelet operator): that cache stores the
+interpolation weights in float32 and casts them back, so a float64
+full-sky operator loaded from it carries ~6e-8 relative rounding (reported
+in GRID4EARTH/healpix-analyse#59). The partial operators are always built
+exactly.
+
+## Synthesis benchmark: legacy full sky versus explicit patch-wise
+
+`benchmarks/scripts/benchmark_synthesis.py` runs the same synthesis
+(`sum |S(x) - S(target)|**2` over the full vanilla plan, LBFGS with strong
+Wolfe line search, `--niter` iterations) in three modes, one fresh process
+each: `legacy` (map variable, `ST_Operator.apply` with autograd,
+`torch.optim.LBFGS`), `pyramid` (Laplacian bands, explicit full-sky VJP,
+`PyramidLBFGS`), `patched` (explicit VJP accumulated over patches,
+`--patch-pixels`, full-sky geometry restricted) and `local` (patch-local
+geometry, `--block-pixels`, no full-sky fine geometry). It reports time,
+loss evaluations, the loss of the final map re-evaluated by the explicit
+engine, CPU RSS and CUDA peaks relative to a baseline taken after the
+geometry of every level is built (for `local`, after the coarse levels
+only), plus the baseline itself, which is where the modes differ most.
+
 ## Memory and performance
 
 - No production `backward()` or `torch.autograd.grad`, and no global tape.

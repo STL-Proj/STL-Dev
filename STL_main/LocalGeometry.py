@@ -137,9 +137,13 @@ class LocalGeometry:
     # -- partial operators -------------------------------------------------
     def conv(self, dg, ids):
         w, nside = self.w, self.nside(dg)
-        optional = dict(device=w.device, dtype=w.dtype, ellipsoid=w.ellipsoid)
-        if self.cache_dir is not None:
-            optional["cache_dir"] = self.cache_dir
+        # healpix-analyse's on-disk cache is on by default and stores the
+        # interpolation weights in float32 whatever the operator dtype, which
+        # silently degrades float64 runs once a geometry has been cached.
+        # It is therefore opt-in here (``cache_dir=...``), off by default.
+        optional = dict(
+            device=w.device, dtype=w.dtype, ellipsoid=w.ellipsoid, cache_dir=self.cache_dir
+        )
         conv = _build_hpa_operator(
             HealPixConv,
             nside=nside,

@@ -281,6 +281,24 @@ class ST_Operator:
 
         return loss_and_grad_patched(self, pyramid, target, **kwargs)
 
+    def apply_local(self, pyramid, **kwargs):
+        """Statistics with patch-local geometry (no full-sky fine geometry)."""
+        from STL_main.LocalScattering import apply_local
+
+        return apply_local(self, pyramid, **kwargs)
+
+    def vjp_local(self, pyramid, gradient, **kwargs):
+        """Band VJP with patch-local geometry."""
+        from STL_main.LocalScattering import vjp_local
+
+        return vjp_local(self, pyramid, gradient, **kwargs)
+
+    def loss_and_grad_local(self, pyramid, target, **kwargs):
+        """Fused loss and band gradients with patch-local geometry."""
+        from STL_main.LocalScattering import loss_and_grad_local
+
+        return loss_and_grad_local(self, pyramid, target, **kwargs)
+
     def apply(
         self,
         data,

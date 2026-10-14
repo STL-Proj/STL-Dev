@@ -458,7 +458,14 @@ class WaveletOperatorHealpixKernel_torch:
         ellipsoid="WGS84",
         down_kwargs=None,
         pyramid_pixel_batch_size=16384,
+        conv_cache_dir="default",
     ):
+        """``conv_cache_dir``: healpix-analyse's on-disk geometry cache for
+        HealPixConv. ``"default"`` keeps the library default (enabled, in the
+        user cache directory), ``None`` disables it, a path selects it. Note
+        that the library stores the interpolation weights in float32, so a
+        float64 operator loaded from the cache carries ~6e-8 relative rounding
+        on its weights; disable the cache when float64 exactness matters."""
         if J is None:
             raise ValueError(
                 "J must be specified for WaveletOperatorHealpixKernel_torch class."
@@ -491,6 +498,7 @@ class WaveletOperatorHealpixKernel_torch:
         ):
             raise ValueError("pyramid_pixel_batch_size must be a positive integer")
         self.pyramid_pixel_batch_size = pyramid_pixel_batch_size
+        self.conv_cache_dir = conv_cache_dir
 
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
@@ -651,6 +659,13 @@ class WaveletOperatorHealpixKernel_torch:
         conv = self._conv_cache.get(key, None)
         if conv is None:
             nside, level, cid_np = self._grid_spec(dg, cid_t)
+            optional = dict(
+                device=self.device,
+                dtype=self.dtype,
+                ellipsoid=self.ellipsoid,
+            )
+            if self.conv_cache_dir != "default":
+                optional["cache_dir"] = self.conv_cache_dir
             conv = _build_hpa_operator(
                 HealPixConv,
                 nside=nside,
@@ -664,11 +679,7 @@ class WaveletOperatorHealpixKernel_torch:
                     cell_ids=cid_np,
                     nest=self.nest,
                 ),
-                optional=dict(
-                    device=self.device,
-                    dtype=self.dtype,
-                    ellipsoid=self.ellipsoid,
-                ),
+                optional=optional,
             )
             conv.set_kernel(weights.detach().cpu().numpy())
             self._conv_cache[key] = conv

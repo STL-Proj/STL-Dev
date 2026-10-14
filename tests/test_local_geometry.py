@@ -22,7 +22,7 @@ def setup_problem(nside=32, channels=2, batch=1, J=4, kernel_size=3, fewer=False
         norm="vanilla",
         compute_PS=False,
         has_fewer_convolutions=fewer,
-        wavelet_op_kwargs=dict(kernel_size=kernel_size, ellipsoid="sphere"),
+        wavelet_op_kwargs=dict(kernel_size=kernel_size, ellipsoid="sphere", conv_cache_dir=None),
     )
     p = HealpixPyramid.from_map(data, op.wavelet_op)
     for band in p.levels:
