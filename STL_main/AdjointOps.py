@@ -125,24 +125,16 @@ def convolution_adjoint(conv, gradient, pixel_batch_size=16384):
 
 
 def downsampling_adjoint(down, gradient):
-    """Transpose the actual anti-aliasing matrix, not child replication."""
+    """Transpose the actual anti-aliasing matrix, not child replication.
+
+    The transposed matrix is kept as a cached CSR tensor on the operator:
+    rebuilding and transposing the COO matrix at every call cost several
+    hundred megabytes of transient memory at nside 256.
+    """
+    from STL_main.PatchOps import down_adjoint_full
+
     if down.mode != "smooth" or not hasattr(down, "_M_indices"):
         raise NotImplementedError(
             "Explicit downsampling requires the smooth sparse operator"
         )
-    matrix = torch.sparse_coo_tensor(
-        down._M_indices,
-        down._M_values.to(gradient.real),
-        down._M_size,
-        device=gradient.device,
-    ).transpose(0, 1)
-    leading = gradient.shape[:-1]
-    flat = gradient.reshape(-1, gradient.shape[-1])
-    if flat.is_complex():
-        result = torch.complex(
-            torch.sparse.mm(matrix, flat.real.T).T,
-            torch.sparse.mm(matrix, flat.imag.T).T,
-        )
-    else:
-        result = torch.sparse.mm(matrix, flat.T).T
-    return result.reshape(*leading, down.N_in)
+    return down_adjoint_full(down, gradient)

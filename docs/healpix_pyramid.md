@@ -213,19 +213,23 @@ prebuilt):
 
 | mode | fine_patch | largest fine field (pixels) | time | RSS increment |
 |---|---|---|---|---|
-| full-sky explicit | - | 196608 | 0.4 s | 77 MB |
-| multiscale | 65536 | 65536 | 1.1 s | 234 MB |
-| multiscale | 16384 | 16384 | 1.3 s | 121 MB |
-| multiscale | 4096 | 4096 | 1.3 s | 68 MB |
-| multiscale | 1024 | 1024 | 1.7 s | 54 MB |
+| full-sky explicit | - | 196608 | 0.2 s | 8 MB |
+| multiscale | 65536 | 65536 | 0.9 s | 238 MB |
+| multiscale | 16384 | 16384 | 1.2 s | 107 MB |
+| multiscale | 4096 | 4096 | 1.2 s | 12 MB |
+| multiscale | 1024 | 1024 | 1.6 s | 10 MB |
 
 The gradient norm is identical in every row. The fine field follows the
-sub-patch size exactly; the process increment follows it once the sub-patch
-is small enough for the per-block index temporaries (bounded by
-`pyramid_pixel_batch_size`) to stop dominating. The full-sky geometry of
-healpix-analyse (the 1.3 GB baseline) is still shared by every mode: at
-`nside=256`, `J=6`, building that geometry alone exceeded 15 GB of RAM and
-was killed before any gradient was computed, in every mode. Patch-local
+sub-patch size exactly and the process increment follows it once the
+per-block index temporaries (bounded by `pyramid_pixel_batch_size`) stop
+dominating. An earlier version showed a plateau of several hundred MB in
+every mode: the decimation matrices were rebuilt as COO tensors and
+transposed at every call of the analysis chain, which at `nside=256` on a
+GPU cost about 440 MB of CUDA peak regardless of the patch. They are now
+cached CSR tensors (`PatchOps.down_forward_full/down_adjoint_full`) and
+whole-level row scans are blocked. The full-sky geometry of healpix-analyse
+is still shared by every mode: at `nside=256`, `J=6` it is about 4 GB on
+the GPU and exceeded 15 GB of host RAM when built on CPU. Patch-local
 geometry is therefore the prerequisite for large maps.
 
 ## Memory and performance

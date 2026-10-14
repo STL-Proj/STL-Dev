@@ -85,9 +85,18 @@ class HealpixPyramid:
         return data
 
     def down(self, x, dg_from, dg_to):
-        return self.wavelet_op.downsample(
-            self.wrap(x, dg_from), dg_to, inplace=True
-        ).array
+        """Filtered decimation through the cached CSR matrices of each level.
+
+        Same matrices as ``wavelet_op.downsample`` (the pyramid rejects masks
+        and NaNs, the only cases where that path differs), without rebuilding
+        a COO tensor at every call.
+        """
+        from STL_main.PatchOps import down_forward_full
+
+        for dg in range(dg_from, dg_to):
+            down = self.wavelet_op._get_down(dg, self.templates[dg].cell_ids)
+            x = down_forward_full(down, x)
+        return x
 
     def down_adjoint(self, g, dg_from, dg_to):
         """Adjoint of down(..., dg_from, dg_to): coarse cotangent -> fine."""

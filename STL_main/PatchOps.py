@@ -257,10 +257,66 @@ def _csr_rows(csr, rows):
     return local_rows, col[entry], val[entry]
 
 
-def down_input_domain(down, out_positions, table=None):
-    """Sorted fine positions read by the coarse ``out_positions``."""
-    _, cols, _ = _csr_rows(_down_csr(down), out_positions)
-    return _collect(cols, table)
+def down_input_domain(down, out_positions, table=None, row_batch_size=16384):
+    """Sorted fine positions read by the coarse ``out_positions``.
+
+    Rows are visited in blocks so that the entry arrays never exceed one
+    block of the sparse matrix, even when ``out_positions`` is a whole level.
+    """
+    csr = _down_csr(down)
+    if table is None:
+        parts = [
+            _csr_rows(csr, out_positions[start:stop])[1]
+            for start, stop in _blocks(out_positions.numel(), row_batch_size)
+        ]
+        return torch.unique(torch.cat(parts))
+    for start, stop in _blocks(out_positions.numel(), row_batch_size):
+        table.mark[_csr_rows(csr, out_positions[start:stop])[1]] = True
+    domain = table.mark.nonzero().reshape(-1)
+    table.mark[domain] = False
+    return domain
+
+
+def _csr_tensor(down, transposed, dtype):
+    """Cached sparse CSR tensor of the decimation matrix or its transpose."""
+    cache = getattr(down, "_stl_csr_tensors", None)
+    if cache is None:
+        cache = down._stl_csr_tensors = {}
+    key = (transposed, dtype)
+    if key not in cache:
+        crow, col, val = _down_csr_t(down) if transposed else _down_csr(down)
+        rows, cols = down._M_size
+        if transposed:
+            rows, cols = cols, rows
+        cache[key] = torch.sparse_csr_tensor(
+            crow, col, val.to(dtype), size=(rows, cols), device=crow.device
+        )
+    return cache[key]
+
+
+def _csr_apply(matrix, x):
+    """``x[..., n] -> y[..., m]`` through a sparse ``[m, n]`` matrix."""
+    leading = x.shape[:-1]
+    flat = x.reshape(-1, x.shape[-1])
+    if flat.is_complex():
+        result = torch.complex((matrix @ flat.real.T).T, (matrix @ flat.imag.T).T)
+    else:
+        result = (matrix @ flat.T).T
+    return result.reshape(*leading, matrix.shape[0])
+
+
+def down_forward_full(down, x):
+    """Whole-level decimation through the cached CSR matrix (no COO rebuild)."""
+    if x.shape[-1] != down.N_in:
+        raise ValueError("Decimation input does not match the operator")
+    return _csr_apply(_csr_tensor(down, False, x.real.dtype), x)
+
+
+def down_adjoint_full(down, gradient):
+    """Whole-level transposed decimation through the cached CSR transpose."""
+    if gradient.shape[-1] != down.N_out:
+        raise ValueError("Decimation cotangent does not match the operator")
+    return _csr_apply(_csr_tensor(down, True, gradient.real.dtype), gradient)
 
 
 class DownRows:
