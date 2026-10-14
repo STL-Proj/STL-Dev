@@ -51,8 +51,11 @@ def main():
             down = op.wavelet_op._get_down(template.dg, template.cell_ids)
             _down_csr(down)
             _down_csr_t(down)
-    if args.mode == "multiscale":
-        op.wavelet_op.pyramid_pixel_batch_size = min(16384, args.fine_patch)
+    # The convolution block bounds the per-row index temporaries (about 6.4 kB
+    # per row of a block, 200x a complex L=2 field value); keep it small and
+    # independent of the sub-patch, which bounds the fields.
+    parser_block = min(4096, args.fine_patch) if args.mode == "multiscale" else 4096
+    op.wavelet_op.pyramid_pixel_batch_size = parser_block
     plan = s3_pair_plan(op, 1, args.j1, j3)
     g = torch.randn(1, len(plan), dtype=torch.complex128, device=data.device)
     tracker = MemoryTracker()
