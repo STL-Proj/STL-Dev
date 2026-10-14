@@ -96,6 +96,8 @@ class ST_Statistics:
         standardized,
         mean_pre_std,
         std_pre_std,
+        whitened=False,
+        spectrum_pre_whiten=None,
     ):
         """
         Constructor, see details above.
@@ -131,6 +133,10 @@ class ST_Statistics:
         self.standardized = standardized
         self.mean_pre_std = mean_pre_std
         self.std_pre_std = std_pre_std
+
+        # Radial power spectrum of data if whitening is applied (after standardization)
+        self.whitened = whitened
+        self.spectrum_pre_whiten = spectrum_pre_whiten
 
         # Additional transform/compression related parameters. While put to
         # False/None for the initialization, their value are modified if these

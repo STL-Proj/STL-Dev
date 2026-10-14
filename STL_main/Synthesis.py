@@ -184,6 +184,7 @@ def optimize_from_maps(
     seed=None,
     prefilter_Nyquist=True,
     adhoc_weights={"S3": 3.5, "S4": 3.5**2},
+    whiten=False,
 ):
     # Set random seed
     torch.manual_seed(seed) if seed is not None else None
@@ -233,7 +234,6 @@ def optimize_from_maps(
 
     with torch.no_grad():
 
-        # ------- Standardize target -------
         l_target = target.copy(empty=False)
 
         l_target.array = l_target.array.reshape(target_shape)
@@ -247,9 +247,16 @@ def optimize_from_maps(
                 print("Prefiltering target to remove frequencies above Nyquist")
                 l_target.array = apply_nyquist_filter(l_target.array)
 
+        # ------- Standardize target -------
         l_target, mean_target, std_target = st_op_target.wavelet_op.standardize(
             l_target, mean_field=mean_field, inplace=True
-        )  # [Nb, Nc] if mean_field else [1, Nc]
+        )  # [1, Nc] if mean_field else [Nb, Nc]
+
+        # ------- Whiten target -------
+        if whiten:
+            l_target, spectrum_target = st_op_target.CS_op.whiten(
+                l_target, mean_field=mean_field, inplace=True
+            )  # [1, Nc, N_modes] if mean_field else [Nb, Nc, N_modes] with N_modes = N_max + 1 (2D) or l_max + 1 (Healpix)
 
         # ------- Compute target stats -------
         target_stats = st_op_target.apply(
@@ -308,8 +315,10 @@ def optimize_from_maps(
         print_iter=print_iter,
     )
 
-    # ------- Post-process optimized u: unstandardize, apply mask constraints, reshape -------
+    # ------- Post-process optimized u: unwhiten, unstandardize, apply mask constraints, reshape -------
     DC_u_opt = target.__class__(array=u_opt, pbc=pbc_running)
+    if whiten:
+        st_op_running.CS_op.unwhiten(DC_u_opt, pk=spectrum_target, inplace=True)
     st_op_running.wavelet_op.unstandardize(
         DC_u_opt, mean=mean_target, std=std_target, inplace=True
     )
@@ -394,6 +403,14 @@ def optimize_from_stats(
         target_stats.std_pre_std.mean(dim=0) if mean_field else target_stats.std_pre_std
     )  # [1, Nc] if mean_field else [Nc]
 
+    # Average pre-whitening power spectrum over batch if mean_field is True (for unwhitening)
+    if target_stats.whitened:
+        pk_target = (
+            target_stats.spectrum_pre_whiten.mean(dim=0, keepdim=True)
+            if mean_field
+            else target_stats.spectrum_pre_whiten
+        )  # [1, Nc, N_max+1] if mean_field else [Nb, Nc, N_max+1]
+
     # ------- Transfer reference normalization from target stats to running operator -------
     # Those reference normalization attributes have been stored during normalisation of the target stats.
     assert (
@@ -437,16 +454,20 @@ def optimize_from_stats(
         print_iter=print_iter,
     )
 
-    # ------- Post-process optimized u: unstandardize, apply mask constraints -------
+    # ------- Post-process optimized u: unwhiten, unstandardize, apply mask constraints -------
+    DC_u_opt = target_stats.DataClass(u_opt, pbc=pbc_running)
+    if target_stats.whitened:
+        st_op_running.CS_op.unwhiten(
+            DC_u_opt, spectrum_pre_whiten=target_stats.spectrum_pre_whiten, inplace=True
+        )
     if target_stats.standardized:
-        DC_u_opt = target_stats.DataClass(u_opt, pbc=pbc_running)
         st_op_running.wavelet_op.unstandardize(
             DC_u_opt,
             mean=target_stats.mean_pre_std,
             std=target_stats.std_pre_std,
             inplace=True,
         )
-        u_opt = DC_u_opt.array
+    u_opt = DC_u_opt.array
 
     if st_op_running.wavelet_op.mask_full_res is not None:
         u_opt[..., st_op_running.wavelet_op.mask_full_res.array] = torch.nan
@@ -524,6 +545,7 @@ def synthesize_from_maps(
     has_fewer_convolutions=False,
     compute_cross_matrix=None,
     mean_field=True,
+    whiten=False,
     **optim_kwargs,
 ):
     """
@@ -541,6 +563,12 @@ def synthesize_from_maps(
     mean_field : bool, optional
         Default is True. Default value allows one to perform synthesis between N target samples and M running samples (with N different from or
         equal to M) while matching statistics computed from the batch-averaged field.
+
+    whiten : bool, optional
+        Default is False. If True, the standardized target is whitened (each Fourier mode is divided by the
+        square root of the power spectrum of its radial shell) before computing its statistics, and the
+        synthesized field is colored back with the target power spectrum. Requires periodic target and
+        running fields without NaN.
 
     Notes
     -----
@@ -601,6 +629,14 @@ def synthesize_from_maps(
             "Power spectrum optimization is disabled because its computation is not yet implemented for NaN values in any dataclass. \n"
         )
 
+    if whiten:
+        if target_has_nan or running_has_nan:
+            raise ValueError(
+                "Whitening is not possible with NaN in target and/or running data."
+            )
+        if data_target.pbc is False or pbc_running is False:
+            raise ValueError("Whitening requires periodic target and running data.")
+
     # compute_PS = not (target_has_nan or running_has_nan)
     compute_PS = False  # Try to synthesis the PSD directly from S2 coefficients synthesis (plus an eventual PSD whitening of the target)
 
@@ -632,6 +668,7 @@ def synthesize_from_maps(
         has_fewer_convolutions=has_fewer_convolutions,
         compute_cross_matrix=compute_cross_matrix,
         compute_PS=compute_PS,
+        whiten=whiten,
         **optim_params,
     )
 
@@ -683,6 +720,12 @@ def synthesize_from_stats(
             target_stats.compute_PS = False
 
     compute_PS = target_stats.compute_PS and not running_has_nan
+
+    if target_stats.whitened and (running_has_nan or pbc_running is False):
+        raise ValueError(
+            "target_stats have been computed on whitened data: unwhitening the synthesized field "
+            "requires periodic running data without NaN."
+        )
 
     # Get scattering operator for running data
     st_op_running = data_running.get_ST_op(

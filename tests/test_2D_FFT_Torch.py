@@ -69,7 +69,35 @@ def test_DataClass_downsample():
     )
 
 
+def test_CS_op_whiten():
+
+    from STL_main.Synthesis import apply_nyquist_filter
+
+    # Nyquist-filtered periodic data (corner modes are not covered by P_k)
+    array = torch.tensor(np.load(DATA_TEST_PATH / "Turb_6.npy")[:4, :128, :128])
+    data = DataClass(array=apply_nyquist_filter(array)[:, None], pbc=True)
+    CS_op = data.get_CS_op()
+
+    whitened, pk = CS_op.whiten(data, mean_field=False)
+    assert pk.shape == (4, 1, CS_op.N_max + 1)
+
+    # whitened power spectrum is flat on each radial shell (k=0 excluded)
+    fft = torch.fft.rfft2(whitened.array, norm="ortho")
+    assert torch.allclose(CS_op._cross_pk(fft, fft)[..., 1:], torch.ones(1).double())
+
+    # whiten / unwhiten round trip
+    colored = CS_op.unwhiten(whitened, pk)
+    assert torch.allclose(colored.array, data.array)
+
+    # P_k interpolation onto the radial grid of an operator of another shape
+    CS_op_64 = DataClass(array=torch.zeros(64, 64), pbc=True).get_CS_op()
+    pk_64 = CS_op_64._interp_pk(pk)
+    assert pk_64.shape == (4, 1, CS_op_64.N_max + 1)
+    assert torch.allclose(pk_64[..., 1:], pk[..., 2::2])
+
+
 if __name__ == "__main__":
     test_DataClass_mean()
     test_DataClass_cov()
     test_DataClass_downsample()
+    test_CS_op_whiten()

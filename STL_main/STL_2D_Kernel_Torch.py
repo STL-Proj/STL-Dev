@@ -1801,6 +1801,144 @@ class CS_operator_2D_Kernel_Torch:
         return pk / self.n_modes_radial
 
     ###########################################################################
+    def _pk_to_grid(self, pk, pow, eps=1e-12):
+        """
+        Map a radial P_k (..., N_max+1) onto the rFFT grid as the factor P_k**pow.
+
+        The mean (k=0) mode gets a factor 1 (left to standardize), and the corner
+        modes beyond N_max (not covered by P_k, removed by the Nyquist prefilter)
+        get a factor 0. Shells with P_k below eps * max(P_k) are floored to it.
+        """
+        pk_floor = eps * pk[..., 1:].amax(dim=-1, keepdim=True)
+        pk = torch.maximum(pk, pk_floor)
+
+        factor = pk[..., self.radial_bin_of_k] ** pow  # [..., N, M//2+1]
+        factor[..., self.radial_bin_of_k == 0] = 1.0
+        factor[..., self.radial_bin_of_k < 0] = 0.0
+
+        return factor
+
+    ###########################################################################
+    def _interp_pk(self, pk, eps=1e-12):
+        """
+        Log-log interpolation (exact for power laws) of a radial P_k computed by an
+        operator of another shape onto the radial frequencies of this operator.
+
+        P_k is defined on radial_k = linspace(0, kmax, len(P_k)) for any shape, so its
+        length is enough to recover its frequency grid. The k=0 mode is excluded
+        from the interpolation, and the extrapolation is constant.
+        """
+        if pk.shape[-1] == self.N_max + 1:
+            return pk
+
+        log_k_src = torch.log(
+            torch.linspace(
+                0, self.kmax, pk.shape[-1], device=pk.device, dtype=self.radial_k.dtype
+            )[1:]
+        )
+        pk_floor = eps * pk[..., 1:].amax(dim=-1, keepdim=True)
+        log_pk_src = torch.log(pk[..., 1:].clamp_min(pk_floor))
+        log_k_tgt = torch.log(self.radial_k[1:]).clamp(
+            min=log_k_src[0], max=log_k_src[-1]
+        )
+
+        idx = torch.searchsorted(log_k_src, log_k_tgt).clamp(1, len(log_k_src) - 1)
+        w = (log_k_tgt - log_k_src[idx - 1]) / (log_k_src[idx] - log_k_src[idx - 1])
+        log_pk_tgt = log_pk_src[..., idx - 1] * (1 - w) + log_pk_src[..., idx] * w
+
+        return torch.cat([pk[..., :1], torch.exp(log_pk_tgt)], dim=-1)
+
+    ###########################################################################
+    def _check_whitening_input(self, data):
+        """Validate input data for psd whitening through Fourier transform."""
+        if data.N0 != self.shape:
+            raise ValueError(
+                f"Full resolution of data : {tuple(data.N0)} does not match operator "
+                f"operator shape : {self.shape}."
+            )
+        if data.dg != 0:
+            raise ValueError("Data dg must be 0 for whitening.")
+        if data.pbc is False:
+            raise ValueError("Whitening through FFT requires periodic data (pbc=True).")
+        if data.array.is_complex():
+            raise ValueError("Whitening is only implemented for real data.")
+        if data.array.isnan().any():
+            raise ValueError(
+                "Data array contains NaN values, whitening is not possible."
+            )
+
+    ###########################################################################
+    def whiten(self, data, mean_field, inplace=False):
+        """
+        Whiten the data by dividing each Fourier mode by the square root of the
+        power spectrum P_k of its radial shell k (unbinned).
+
+        Parameters
+        ----------
+        - data : STL_2D_Kernel_Torch
+            Periodic input data at dg=0, without NaN.
+        - mean_field : bool
+            If True, P_k is averaged over the batch dimension.
+        - inplace : bool
+            If True, perform the operation in-place on the input data.
+
+        Returns
+        -------
+        - STL_2D_Kernel_Torch
+            Whitened data.
+        - torch.Tensor
+            P_k used for whitening, [..., N_max+1] ([1, ..., N_max+1] if mean_field).
+        """
+        self._check_whitening_input(data)
+
+        l_data = data.copy(empty=False) if not inplace else data
+
+        fft = torch.fft.rfft2(l_data.array, norm="ortho")  # [..., N, M//2+1]
+        pk = self._cross_pk(fft, fft)  # [..., N_max+1]
+        if mean_field:
+            pk = pk.mean(dim=0, keepdim=True)
+
+        l_data.array = torch.fft.irfft2(
+            fft * self._pk_to_grid(pk, pow=-0.5),
+            s=l_data.array.shape[-2:],
+            norm="ortho",
+        )
+
+        return l_data, pk
+
+    ###########################################################################
+    def unwhiten(self, data, pk, inplace=False):
+        """
+        Color back the data by multiplying each Fourier mode by the square root of
+        the power spectrum P_k of its radial shell k, as returned by whiten.
+
+        Parameters
+        ----------
+        - data : STL_2D_Kernel_Torch
+            Periodic input data at dg=0.
+        - pk : torch.Tensor
+            P_k returned by whiten, [..., N_max'+1]. If it has been computed by an
+            operator of another shape, it is interpolated onto this operator radial grid.
+
+        Returns
+        -------
+        - STL_2D_Kernel_Torch
+            Colored data.
+        """
+        self._check_whitening_input(data)
+
+        l_data = data.copy(empty=False) if not inplace else data
+
+        fft = torch.fft.rfft2(l_data.array, norm="ortho")
+        l_data.array = torch.fft.irfft2(
+            fft * self._pk_to_grid(self._interp_pk(pk), pow=0.5),
+            s=l_data.array.shape[-2:],
+            norm="ortho",
+        )
+
+        return l_data
+
+    ###########################################################################
     def _bin_pk(self, pk):
         """Bin P_k into the n_bins radial frequency bands. (..., N_max+1) -> (..., n_bins)."""
         weights = self.bin_weights.to(dtype=pk.dtype)

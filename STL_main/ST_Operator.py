@@ -247,6 +247,7 @@ class ST_Operator:
         PS_ref_sqrt_chan_diag=None,
         var_ref=None,
         compute_cross_matrix=None,
+        whiten=False,
     ):
         """
         Compute the Scattering Transform (ST) of data, which are either stored
@@ -271,6 +272,11 @@ class ST_Operator:
         # Data
         - data : StlData with MR=False, dim (N) or (Nc, N) or (Nb, Nc, N)
             data, Nc number of channel, Nb batch size. Should have dg=0.
+        - standardize : bool
+            standardize each map (mean and std stored in the ST statistics) before computing statistics
+        - whiten : bool
+            whiten each map (after standardization if any) by the square root of its unbinned radial
+            power spectrum, which is stored in the ST statistics. Requires periodic data without NaN.
 
         # Scattering Transform
         - SC : str
@@ -419,6 +425,15 @@ class ST_Operator:
             standardized = False
             mean_pre_std, std_pre_std = None, None
 
+        if whiten:
+            whitened = True
+            l_data, spectrum_pre_whiten = self.CS_op.whiten(
+                l_data, mean_field=False, inplace=True
+            )  # [Nb, Nc, N_max+1]
+        else:
+            whitened = False
+            spectrum_pre_whiten = None
+
         # Create a ST_statistics instance
         data_st = ST_Statistics(
             data.__class__,
@@ -434,6 +449,8 @@ class ST_Operator:
             standardized,
             mean_pre_std,
             std_pre_std,
+            whitened,
+            spectrum_pre_whiten,
         )
 
         # Systematic statistics (data supposed to be real)
