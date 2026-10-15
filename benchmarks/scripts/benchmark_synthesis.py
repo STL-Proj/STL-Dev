@@ -21,6 +21,7 @@ python -m benchmarks.scripts.benchmark_synthesis --mode patched --nside 64 --nit
 import argparse
 import gc
 import json
+import os
 import threading
 import time
 
@@ -103,7 +104,12 @@ def main():
         help="local mode: partial decimations on the device, in host RAM (default "
         "on CUDA) or reloaded from --cache-dir block by block",
     )
-    parser.add_argument("--nside", type=int, default=64)
+    parser.add_argument("--nside", type=int, default=64, help="ignored with --target")
+    parser.add_argument(
+        "--target", default=None,
+        help="NESTED full-sky map (.npy, e.g. data/websky/kap_nside1024_nested.npy) "
+        "used as the target after standardisation; the initial map is white noise",
+    )
     parser.add_argument("--J", type=int, default=None, help="default log2(nside) - 1")
     parser.add_argument("--L", type=int, default=2)
     parser.add_argument("--kernel-size", type=int, default=5)
@@ -123,10 +129,25 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="do not print the loss per evaluation")
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
-    J = args.J if args.J is not None else max(1, args.nside.bit_length() - 2)
     generator = torch.Generator().manual_seed(args.seed)
+    target_stats_info = None
+    if args.target is not None:
+        import numpy as np
+
+        raw = np.load(args.target).astype(np.float64).reshape(-1)
+        nside = int(round((raw.size / 12) ** 0.5))
+        if 12 * nside**2 != raw.size or nside & (nside - 1):
+            raise SystemExit(f"{args.target}: {raw.size} pixels is not a full-sky HEALPix map")
+        if not np.isfinite(raw).all():
+            raise SystemExit(f"{args.target}: non-finite values")
+        args.nside = nside
+        mean, std = float(raw.mean()), float(raw.std())
+        target_map = torch.as_tensor((raw - mean) / std)
+        target_stats_info = dict(file=args.target, mean=mean, std=std)
+    J = args.J if args.J is not None else max(1, args.nside.bit_length() - 2)
     npix = 12 * args.nside**2
-    target_map = torch.randn(npix, dtype=torch.float64, generator=generator)
+    if args.target is None:
+        target_map = torch.randn(npix, dtype=torch.float64, generator=generator)
     initial_map = torch.randn(npix, dtype=torch.float64, generator=generator)
     kwargs = {} if args.device is None else dict(device=args.device)
     target = STL_Healpix_Kernel_Torch(target_map, **kwargs)
@@ -271,7 +292,8 @@ def main():
         floor["dilation_cache_entries"] = len(geometry._dilations)
     output = args.output
     if output is None:
-        output = f"synthesis_{args.mode}_nside{args.nside}.png"
+        tag = "" if args.target is None else "_" + os.path.splitext(os.path.basename(args.target))[0]
+        output = f"synthesis_{args.mode}_nside{args.nside}{tag}.png"
     if output != "none":
         save_figure(
             output, args, history, target_map.cpu().numpy(),
@@ -282,6 +304,7 @@ def main():
             dict(
                 mode=args.mode,
                 nside=args.nside,
+                target=target_stats_info,
                 J=J,
                 L=args.L,
                 coefficients=len(plan),
