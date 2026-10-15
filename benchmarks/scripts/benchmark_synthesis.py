@@ -98,6 +98,11 @@ def main():
         "--cache-dir", default=None,
         help="local mode: directory for the exact (operator dtype) partial geometry cache",
     )
+    parser.add_argument(
+        "--down-cache", choices=("ram", "disk"), default=None,
+        help="local mode: keep partial decimations on the device or reload them "
+        "from --cache-dir block by block (default: disk when --cache-dir is given)",
+    )
     parser.add_argument("--nside", type=int, default=64)
     parser.add_argument("--J", type=int, default=None, help="default log2(nside) - 1")
     parser.add_argument("--L", type=int, default=2)
@@ -140,7 +145,10 @@ def main():
     if args.mode == "local":
         from STL_main.LocalGeometry import LocalGeometry
 
-        geometry = LocalGeometry(w, block_pixels=args.block_pixels, cache_dir=args.cache_dir)
+        geometry = LocalGeometry(
+            w, block_pixels=args.block_pixels, cache_dir=args.cache_dir,
+            cache_downs=args.down_cache,
+        )
         target_stats = op.apply_local(geometry.pyramid_from_map(target), geometry=geometry)
     else:
         geometry = None
@@ -246,6 +254,20 @@ def main():
                 HealpixPyramid.from_map(final_data, w), coefficient_batch_size=args.batch_size
             )
         final_loss = float((final.values - target_stats.values).abs().square().sum())
+    # Block-independent memory terms (bytes), to read next to the peaks.
+    levels = list(range(J)) if geometry is None else list(range(J))
+    npix_levels = [12 * (args.nside >> d) ** 2 for d in range(J)]
+    maps_bytes = sum(npix_levels) * 8
+    floor = dict(
+        bands_maps_and_gradients=3 * maps_bytes,
+        lbfgs_history=2 * args.history_size * maps_bytes,
+    )
+    if geometry is not None:
+        floor["stored_moduli_and_cotangents"] = (
+            2 * args.L * 8 * sum(n * npix_levels[n] for n in range(1, J))
+        )
+        floor["down_cache_on_device"] = geometry.down_cache_bytes()
+        floor["down_cache_mode"] = geometry.cache_downs
     output = args.output
     if output is None:
         output = f"synthesis_{args.mode}_nside{args.nside}.png"
@@ -275,6 +297,7 @@ def main():
                 loss_final_map=final_loss,
                 loss_history=history,
                 figure=None if output == "none" else output,
+                memory_floor_bytes=floor,
                 rss_baseline=rss_baseline,
                 rss_peak_increment=peak[0] - rss_baseline,
                 cuda_baseline_allocated=cuda_baseline if cuda else None,

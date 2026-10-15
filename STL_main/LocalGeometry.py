@@ -91,19 +91,80 @@ def dilate_fine(ids, nside, rings):
     return children(dilate(parents(ids), nside // 2, rings // 2 + 1))
 
 
+class SlimDown:
+    """A partial decimation reduced to its two CSR tensors.
+
+    Quacks like ``HealPixDown`` for ``PatchOps.down_forward_full``,
+    ``AdjointOps.downsampling_adjoint`` and ``LocalGeometry.out_ids``.
+    """
+
+    mode = "smooth"
+
+    def __init__(self, n_in, n_out, cell_ids_out, device, forward, transposed):
+        self.N_in, self.N_out = int(n_in), int(n_out)
+        self.cell_ids_out = np.asarray(cell_ids_out, dtype=np.int64)
+        self.device = torch.device(device)
+        dtype = forward.values().dtype
+        self._stl_csr_tensors = {(False, dtype): forward, (True, dtype): transposed}
+
+    def _tensors(self):
+        (forward, transposed) = (
+            self._stl_csr_tensors[k] for k in sorted(self._stl_csr_tensors, key=lambda k: k[0])
+        )
+        return forward, transposed
+
+    def nbytes(self):
+        total = 0
+        for t in self._stl_csr_tensors.values():
+            for part in (t.crow_indices(), t.col_indices(), t.values()):
+                total += part.numel() * part.element_size()
+        return total
+
+    def state(self):
+        forward, transposed = self._tensors()
+        return dict(
+            n_in=self.N_in, n_out=self.N_out, cell_ids_out=torch.as_tensor(self.cell_ids_out),
+            f_crow=forward.crow_indices().cpu(), f_col=forward.col_indices().cpu(),
+            f_val=forward.values().cpu(), t_crow=transposed.crow_indices().cpu(),
+            t_col=transposed.col_indices().cpu(), t_val=transposed.values().cpu(),
+        )
+
+    @classmethod
+    def from_state(cls, s, device):
+        n_in, n_out = int(s["n_in"]), int(s["n_out"])
+        forward = torch.sparse_csr_tensor(
+            s["f_crow"].to(device), s["f_col"].to(device), s["f_val"].to(device), size=(n_out, n_in)
+        )
+        transposed = torch.sparse_csr_tensor(
+            s["t_crow"].to(device), s["t_col"].to(device), s["t_val"].to(device), size=(n_in, n_out)
+        )
+        return cls(n_in, n_out, s["cell_ids_out"].numpy(), device, forward, transposed)
+
+
 class LocalGeometry:
     """Partial operators and block-wise exact pyramid operations."""
 
-    def __init__(self, wavelet_op, block_pixels=16384, cache_dir=None, cache_downs=True):
-        """``cache_downs`` keeps the partial decimation matrices (a few tens of
-        bytes per coarse row, about the size of the full-sky decimation
-        matrix in total) across calls; convolution geometries, the expensive
-        part (3.2 kB per pixel), are never kept and go through healpix-analyse's
-        on-disk ``cache_dir`` instead."""
+    def __init__(self, wavelet_op, block_pixels=16384, cache_dir=None, cache_downs=None):
+        """``cache_downs``: where the partial decimation matrices live between
+        uses. ``"ram"`` keeps them on the device (in total about the full-sky
+        decimation matrix: tens of bytes per fine pixel, block independent);
+        ``"disk"`` stores them under ``cache_dir`` and reloads one block at a
+        time, so device memory stays block sized; ``False`` rebuilds them
+        every time (slow). Default: ``"disk"`` when ``cache_dir`` is given,
+        else ``"ram"``. Convolution geometries (3.2 kB per pixel) are never
+        kept on the device; with ``cache_dir`` they are reloaded from disk."""
         if wavelet_op.mask_full_res is not None or wavelet_op.nan_aware_stats:
             raise NotImplementedError("Local geometry requires unmasked finite data")
         if not isinstance(block_pixels, int) or block_pixels < 1:
             raise ValueError("block_pixels must be a positive integer")
+        if cache_downs is None:
+            cache_downs = "disk" if cache_dir is not None else "ram"
+        if cache_downs is True:
+            cache_downs = "ram"
+        if cache_downs not in ("ram", "disk", False):
+            raise ValueError("cache_downs must be 'ram', 'disk' or False")
+        if cache_downs == "disk" and cache_dir is None:
+            raise ValueError("cache_downs='disk' requires cache_dir")
         self.w = wavelet_op
         self.block_pixels = block_pixels
         self.cache_dir = cache_dir
@@ -207,8 +268,12 @@ class LocalGeometry:
 
     def down(self, dg, ids):
         key = (dg, ids.numel(), int(ids[0]), int(ids[-1]), int(ids.sum()))
-        if self.cache_downs and key in self._downs:
+        if self.cache_downs == "ram" and key in self._downs:
             return self._downs[key]
+        if self.cache_downs == "disk":
+            loaded = self._load_down(key)
+            if loaded is not None:
+                return loaded
         w, nside = self.w, self.nside(dg)
         down = _build_hpa_operator(
             HealPixDown,
@@ -220,26 +285,64 @@ class LocalGeometry:
             ),
         )
         self.built["down"] += 1
-        if self.cache_downs:
-            # Keep only the two CSR tensors (forward and transpose); the COO
-            # buffers and the row-restriction views would triple the footprint.
-            _csr_tensor(down, False, w.dtype)
-            _csr_tensor(down, True, w.dtype)
-            for name in ("_M_indices", "_M_values", "_stl_patch_csr", "_stl_patch_csr_t"):
-                if name in down._buffers:
-                    del down._buffers[name]
-                elif hasattr(down, name):
-                    delattr(down, name)
-            self._downs[key] = down
-        return down
+        if not self.cache_downs:
+            return down
+        # Keep only the two CSR tensors (forward and transpose) in a slim
+        # object; the COO buffers and row-restriction views would triple it.
+        slim = SlimDown(
+            down.N_in, down.N_out, np.asarray(down.cell_ids_out), down.device,
+            _csr_tensor(down, False, w.dtype), _csr_tensor(down, True, w.dtype),
+        )
+        del down
+        if self.cache_downs == "ram":
+            self._downs[key] = slim
+        else:
+            self._save_down(key, slim)
+        return slim
+
+    def _down_path(self, key):
+        from pathlib import Path
+
+        name = "stl_down_{}_{}_{}_{}_{}_{}.pt".format(
+            self.nside(0), *key
+        )
+        return Path(self.cache_dir) / name
+
+    def _save_down(self, key, slim):
+        try:
+            path = self._down_path(key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            torch.save(slim.state(), tmp)
+            tmp.replace(path)
+        except Exception:
+            pass
+
+    def _load_down(self, key):
+        path = self._down_path(key)
+        if not path.exists():
+            return None
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception:
+            return None
+        return SlimDown.from_state(state, self.device)
+
+    def down_cache_bytes(self):
+        """Device bytes held by the decimation matrices kept in RAM."""
+        return sum(d.nbytes() for d in self._downs.values())
 
     @staticmethod
     def out_ids(down):
         cached = getattr(down, "_stl_out_ids", None)
         if cached is None:
-            cached = down._stl_out_ids = torch.as_tensor(
+            cached = torch.as_tensor(
                 np.asarray(down.cell_ids_out), dtype=torch.long, device=down.device
             )
+            try:
+                down._stl_out_ids = cached
+            except AttributeError:
+                pass
         return cached
 
     # -- exact block-wise pyramid operations ---------------------------------
