@@ -56,6 +56,44 @@ def equirectangular(values, nside, height=None):
     return image
 
 
+def write_healpix_fits(path, values, nside, column="VALUE", unit=""):
+    """Write a full-sky NESTED HEALPix map as a standard binary-table FITS file."""
+    import numpy as np
+    from astropy.io import fits
+
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size != 12 * nside**2:
+        raise ValueError("Map size does not match nside")
+    col = fits.Column(name=column, format="E", unit=unit, array=values)
+    hdu = fits.BinTableHDU.from_columns([col])
+    header = hdu.header
+    header["PIXTYPE"] = "HEALPIX"
+    header["ORDERING"] = "NESTED"
+    header["COORDSYS"] = "C"
+    header["EXTNAME"] = "xtension"
+    header["NSIDE"] = nside
+    header["FIRSTPIX"] = 0
+    header["LASTPIX"] = values.size - 1
+    header["INDXSCHM"] = "IMPLICIT"
+    header["OBJECT"] = "FULLSKY"
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+
+def upsample_nested(values, nside_from, nside_to):
+    """Replicate each NESTED pixel on its 4**k children."""
+    import numpy as np
+
+    factor = (nside_to // nside_from) ** 2
+    return np.repeat(np.asarray(values).reshape(-1), factor)
+
+
+def downsample_nested(values, nside_from, nside_to):
+    import numpy as np
+
+    factor = (nside_from // nside_to) ** 2
+    return np.asarray(values).reshape(-1, factor).mean(axis=1)
+
+
 def save_figure(path, args, history, target_map, result_map, nside, J):
     import matplotlib
 
@@ -131,6 +169,22 @@ def main():
         "(default synthesis_<mode>_nside<N>.png); 'none' disables it",
     )
     parser.add_argument("--quiet", action="store_true", help="do not print the loss per evaluation")
+    parser.add_argument(
+        "--fits", default=None,
+        help="prefix for FITS outputs (<prefix>_target.fits, <prefix>_synthesis.fits, "
+        "NESTED, in the units of --target); default: same base name as the PNG; 'none' disables",
+    )
+    parser.add_argument(
+        "--init", default=None,
+        help="NESTED .npy map at a lower (or equal) nside used as the initial map after "
+        "NESTED replication to the target nside, e.g. a synthesis at nside 256",
+    )
+    parser.add_argument(
+        "--init-noise", default="auto",
+        help="white noise std added to --init, in the units of --init: 'auto' uses the "
+        "RMS of (target - upsampled(downsampled(target))) at the init nside, "
+        "a number sets it directly, 0 adds nothing",
+    )
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
     generator = torch.Generator().manual_seed(args.seed)
@@ -152,7 +206,31 @@ def main():
     npix = 12 * args.nside**2
     if args.target is None:
         target_map = torch.randn(npix, dtype=torch.float64, generator=generator)
-    initial_map = torch.randn(npix, dtype=torch.float64, generator=generator)
+    init_info = None
+    if args.init is None:
+        initial_map = torch.randn(npix, dtype=torch.float64, generator=generator)
+    else:
+        import numpy as np
+
+        coarse = np.load(args.init).astype(np.float64).reshape(-1)
+        nside_init = int(round((coarse.size / 12) ** 0.5))
+        if 12 * nside_init**2 != coarse.size or nside_init > args.nside or args.nside % nside_init:
+            raise SystemExit(f"{args.init}: nside {nside_init} incompatible with target nside {args.nside}")
+        if target_stats_info is not None:
+            # Same standardisation as the target so that both live in the same units.
+            coarse = (coarse - target_stats_info["mean"]) / target_stats_info["std"]
+        base = upsample_nested(coarse, nside_init, args.nside)
+        if args.init_noise == "auto":
+            tgt = target_map.numpy()
+            residual = tgt - upsample_nested(downsample_nested(tgt, args.nside, nside_init), nside_init, args.nside)
+            noise_std = float(np.sqrt(np.mean(residual**2)))
+        else:
+            noise_std = float(args.init_noise)
+        noise = torch.randn(npix, dtype=torch.float64, generator=generator).numpy() * noise_std
+        initial_map = torch.as_tensor(base + noise)
+        init_info = dict(file=args.init, nside=nside_init, noise_std=noise_std)
+        print(f"initial map: {args.init} (nside {nside_init}) replicated to {args.nside} "
+              f"+ white noise std {noise_std:.4e} (standardised units)", flush=True)
     kwargs = {} if args.device is None else dict(device=args.device)
     target = STL_Healpix_Kernel_Torch(target_map, **kwargs)
     device = target.device
@@ -300,11 +378,24 @@ def main():
     if output is None:
         tag = "" if args.target is None else "_" + os.path.splitext(os.path.basename(args.target))[0]
         output = f"synthesis_{args.mode}_nside{args.nside}{tag}.png"
+    result_np = result.reshape(-1).detach().cpu().numpy()
+    target_np = target_map.cpu().numpy()
     if output != "none":
-        save_figure(
-            output, args, history, target_map.cpu().numpy(),
-            result.reshape(-1).detach().cpu().numpy(), args.nside, J,
+        save_figure(output, args, history, target_np, result_np, args.nside, J)
+    fits_prefix = args.fits
+    if fits_prefix is None:
+        fits_prefix = os.path.splitext(output)[0] if output != "none" else "none"
+    fits_files = None
+    if fits_prefix != "none":
+        scale, shift = (1.0, 0.0) if target_stats_info is None else (
+            target_stats_info["std"], target_stats_info["mean"]
         )
+        fits_files = [f"{fits_prefix}_target.fits", f"{fits_prefix}_synthesis.fits"]
+        write_healpix_fits(fits_files[0], target_np * scale + shift, args.nside, "TARGET")
+        write_healpix_fits(fits_files[1], result_np * scale + shift, args.nside, "SYNTHESIS")
+        import numpy as np
+
+        np.save(f"{fits_prefix}_synthesis_nested.npy", (result_np * scale + shift).astype(np.float32))
     print(
         json.dumps(
             dict(
@@ -328,6 +419,8 @@ def main():
                 loss_final_map=final_loss,
                 loss_history=history,
                 figure=None if output == "none" else output,
+                fits=fits_files,
+                init=init_info,
                 memory_floor_bytes=floor,
                 timers_seconds=(
                     None if geometry is None
