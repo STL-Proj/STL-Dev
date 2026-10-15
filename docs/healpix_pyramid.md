@@ -361,7 +361,16 @@ coefficients, 50 LBFGS iterations = 57 evaluations, blocks of 4096):
 | local, exact cache | 373 s | 6.5 s | 432 MB | 123 MB | 7.7e-8 |
 
 The explicit modes share one trajectory (bands as variables); legacy
-optimises the map and reaches a lower loss in 50 iterations. At this
+optimises the map and reaches a lower loss in 50 iterations.
+
+On a structured target (the WebSky CMB lensing convergence, `--target
+data/websky/kap_nside128_nested.npy`, 30 iterations) the band
+parametrisation is badly conditioned for LBFGS: the loss goes from 7.0e-3
+to 9.0e-4 with bands, and to 6.5e-7 with the map as variable, identical
+to legacy to all printed digits. `PyramidSynthesis(variables="map")`
+optimises the finest band only with the coarser bands held at zero, so
+the explicit and local engines follow the legacy trajectory exactly; it
+is the benchmark default (`--variables bands` restores the other). At this
 resolution the full-sky geometry is small, so the baselines are close; the
 local mode is the only one whose baseline does not contain the fine-level
 geometry, and it is the mode to use when the geometry is the limit. Its

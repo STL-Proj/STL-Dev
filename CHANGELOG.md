@@ -9,6 +9,9 @@
   full-sky operator indices, so wavelet fields never cover the whole sphere.
   Available through `ST_Operator.apply_patched/vjp_patched/loss_and_grad_patched`
   and `PyramidSynthesis(patch_pixels=...)`.
+- Added `PyramidSynthesis(variables="map")`: the explicit engines can optimise
+  the map (finest band) instead of all Laplacian bands, which conditions
+  LBFGS like the legacy synthesis on structured targets.
 - Added `STL_main.TorchGeometry`: the HEALPix convolution geometry (pixel
   centres, stencil rotation, RING bilinear interpolation, partial-grid
   binding) computed on the device in torch, matching healpix-analyse to

@@ -118,6 +118,10 @@ def main():
     parser.add_argument("--patch-pixels", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=16, help="coefficient batch")
     parser.add_argument("--fewer", action="store_true", help="has_fewer_convolutions")
+    parser.add_argument(
+        "--variables", choices=("map", "bands"), default="map",
+        help="explicit modes: optimise the map (finest band, like legacy) or all bands",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=11)
@@ -252,12 +256,14 @@ def main():
             coefficient_batch_size=args.batch_size,
             patch_pixels=args.patch_pixels if args.mode == "patched" else None,
             geometry=geometry,
+            variables=args.variables,
         )
         initial = target.new_like(initial_map)
         if geometry is not None:
             pyramid = geometry.pyramid_from_map(initial)
         else:
             pyramid = HealpixPyramid.from_map(initial, w)
+        solver.prepare_variables(pyramid)
         history = solver.run(pyramid, niter=args.niter, callback=report)
         result = solver.reconstruct()
 
@@ -312,6 +318,7 @@ def main():
                 evaluations=len(history),
                 patch_pixels=args.patch_pixels if args.mode == "patched" else None,
                 block_pixels=args.block_pixels if args.mode == "local" else None,
+                variables=None if args.mode == "legacy" else args.variables,
                 partial_operators_built=None if geometry is None else dict(geometry.built),
                 device=str(device),
                 seconds=round(elapsed, 2),

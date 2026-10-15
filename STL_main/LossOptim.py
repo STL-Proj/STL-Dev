@@ -156,10 +156,12 @@ class PyramidLBFGS:
         self.evaluations = 0
         self._pyramid = None
 
-    def minimize(self, pyramid, evaluate, max_iter, callback=None):
+    def minimize(self, pyramid, evaluate, max_iter, callback=None, levels=None):
         """Minimize with at most ``max_iter`` LBFGS iterations.
 
         ``evaluate(pyramid)`` must return ``(scalar_loss, band_gradients)``.
+        ``levels`` restricts the variables to those bands (default: all); the
+        gradients of the other bands are ignored and those bands stay fixed.
         The returned history contains every closure evaluation, including the
         extra evaluations requested by the line search.
         """
@@ -168,7 +170,8 @@ class PyramidLBFGS:
         if self._pyramid is not None and self._pyramid is not pyramid:
             raise ValueError("Create a separate optimizer for each pyramid")
         self._pyramid = pyramid
-        parameters = list(pyramid.levels)
+        levels = list(range(len(pyramid.levels))) if levels is None else list(levels)
+        parameters = [pyramid.levels[d] for d in levels]
         if not all(parameter.is_leaf for parameter in parameters):
             raise ValueError("Pyramid bands must be independent leaf tensors")
         previous_requires_grad = [parameter.requires_grad for parameter in parameters]
@@ -190,10 +193,11 @@ class PyramidLBFGS:
             optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
                 value, gradients = evaluate(pyramid)
-                if len(gradients) != len(parameters):
+                if len(gradients) != len(pyramid.levels):
                     raise ValueError("One gradient per pyramid band is required")
                 if not bool(torch.isfinite(value)):
                     raise FloatingPointError("Non-finite synthesis loss")
+                gradients = [gradients[d] for d in levels]
                 for parameter, gradient in zip(parameters, gradients):
                     if (
                         parameter.shape != gradient.shape
@@ -234,8 +238,14 @@ class PyramidSynthesis:
         strategy="recompute",
         patch_pixels=None,
         geometry=None,
+        variables="bands",
     ):
-        """``patch_pixels`` selects the patch-localised engine (PatchScattering):
+        """``variables``: ``"bands"`` optimises every Laplacian band;
+        ``"map"`` optimises the finest band only with the coarser bands held
+        at zero, i.e. the map itself is the variable (same trajectory as a
+        map-based optimiser with the same loss), which conditions LBFGS much
+        better on structured targets.
+        ``patch_pixels`` selects the patch-localised engine (PatchScattering):
         wavelet fields are then bounded by that pixel budget at the finest
         scale of each coefficient batch instead of covering the whole sphere.
         ``geometry`` (a ``LocalGeometry``) selects the patch-local geometry
@@ -252,6 +262,9 @@ class PyramidSynthesis:
         self.loss = loss if loss is not None else SquaredStatisticsLoss()
         self.patch_pixels = patch_pixels
         self.geometry = geometry
+        if variables not in ("bands", "map"):
+            raise ValueError("variables must be 'bands' or 'map'")
+        self.variables = variables
         if geometry is not None:
             if patch_pixels is not None:
                 raise ValueError("Use either patch_pixels or geometry, not both")
@@ -283,7 +296,17 @@ class PyramidSynthesis:
             self.pyramid = self.geometry.pyramid_from_map(noise_data)
         else:
             self.pyramid = HealpixPyramid.from_map(noise_data, self.operator.wavelet_op)
+        self.prepare_variables(self.pyramid)
         return self.pyramid
+
+    @torch.no_grad()
+    def prepare_variables(self, pyramid):
+        """For ``variables="map"``: put the whole map in the finest band."""
+        if self.variables == "map" and len(pyramid.levels) > 1:
+            pyramid.levels[0].copy_(pyramid.reconstruct_level(0))
+            for band in pyramid.levels[1:]:
+                band.zero_()
+        return pyramid
 
     @torch.no_grad()
     def _loss_and_gradient(self, pyramid):
@@ -318,6 +341,8 @@ class PyramidSynthesis:
             )
         if not bool(torch.isfinite(value)):
             raise FloatingPointError("Non-finite synthesis loss")
+        if self.variables == "map":
+            gradients = [gradients[0]] + [torch.zeros_like(g) for g in gradients[1:]]
         return value, gradients
 
     @torch.no_grad()
@@ -336,7 +361,8 @@ class PyramidSynthesis:
             if niter == 0:
                 return []
             history = self.optimizer.minimize(
-                pyramid, self._loss_and_gradient, niter, callback
+                pyramid, self._loss_and_gradient, niter, callback,
+                levels=[0] if self.variables == "map" else None,
             )
             self.pyramid = pyramid
             return history
