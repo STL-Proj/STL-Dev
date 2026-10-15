@@ -9,6 +9,10 @@
   full-sky operator indices, so wavelet fields never cover the whole sphere.
   Available through `ST_Operator.apply_patched/vjp_patched/loss_and_grad_patched`
   and `PyramidSynthesis(patch_pixels=...)`.
+- Added `STL_main.TorchGeometry`: the HEALPix convolution geometry (pixel
+  centres, stencil rotation, RING bilinear interpolation, partial-grid
+  binding) computed on the device in torch, matching healpix-analyse to
+  1e-12 on complete rows; used by `LocalGeometry` for the sphere.
 - Added `STL_main.LocalScattering`: the complete ScatCov (mean, var, S1, S2,
   S3, S4) with patch-local geometry (`apply_local`, `vjp_local`,
   `loss_and_grad_local`, `PyramidSynthesis(geometry=...)`), level by level and

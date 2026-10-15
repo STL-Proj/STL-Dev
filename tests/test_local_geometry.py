@@ -74,8 +74,11 @@ def test_local_s3_pair_matches_full_sky(kernel_size, fewer, pair, fine_patch):
 
 def test_exact_geometry_cache_roundtrip(tmp_path):
     _, op, _ = setup_problem(nside=16, J=2, kernel_size=5)
-    cached = LocalGeometry(op.wavelet_op, block_pixels=256, cache_dir=str(tmp_path))
-    fresh = LocalGeometry(op.wavelet_op, block_pixels=256)
+    # The disk cache belongs to the healpix-analyse fallback path.
+    cached = LocalGeometry(
+        op.wavelet_op, block_pixels=256, cache_dir=str(tmp_path), torch_geometry=False
+    )
+    fresh = LocalGeometry(op.wavelet_op, block_pixels=256, torch_geometry=False)
     ids = cached.blocks(0)[2]
     first = cached.conv(0, ids)
     assert cached.built.get("saved") == 1

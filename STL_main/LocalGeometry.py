@@ -144,7 +144,10 @@ class SlimDown:
 class LocalGeometry:
     """Partial operators and block-wise exact pyramid operations."""
 
-    def __init__(self, wavelet_op, block_pixels=16384, cache_dir=None, cache_downs=None):
+    def __init__(
+        self, wavelet_op, block_pixels=16384, cache_dir=None, cache_downs=None,
+        torch_geometry=True,
+    ):
         """``cache_downs``: where the partial decimation matrices live between
         uses. ``"ram"`` keeps them on the device (in total about the full-sky
         decimation matrix: tens of bytes per fine pixel, block independent);
@@ -169,6 +172,7 @@ class LocalGeometry:
         self.block_pixels = block_pixels
         self.cache_dir = cache_dir
         self.cache_downs = cache_downs
+        self.torch_geometry = bool(torch_geometry)
         self._downs = {}
         self.conv_rings = (int(wavelet_op.KERNELSZ) - 1) // 2 + 2
         self.device = wavelet_op.device
@@ -196,8 +200,25 @@ class LocalGeometry:
         ]
 
     # -- partial operators -------------------------------------------------
+    def torch_geometry_available(self):
+        """Device-side geometry (TorchGeometry) covers the sphere and the
+        'phi'/'cosmo' gauges; other ellipsoids fall back to healpix-analyse."""
+        return str(self.w.ellipsoid).lower() == "sphere" and self.w.gauge_type in (
+            "phi",
+            "cosmo",
+        )
+
     def conv(self, dg, ids):
         w, nside = self.w, self.nside(dg)
+        if self.torch_geometry and self.torch_geometry_available():
+            from STL_main.TorchGeometry import TorchConv
+
+            self.built["conv"] += 1
+            return TorchConv(
+                ids, nside, w.KERNELSZ, w.L, w.gauge_type,
+                w._wav_weights.detach().cpu().numpy(), w.dtype,
+                w.pyramid_pixel_batch_size,
+            )
         # healpix-analyse's on-disk cache is on by default and stores the
         # interpolation weights in float32 whatever the operator dtype, which
         # silently degrades float64 runs once a geometry has been cached.

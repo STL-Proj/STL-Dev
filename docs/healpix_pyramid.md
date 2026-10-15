@@ -282,6 +282,27 @@ with the local geometry. The partial `HealPixDown` construction is the slow
 part of the first iteration (about 0.4 s per block at `nside=256`); the
 build temporaries are host-side numpy arrays of healpix-analyse.
 
+## Device-side geometry (`TorchGeometry`)
+
+Building a partial `HealPixConv` with healpix-analyse costs about 16 us per
+pixel on the CPU (pixel centres and bilinear interpolation through
+healpix-geo, then the torch binding), a hundred times the convolution
+itself; at `nside=1024` a local evaluation spent 874 s rebuilding ~2000
+block geometries. `STL_main.TorchGeometry.TorchConv` reproduces the same
+pipeline in vectorised torch on the device: NESTED pixel centres
+(`nest2xyf`, `xyf2ang`), the stencil rotation per pixel and gauge, the
+RING bilinear interpolation of the HEALPix C++ library (`get_interpol`,
+then `ring2nest`) and the partial-grid binding. Pixel centres match
+healpix-geo to 1e-11 degrees, `ring2nest` is exact, and the convolution
+operator matches the library to 1e-12 on every row whose stencil is
+complete (rows with a truncated stencil fall back differently in exact-tie
+cases and are never used by the local engine; `TorchConv._complete` flags
+them). The kernel is cast through float32 as `set_kernel` does. Supported:
+`ellipsoid="sphere"`, gauges `phi` and `cosmo`; `LocalGeometry` falls back
+to healpix-analyse otherwise (`torch_geometry=False` forces the fallback).
+With the device geometry no convolution cache is needed; the exact disk
+cache remains for the fallback path.
+
 ## Complete ScatCov with patch-local geometry
 
 `STL_main.LocalScattering` extends the local geometry to every family:
