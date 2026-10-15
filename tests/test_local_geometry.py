@@ -96,7 +96,8 @@ def test_local_s3_pair_larger_map_and_cached_downs():
     plan = s3_pair_plan(op, 1, 0, 4)
     g = torch.randn(1, len(plan), dtype=torch.complex128, device=p.device)
     _, maps_ref = s3_scale_pair(op, p, 0, 4, gradient=g, fine_patch_pixels=4096)
-    geo = LocalGeometry(op.wavelet_op, block_pixels=4096)
+    # Fallback path (library operators), whose decimations are cached.
+    geo = LocalGeometry(op.wavelet_op, block_pixels=4096, torch_geometry=False)
     _, maps_gradient = s3_scale_pair_local(op, p, 0, 4, gradient=g, geometry=geo)
     for a, b in zip(maps_gradient, maps_ref):
         torch.testing.assert_close(a, b, atol=1e-10, rtol=1e-9)

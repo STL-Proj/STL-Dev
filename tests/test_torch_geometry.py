@@ -42,6 +42,32 @@ def test_ring2nest_roundtrip(order):
     assert torch.equal(ring2nest(ring, order), expected)
 
 
+@pytest.mark.parametrize("nside", [8, 32, 128])
+@pytest.mark.parametrize("shuffle_block", [False, True])
+def test_torch_decimation_matches_library(nside, shuffle_block):
+    from healpix_analyse.down import HealPixDown
+
+    from STL_main.LocalGeometry import LocalGeometry
+    from STL_main.STL_Healpix_Kernel_Torch import STL_Healpix_Kernel_Torch
+
+    npix = 12 * nside**2
+    data = STL_Healpix_Kernel_Torch(torch.randn(npix, dtype=torch.float64), nside=nside)
+    op = data.get_ST_op(J=2, L=2, norm="vanilla", compute_PS=False,
+                        wavelet_op_kwargs=dict(kernel_size=3, ellipsoid="sphere", conv_cache_dir=None))
+    geo = LocalGeometry(op.wavelet_op, block_pixels=256)
+    start = 4 * 64 if shuffle_block else 0
+    ids = torch.arange(start, min(start + 4 * 300, npix))
+    mine = geo.torch_down(0, ids)
+    reference = HealPixDown(level=int(np.log2(nside)), mode="smooth", cell_ids=ids.numpy(),
+                            device="cpu", dtype=torch.float64, ellipsoid="sphere")
+    assert np.array_equal(mine.cell_ids_out, np.asarray(reference.cell_ids_out))
+    dense_ref = torch.sparse_coo_tensor(reference._M_indices, reference._M_values, reference._M_size).to_dense()
+    dense_mine = mine._stl_csr_tensors[(False, torch.float64)].to_dense()
+    torch.testing.assert_close(dense_mine, dense_ref, atol=1e-12, rtol=1e-12)
+    dense_t = mine._stl_csr_tensors[(True, torch.float64)].to_dense()
+    torch.testing.assert_close(dense_t, dense_mine.T, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("nside,count", [(8, 768), (32, 3000), (128, 6000)])
 @pytest.mark.parametrize("kernel_sz,G,gauge", [(3, 2, "cosmo"), (5, 4, "cosmo"), (5, 2, "phi")])
 @pytest.mark.parametrize("shuffle", [False, True])

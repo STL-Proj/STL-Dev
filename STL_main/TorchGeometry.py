@@ -413,6 +413,85 @@ def bind_support(idx_t, w_t, ids_sorted, kernel_sz, K, P):
 
 
 # ---------------------------------------------------------------------------
+# Anti-aliased decimation (port of HealPixDown("smooth"), sphere)
+# ---------------------------------------------------------------------------
+
+
+def _haversine(lat1, lon1, lat2, lon2):
+    dlat = 0.5 * (lat2 - lat1)
+    dlon = 0.5 * (lon2 - lon1)
+    a = (torch.sin(dlat) ** 2 + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon) ** 2).clamp(
+        0.0, 1.0
+    )
+    return 2.0 * torch.asin(torch.sqrt(a))
+
+
+def centres_lonlat(ids, nside):
+    """Longitude and latitude (radians, float64) of NESTED pixel centres,
+    rounded through degrees like the healpix-geo output used by the library."""
+    order = int(round(math.log2(nside)))
+    theta, phi = xyf2ang(*nest2xyf(ids.to(torch.long), order), nside)
+    lon_deg = torch.rad2deg(phi)
+    lat_deg = 90.0 - torch.rad2deg(theta)
+    return torch.deg2rad(lon_deg), torch.deg2rad(lat_deg)
+
+
+def smooth_decimation_csr(ids, nside, candidates, dtype, radius_deg=None, sigma_deg=None, weight_norm="l1"):
+    """CSR matrices (forward ``[N_out, N_in]`` and transpose) of the smooth
+    decimation of ``HealPixDown`` restricted to the fine pixels ``ids``
+    (sorted, NESTED, resolution ``nside``).
+
+    ``candidates`` is ``[N_out, M]`` of fine NESTED ids (or -1) that may lie
+    within the cone of each coarse pixel (parents of ``ids``, sorted); fine
+    pixels outside ``ids`` are unavailable, as in the partial operator.  The
+    weights follow ``_build_smooth_matrix``: Gaussian of the haversine
+    distance to the coarse centre, zero beyond ``radius``, rows normalised
+    over the available pixels, zero entries dropped.  Returns
+    ``(coarse_ids, forward, transposed)``.
+    """
+    device = ids.device
+    npix_fine = 12 * nside * nside
+    pix_deg = math.degrees(math.sqrt(4.0 * math.pi / npix_fine))
+    radius = math.radians(3.0 * pix_deg if radius_deg is None else float(radius_deg))
+    sigma = radius / 2.0 if sigma_deg is None else math.radians(float(sigma_deg))
+    coarse = torch.unique(torch.div(ids, 4, rounding_mode="floor"))
+    n_out, n_in = coarse.numel(), ids.numel()
+    lon_c, lat_c = centres_lonlat(coarse, nside // 2)
+    # Keep candidate fine pixels that are available (inside ``ids``).
+    cand = candidates.reshape(-1)
+    valid = cand >= 0
+    pos = torch.searchsorted(ids, cand.clamp_min(0))
+    pos = pos.clamp_max(max(n_in - 1, 0))
+    present = valid & (ids[pos] == cand)
+    rows = torch.arange(n_out, device=device).repeat_interleave(candidates.shape[1])
+    rows, cols = rows[present], pos[present]
+    # Candidate lists may repeat a pair; keep each (row, col) once.
+    key = torch.unique(rows * n_in + cols)
+    rows, cols = torch.div(key, n_in, rounding_mode="floor"), key % n_in
+    lon_f, lat_f = centres_lonlat(ids[cols], nside)
+    gamma = _haversine(lat_c[rows], lon_c[rows], lat_f, lon_f)
+    w = torch.exp(-0.5 * (gamma / sigma) ** 2)
+    w = torch.where(gamma > radius, torch.zeros_like(w), w)
+    row_sum = torch.zeros(n_out, dtype=w.dtype, device=device).index_add_(0, rows, w)
+    # Rows whose every candidate is cut: uniform over available (library fallback).
+    empty = row_sum[rows] <= 0.0
+    if bool(empty.any()):
+        count = torch.zeros(n_out, dtype=w.dtype, device=device).index_add_(0, rows, torch.ones_like(w))
+        w = torch.where(empty, 1.0 / count[rows], w)
+        row_sum = torch.zeros(n_out, dtype=w.dtype, device=device).index_add_(0, rows, w)
+    if weight_norm == "l1":
+        w = w / row_sum[rows].clamp_min(1e-300)
+    elif weight_norm == "l2":
+        norm = torch.sqrt(torch.zeros(n_out, dtype=w.dtype, device=device).index_add_(0, rows, w * w))
+        w = w / norm[rows].clamp_min(1e-300)
+    keep = w != 0.0
+    rows, cols, w = rows[keep], cols[keep], w[keep].to(dtype)
+    forward = torch.sparse_coo_tensor(torch.stack([rows, cols]), w, (n_out, n_in)).coalesce().to_sparse_csr()
+    transposed = torch.sparse_coo_tensor(torch.stack([cols, rows]), w, (n_in, n_out)).coalesce().to_sparse_csr()
+    return coarse, forward, transposed
+
+
+# ---------------------------------------------------------------------------
 # The operator
 # ---------------------------------------------------------------------------
 

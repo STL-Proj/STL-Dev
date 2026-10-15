@@ -344,7 +344,37 @@ class LocalGeometry:
         except Exception:  # cache is an optimisation only; never fail a build
             pass
 
+    def torch_down(self, dg, ids):
+        """Partial smooth decimation built on the device (sphere); no cache needed."""
+        from STL_main.TorchGeometry import smooth_decimation_csr
+
+        nside = self.nside(dg)
+        coarse = parents(ids)
+        # Candidate fine pixels: children of the 2-ring coarse neighbourhood
+        # (a cone of 3 fine pixels never reaches further).
+        near = dilate(coarse, nside // 2, 2) if nside // 2 >= 1 else coarse
+        # Per coarse pixel candidate lists through kth_neighbourhood (CPU, small).
+        depth = int(round(math.log2(nside // 2)))
+        if nside // 2 >= 4 and 2 < nside // 2:
+            nb = kth_neighbourhood(coarse.detach().cpu().numpy().astype(np.uint64), depth, 2)
+            nb = torch.as_tensor(np.asarray(nb, dtype=np.int64), device=ids.device)
+        else:
+            nb = torch.arange(12 * (nside // 2) ** 2, device=ids.device).expand(coarse.numel(), -1)
+        children_ids = (nb[:, :, None] * 4 + torch.arange(4, device=ids.device)).reshape(nb.shape[0], -1)
+        children_ids = torch.where(nb[:, :, None].expand(-1, -1, 4).reshape(nb.shape[0], -1) < 0, -1, children_ids)
+        with self.timed("down_build"):
+            coarse_ids, forward, transposed = smooth_decimation_csr(
+                ids, nside, children_ids, self.w.dtype,
+                radius_deg=self.w.down_kwargs.get("radius_deg"),
+                sigma_deg=self.w.down_kwargs.get("sigma_deg"),
+                weight_norm=self.w.down_kwargs.get("weight_norm", "l1"),
+            )
+        self.built["down"] += 1
+        return SlimDown(ids.numel(), coarse_ids.numel(), coarse_ids.cpu().numpy(), ids.device, forward, transposed)
+
     def down(self, dg, ids):
+        if self.torch_geometry and self.torch_geometry_available():
+            return self.torch_down(dg, ids)
         key = (dg, ids.numel(), int(ids[0]), int(ids[-1]), int(ids.sum()))
         if self.cache_downs in ("ram", "host") and key in self._downs:
             hit = self._downs[key]
