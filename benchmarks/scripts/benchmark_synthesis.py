@@ -99,9 +99,9 @@ def main():
         help="local mode: directory for the exact (operator dtype) partial geometry cache",
     )
     parser.add_argument(
-        "--down-cache", choices=("ram", "disk"), default=None,
-        help="local mode: keep partial decimations on the device or reload them "
-        "from --cache-dir block by block (default: disk when --cache-dir is given)",
+        "--down-cache", choices=("ram", "host", "disk"), default=None,
+        help="local mode: partial decimations on the device, in host RAM (default "
+        "on CUDA) or reloaded from --cache-dir block by block",
     )
     parser.add_argument("--nside", type=int, default=64)
     parser.add_argument("--J", type=int, default=None, help="default log2(nside) - 1")
@@ -266,8 +266,9 @@ def main():
         floor["stored_moduli_and_cotangents"] = (
             2 * args.L * 8 * sum(n * npix_levels[n] for n in range(1, J))
         )
-        floor["down_cache_on_device"] = geometry.down_cache_bytes()
+        floor["down_cache_bytes"] = geometry.down_cache_bytes()
         floor["down_cache_mode"] = geometry.cache_downs
+        floor["dilation_cache_entries"] = len(geometry._dilations)
     output = args.output
     if output is None:
         output = f"synthesis_{args.mode}_nside{args.nside}.png"
@@ -298,6 +299,10 @@ def main():
                 loss_history=history,
                 figure=None if output == "none" else output,
                 memory_floor_bytes=floor,
+                timers_seconds=(
+                    None if geometry is None
+                    else {k: round(v, 1) for k, v in sorted(geometry.timers.items())}
+                ),
                 rss_baseline=rss_baseline,
                 rss_peak_increment=peak[0] - rss_baseline,
                 cuda_baseline_allocated=cuda_baseline if cuda else None,

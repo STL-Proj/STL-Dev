@@ -36,6 +36,7 @@ disk after the first iteration.
 """
 
 import math
+import time
 
 import numpy as np
 import torch
@@ -120,6 +121,25 @@ class SlimDown:
                 total += part.numel() * part.element_size()
         return total
 
+    def to_device(self, device):
+        device = torch.device(device)
+        if device == self.device:
+            return self
+        forward, transposed = self._tensors()
+
+        def move(t, size):
+            return torch.sparse_csr_tensor(
+                t.crow_indices().to(device, non_blocking=True),
+                t.col_indices().to(device, non_blocking=True),
+                t.values().to(device, non_blocking=True),
+                size=size,
+            )
+
+        return SlimDown(
+            self.N_in, self.N_out, self.cell_ids_out, device,
+            move(forward, (self.N_out, self.N_in)), move(transposed, (self.N_in, self.N_out)),
+        )
+
     def state(self):
         forward, transposed = self._tensors()
         return dict(
@@ -151,21 +171,24 @@ class LocalGeometry:
         """``cache_downs``: where the partial decimation matrices live between
         uses. ``"ram"`` keeps them on the device (in total about the full-sky
         decimation matrix: tens of bytes per fine pixel, block independent);
-        ``"disk"`` stores them under ``cache_dir`` and reloads one block at a
-        time, so device memory stays block sized; ``False`` rebuilds them
-        every time (slow). Default: ``"disk"`` when ``cache_dir`` is given,
-        else ``"ram"``. Convolution geometries (3.2 kB per pixel) are never
-        kept on the device; with ``cache_dir`` they are reloaded from disk."""
+        ``"host"`` keeps them in CPU memory and moves one block at a time to
+        the device; ``"disk"`` stores them under ``cache_dir`` and reloads one
+        block at a time (slow on network file systems); ``False`` rebuilds
+        them every time. Default: ``"host"`` on CUDA, ``"ram"`` otherwise.
+        With ``cache_dir``, built decimations are also saved to disk and
+        found there in later runs. Convolution geometries are computed on the
+        device (``TorchGeometry``) or, in the fallback, reloaded from
+        ``cache_dir``. ``timers`` accumulates seconds per operation class."""
         if wavelet_op.mask_full_res is not None or wavelet_op.nan_aware_stats:
             raise NotImplementedError("Local geometry requires unmasked finite data")
         if not isinstance(block_pixels, int) or block_pixels < 1:
             raise ValueError("block_pixels must be a positive integer")
         if cache_downs is None:
-            cache_downs = "disk" if cache_dir is not None else "ram"
+            cache_downs = "host" if wavelet_op.device.type == "cuda" else "ram"
         if cache_downs is True:
             cache_downs = "ram"
-        if cache_downs not in ("ram", "disk", False):
-            raise ValueError("cache_downs must be 'ram', 'disk' or False")
+        if cache_downs not in ("ram", "host", "disk", False):
+            raise ValueError("cache_downs must be 'ram', 'host', 'disk' or False")
         if cache_downs == "disk" and cache_dir is None:
             raise ValueError("cache_downs='disk' requires cache_dir")
         self.w = wavelet_op
@@ -174,9 +197,42 @@ class LocalGeometry:
         self.cache_downs = cache_downs
         self.torch_geometry = bool(torch_geometry)
         self._downs = {}
+        self._dilations = {}
+        self.timers = {}
         self.conv_rings = (int(wavelet_op.KERNELSZ) - 1) // 2 + 2
         self.device = wavelet_op.device
         self.built = dict(conv=0, down=0)
+
+    # -- timing ------------------------------------------------------------------
+    class _timed:
+        def __init__(self, geometry, name):
+            self.geometry, self.name = geometry, name
+
+        def __enter__(self):
+            if self.geometry.device.type == "cuda":
+                torch.cuda.synchronize(self.geometry.device)
+            self.start = time.perf_counter()
+
+        def __exit__(self, *exc):
+            if self.geometry.device.type == "cuda":
+                torch.cuda.synchronize(self.geometry.device)
+            self.geometry.timers[self.name] = self.geometry.timers.get(self.name, 0.0) + (
+                time.perf_counter() - self.start
+            )
+
+    def timed(self, name):
+        return self._timed(self, name)
+
+    def dilate_fine(self, ids, nside, rings):
+        """``dilate_fine`` memoised on the host (geometry only, reused across calls)."""
+        key = (nside, rings, ids.numel(), int(ids[0]), int(ids[-1]), int(ids.sum()))
+        hit = self._dilations.get(key)
+        if hit is not None:
+            return hit.to(ids.device, non_blocking=True)
+        with self.timed("dilation"):
+            out = dilate_fine(ids, nside, rings)
+        self._dilations[key] = out.cpu()
+        return out
 
     # -- resolutions and blocks ---------------------------------------------
     def nside(self, dg):
@@ -214,11 +270,12 @@ class LocalGeometry:
             from STL_main.TorchGeometry import TorchConv
 
             self.built["conv"] += 1
-            return TorchConv(
-                ids, nside, w.KERNELSZ, w.L, w.gauge_type,
-                w._wav_weights.detach().cpu().numpy(), w.dtype,
-                w.pyramid_pixel_batch_size,
-            )
+            with self.timed("conv_geometry"):
+                return TorchConv(
+                    ids, nside, w.KERNELSZ, w.L, w.gauge_type,
+                    w._wav_weights.detach().cpu().numpy(), w.dtype,
+                    w.pyramid_pixel_batch_size,
+                )
         # healpix-analyse's on-disk cache is on by default and stores the
         # interpolation weights in float32 whatever the operator dtype, which
         # silently degrades float64 runs once a geometry has been cached.
@@ -289,12 +346,37 @@ class LocalGeometry:
 
     def down(self, dg, ids):
         key = (dg, ids.numel(), int(ids[0]), int(ids[-1]), int(ids.sum()))
-        if self.cache_downs == "ram" and key in self._downs:
-            return self._downs[key]
-        if self.cache_downs == "disk":
-            loaded = self._load_down(key)
+        if self.cache_downs in ("ram", "host") and key in self._downs:
+            hit = self._downs[key]
+            return hit if self.cache_downs == "ram" else hit.to_device(self.device)
+        if self.cache_downs in ("disk", "host") and self.cache_dir is not None:
+            with self.timed("down_load"):
+                loaded = self._load_down(key)
             if loaded is not None:
+                if self.cache_downs == "host":
+                    self._downs[key] = loaded.to_device("cpu")
+                    return loaded
                 return loaded
+        with self.timed("down_build"):
+            down = self._build_down(dg, ids)
+        if not self.cache_downs:
+            return down
+        slim = SlimDown(
+            down.N_in, down.N_out, np.asarray(down.cell_ids_out), down.device,
+            _csr_tensor(down, False, self.w.dtype), _csr_tensor(down, True, self.w.dtype),
+        )
+        del down
+        if self.cache_downs == "ram":
+            self._downs[key] = slim
+        elif self.cache_downs == "host":
+            self._downs[key] = slim.to_device("cpu")
+            if self.cache_dir is not None:
+                self._save_down(key, slim)
+        else:
+            self._save_down(key, slim)
+        return slim
+
+    def _build_down(self, dg, ids):
         w, nside = self.w, self.nside(dg)
         down = _build_hpa_operator(
             HealPixDown,
@@ -306,20 +388,7 @@ class LocalGeometry:
             ),
         )
         self.built["down"] += 1
-        if not self.cache_downs:
-            return down
-        # Keep only the two CSR tensors (forward and transpose) in a slim
-        # object; the COO buffers and row-restriction views would triple it.
-        slim = SlimDown(
-            down.N_in, down.N_out, np.asarray(down.cell_ids_out), down.device,
-            _csr_tensor(down, False, w.dtype), _csr_tensor(down, True, w.dtype),
-        )
-        del down
-        if self.cache_downs == "ram":
-            self._downs[key] = slim
-        else:
-            self._save_down(key, slim)
-        return slim
+        return down
 
     def _down_path(self, key):
         from pathlib import Path
@@ -350,7 +419,7 @@ class LocalGeometry:
         return SlimDown.from_state(state, self.device)
 
     def down_cache_bytes(self):
-        """Device bytes held by the decimation matrices kept in RAM."""
+        """Bytes held by the cached decimation matrices (device for 'ram', host for 'host')."""
         return sum(d.nbytes() for d in self._downs.values())
 
     @staticmethod
@@ -376,11 +445,12 @@ class LocalGeometry:
         out = x.new_zeros(*x.shape[:-1], self.pixels(dg + 1))
         rings = 2 * self.down_rings(dg)
         for block in self.blocks(dg):
-            domain = dilate_fine(block, self.nside(dg), rings)
+            domain = self.dilate_fine(block, self.nside(dg), rings)
             down = self.down(dg, domain)
-            y = down_forward_full(down, x[..., domain])
-            rows = parents(block)
-            out[..., rows] = y[..., positions(self.out_ids(down), rows)]
+            with self.timed("decimate"):
+                y = down_forward_full(down, x[..., domain])
+                rows = parents(block)
+                out[..., rows] = y[..., positions(self.out_ids(down), rows)]
         return out
 
     def decimate_adjoint(self, g, dg):
@@ -388,10 +458,11 @@ class LocalGeometry:
         out = g.new_zeros(*g.shape[:-1], self.pixels(dg))
         rings = 2 * self.down_rings(dg)
         for block in self.blocks(dg):
-            domain = dilate_fine(block, self.nside(dg), rings)
+            domain = self.dilate_fine(block, self.nside(dg), rings)
             down = self.down(dg, domain)
-            x = downsampling_adjoint(down, g[..., self.out_ids(down)])
-            out[..., block] = x[..., positions(domain, block)]
+            with self.timed("decimate"):
+                x = downsampling_adjoint(down, g[..., self.out_ids(down)])
+                out[..., block] = x[..., positions(domain, block)]
         return out
 
     def analysis_levels(self, pyramid):
@@ -451,21 +522,23 @@ class LocalGeometry:
         ``z`` is ``[B, C, L, |block|]`` complex; ``domain`` and ``conv`` are
         needed again by ``wave_adjoint``.
         """
-        domain = dilate_fine(block, self.nside(dg), self.conv_rings)
+        domain = self.dilate_fine(block, self.nside(dg), self.conv_rings)
         conv = self.conv(dg, domain)
-        x = x_level[..., domain]
-        batch, channels = x.shape[:2]
-        y = conv(x.reshape(-1, 1, domain.numel()).to(conv.dtype))
-        y = y[..., positions(domain, block)]
-        return _join(y, self.w.L).reshape(batch, channels, self.w.L, -1), domain, conv
+        with self.timed("conv_apply"):
+            x = x_level[..., domain]
+            batch, channels = x.shape[:2]
+            y = conv(x.reshape(-1, 1, domain.numel()).to(conv.dtype))
+            y = y[..., positions(domain, block)]
+            return _join(y, self.w.L).reshape(batch, channels, self.w.L, -1), domain, conv
 
     def wave_adjoint(self, gz, block, domain, conv):
         """Adjoint of ``wave`` on ``block``: ``[B, C, L, |block|] -> [B, C, |domain|]``."""
-        batch, channels = gz.shape[:2]
-        g = gz.new_zeros(batch * channels, 2 * self.w.L, domain.numel(), dtype=gz.real.dtype)
-        g[..., positions(domain, block)] = _split(gz).reshape(batch * channels, 2 * self.w.L, -1)
-        gx = convolution_adjoint(conv, g, self.w.pyramid_pixel_batch_size)
-        return gx.reshape(batch, channels, -1)
+        with self.timed("conv_adjoint"):
+            batch, channels = gz.shape[:2]
+            g = gz.new_zeros(batch * channels, 2 * self.w.L, domain.numel(), dtype=gz.real.dtype)
+            g[..., positions(domain, block)] = _split(gz).reshape(batch * channels, 2 * self.w.L, -1)
+            gx = convolution_adjoint(conv, g, self.w.pyramid_pixel_batch_size)
+            return gx.reshape(batch, channels, -1)
 
     def piece_forward(self, a, support, dg):
         """Contribution of a field supported on ``support`` to level ``dg + 1``.
@@ -473,23 +546,25 @@ class LocalGeometry:
         Returns ``(y, next_support)`` with ``y`` exact on ``next_support``.
         """
         rings = self.down_rings(dg)
-        domain = dilate_fine(support, self.nside(dg), 2 * rings)
+        domain = self.dilate_fine(support, self.nside(dg), 2 * rings)
         down = self.down(dg, domain)
-        padded = a.new_zeros(*a.shape[:-1], domain.numel())
-        padded[..., positions(domain, support)] = a
-        y = down_forward_full(down, padded)
-        next_support = parents(dilate_fine(support, self.nside(dg), rings))
-        return y[..., positions(self.out_ids(down), next_support)], next_support
+        with self.timed("pieces"):
+            padded = a.new_zeros(*a.shape[:-1], domain.numel())
+            padded[..., positions(domain, support)] = a
+            y = down_forward_full(down, padded)
+            next_support = parents(self.dilate_fine(support, self.nside(dg), rings))
+            return y[..., positions(self.out_ids(down), next_support)], next_support
 
     def piece_adjoint(self, g, support, next_support, dg):
         """Transpose of ``piece_forward``, exact on ``support``."""
-        domain = dilate_fine(support, self.nside(dg), 2 * self.down_rings(dg))
+        domain = self.dilate_fine(support, self.nside(dg), 2 * self.down_rings(dg))
         down = self.down(dg, domain)
-        out_ids = self.out_ids(down)
-        padded = g.new_zeros(*g.shape[:-1], out_ids.numel())
-        padded[..., positions(out_ids, next_support)] = g
-        x = downsampling_adjoint(down, padded)
-        return x[..., positions(domain, support)]
+        with self.timed("pieces"):
+            out_ids = self.out_ids(down)
+            padded = g.new_zeros(*g.shape[:-1], out_ids.numel())
+            padded[..., positions(out_ids, next_support)] = g
+            x = downsampling_adjoint(down, padded)
+            return x[..., positions(domain, support)]
 
 
 @torch.no_grad()
@@ -600,7 +675,7 @@ def s3_scale_pair_local(
         z, domain, conv = geometry.wave(maps[d1], block, d1)
         supports, support = [block], block
         for level in range(d1, n):
-            support = parents(dilate_fine(support, geometry.nside(level), geometry.down_rings(level)))
+            support = parents(geometry.dilate_fine(support, geometry.nside(level), geometry.down_rings(level)))
             supports.append(support)
         g = gm[..., supports[-1]]
         for level in range(n - 1, d1 - 1, -1):

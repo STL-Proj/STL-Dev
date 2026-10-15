@@ -36,7 +36,7 @@ full-sky geometry beyond the levels that fit in one block.
 import torch
 
 from STL_main.AdjointOps import convolution_adjoint, modulus_vjp, root_modulus_vjp
-from STL_main.LocalGeometry import LocalGeometry, dilate_fine, parents, positions
+from STL_main.LocalGeometry import LocalGeometry, parents, positions
 from STL_main.PyramidScattering import PyramidStatistics, _validate, build_plan
 from STL_main.S3Multiscale import _join, _split
 
@@ -55,17 +55,19 @@ class _Block:
         geo, w = engine.geo, engine.w
         self.engine, self.n, self.block = engine, n, block
         nside = geo.nside(n)
-        self.a1 = dilate_fine(block, nside, geo.conv_rings)
-        self.domain = dilate_fine(self.a1, nside, geo.conv_rings)
+        self.a1 = geo.dilate_fine(block, nside, geo.conv_rings)
+        self.domain = geo.dilate_fine(self.a1, nside, geo.conv_rings)
         self.conv = geo.conv(n, self.domain)
-        self.rows_a1 = positions(self.domain, self.a1)
-        self.rows_f = positions(self.domain, block)
-        self.f_in_a1 = positions(self.a1, block)
+        with geo.timed("indexing"):
+            self.rows_a1 = positions(self.domain, self.a1)
+            self.rows_f = positions(self.domain, block)
+            self.f_in_a1 = positions(self.a1, block)
         maps = engine.maps
         x = maps[n][..., self.domain]
         batch, channels = x.shape[:2]
         self.batch, self.channels = batch, channels
-        y = self.conv(x.reshape(-1, 1, self.domain.numel()).to(self.conv.dtype))
+        with geo.timed("conv_apply"):
+            y = self.conv(x.reshape(-1, 1, self.domain.numel()).to(self.conv.dtype))
         self.z = _join(y[..., self.rows_a1], w.L).reshape(batch, channels, w.L, -1)
         engine.trace("first_wavelet", n, self.z)
         self._modulus, self._branch = {}, {}
@@ -89,7 +91,8 @@ class _Block:
             m = self.modulus(d)
             padded = m.new_zeros(*m.shape[:-1], self.domain.numel())
             padded[..., self.rows_a1] = m
-            y = self.conv(padded.reshape(-1, 1, self.domain.numel()).to(self.conv.dtype))
+            with self.engine.geo.timed("conv_apply"):
+                y = self.conv(padded.reshape(-1, 1, self.domain.numel()).to(self.conv.dtype))
             y = _join(y[..., self.rows_f], w.L)
             self._branch[d] = y.reshape(self.batch, self.channels, w.L, w.L, -1)
             self.engine.trace("second_wavelet", self.n, self._branch[d])
@@ -194,7 +197,8 @@ class _Block:
         for d, g in self.gbranch.items():
             padded = g.new_zeros(self.batch * self.channels * L, 2 * L, self.domain.numel(), dtype=g.real.dtype)
             padded[..., self.rows_f] = _split(g).reshape(self.batch * self.channels * L, 2 * L, -1)
-            gm = convolution_adjoint(self.conv, padded, pixel_batch)[..., self.rows_a1]
+            with geo.timed("conv_adjoint"):
+                gm = convolution_adjoint(self.conv, padded, pixel_batch)[..., self.rows_a1]
             gm = gm.reshape(self.batch, self.channels, L, -1)
             if d not in self.gmod:
                 self.gmod[d] = gm
@@ -227,7 +231,8 @@ class _Block:
         # Wavelet adjoint on a1 rows -> map cotangent on the domain.
         padded = self.gz.new_zeros(self.batch * self.channels, 2 * L, self.domain.numel(), dtype=self.gz.real.dtype)
         padded[..., self.rows_a1] = _split(self.gz).reshape(self.batch * self.channels, 2 * L, -1)
-        gx = convolution_adjoint(self.conv, padded, pixel_batch)
+        with geo.timed("conv_adjoint"):
+            gx = convolution_adjoint(self.conv, padded, pixel_batch)
         maps_gradient[n].index_add_(-1, self.domain, gx.reshape(self.batch, self.channels, -1))
 
 
@@ -262,7 +267,7 @@ class LocalEngine:
         if key not in self._supports:
             chain, support = [block], block
             for level in range(n, self.levels - 1):
-                support = parents(dilate_fine(support, self.geo.nside(level), self.geo.down_rings(level)))
+                support = parents(self.geo.dilate_fine(support, self.geo.nside(level), self.geo.down_rings(level)))
                 chain.append(support)
             self._supports[key] = chain
         return self._supports[key]
