@@ -1,10 +1,11 @@
-"""Download the WebSky CMB lensing convergence map and store it NESTED as .npy.
+"""Download a WebSky full-sky map and store it NESTED as .npy.
 
-python -m benchmarks.scripts.prepare_websky_kappa --out data/websky [--downgrade 1024 512]
+python -m benchmarks.scripts.prepare_websky_kappa --product kap --out data/websky --downgrade 1024 512
+python -m benchmarks.scripts.prepare_websky_kappa --product ksz --out data/websky --downgrade 1024 512
 
-Source: https://lambda.gsfc.nasa.gov/data/simulation/cmb_mocks/kap.fits
-(Stein et al. 2020, arXiv:2001.08787; nside 4096, full sky). The FITS map is
-RING ordered; the conversion to NESTED uses STL's torch ``ring2nest``.
+Source: https://lambda.gsfc.nasa.gov/data/simulation/cmb_mocks/ (Stein et al.
+2020, arXiv:2001.08787; nside 4096, full sky, 805 MB per map). The FITS maps
+are RING ordered; the conversion to NESTED uses STL's torch ``ring2nest``.
 Downgraded versions average the 4**k NESTED children (plain binning).
 """
 
@@ -15,7 +16,19 @@ import urllib.request
 import numpy as np
 import torch
 
-URL = "https://lambda.gsfc.nasa.gov/data/simulation/cmb_mocks/kap.fits"
+BASE = "https://lambda.gsfc.nasa.gov/data/simulation/cmb_mocks/"
+PRODUCTS = {
+    "kap": "kap.fits",  # CMB lensing convergence
+    "ksz": "ksz.fits",  # kinetic SZ (uK)
+    "ksz_patchy": "ksz_patchy.fits",
+    "tsz": "tsz.fits",  # Compton-y
+    "isw": "isw.fits",
+    "cib_143": "cib_nu0143.fits",  # MJy/sr
+    "cib_217": "cib_nu0217.fits",
+    "cib_353": "cib_nu0353.fits",
+    "cib_545": "cib_nu0545.fits",
+    "cib_857": "cib_nu0857.fits",
+}
 
 
 def read_healpix_fits(path):
@@ -48,14 +61,19 @@ def ring_to_nested(values, nside, chunk=16_000_000):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="data/websky")
-    parser.add_argument("--fits", default=None, help="existing kap.fits (skips download)")
+    parser.add_argument(
+        "--product", default="kap", choices=sorted(PRODUCTS),
+        help="WebSky map: kap (lensing convergence), ksz, tsz, isw, cib_<GHz>",
+    )
+    parser.add_argument("--fits", default=None, help="existing FITS file (skips download)")
     parser.add_argument("--downgrade", type=int, nargs="*", default=[1024])
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)
-    fits_path = args.fits or os.path.join(args.out, "kap.fits")
+    url = BASE + PRODUCTS[args.product]
+    fits_path = args.fits or os.path.join(args.out, PRODUCTS[args.product])
     if not os.path.exists(fits_path):
-        print(f"downloading {URL} -> {fits_path}", flush=True)
-        urllib.request.urlretrieve(URL, fits_path)
+        print(f"downloading {url} -> {fits_path}", flush=True)
+        urllib.request.urlretrieve(url, fits_path)
     values, nside, ordering = read_healpix_fits(fits_path)
     print(f"nside={nside} ordering={ordering} dtype={values.dtype} npix={values.size} "
           f"mean={values.mean():.4e} std={values.std():.4e}", flush=True)
@@ -63,13 +81,13 @@ def main():
         values = ring_to_nested(values, nside)
     elif ordering != "NESTED":
         raise ValueError(f"Unknown ORDERING {ordering}")
-    name = os.path.join(args.out, f"kap_nside{nside}_nested.npy")
+    name = os.path.join(args.out, f"{args.product}_nside{nside}_nested.npy")
     np.save(name, values)
     print(f"saved {name} ({os.path.getsize(name) / 1e6:.0f} MB)", flush=True)
     for target in args.downgrade:
         factor = (nside // target) ** 2
         low = values.reshape(-1, factor).mean(axis=1).astype(values.dtype)
-        name = os.path.join(args.out, f"kap_nside{target}_nested.npy")
+        name = os.path.join(args.out, f"{args.product}_nside{target}_nested.npy")
         np.save(name, low)
         print(f"saved {name} ({os.path.getsize(name) / 1e6:.0f} MB)", flush=True)
 
