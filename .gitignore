@@ -5,3 +5,4 @@ docs/build/
 *.pyc
 my_tests.ipynb
 STL.egg-info/benchmarks/results/
+data/websky/
