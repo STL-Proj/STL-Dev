@@ -22,11 +22,11 @@ def chain():
     ax.set_xlim(0, 12.5); ax.set_ylim(0, 3.4); ax.axis("off")
     w = 2.0
     boxes = [
-        (0.2, "carte x\n(nside 2048)", INK),
-        (2.5, "ψ_j1 ⋆ x\nondelette fine\ncomplexe, L orient.", ACCENT),
-        (4.8, "| · |\nmodule", INK),
-        (7.1, "D^(n−d)\ndécimation lissée\n÷2 par niveau", ACCENT),
-        (9.4, "ψ_j3 ⋆ ( · )\nondelette\ngrossière", ACCENT),
+        (0.2, "map x\n(nside 2048)", INK),
+        (2.5, "ψ_j1 ⋆ x\nfine wavelet\ncomplex, L orient.", ACCENT),
+        (4.8, "| · |\nmodulus", INK),
+        (7.1, "D^(n−d)\nsmooth decimation\n÷2 per level", ACCENT),
+        (9.4, "ψ_j3 ⋆ ( · )\ncoarse\nwavelet", ACCENT),
     ]
     for x, label, color in boxes:
         ax.add_patch(Rectangle((x, 1.4), w, 1.3, facecolor=LIGHT if color == ACCENT else "white",
@@ -35,12 +35,12 @@ def chain():
     for x in (2.2, 4.5, 6.8, 9.1):
         ax.add_patch(FancyArrowPatch((x, 2.05), (x + 0.3, 2.05), arrowstyle="-|>", mutation_scale=14, color=INK))
     ax.add_patch(FancyArrowPatch((11.4, 2.05), (11.7, 2.05), arrowstyle="-|>", mutation_scale=14, color=INK))
-    ax.text(12.1, 2.05, "S3 =\nmoyenne\ndu produit", ha="center", va="center", fontsize=10.5)
+    ax.text(12.1, 2.05, "S3 =\nmean of\nthe product", ha="center", va="center", fontsize=10.5)
     # the direct branch
     ax.add_patch(FancyArrowPatch((1.2, 1.4), (10.4, 0.55), arrowstyle="-|>", mutation_scale=14, color=GREY,
                                  connectionstyle="arc3,rad=0.22"))
-    ax.text(5.8, 0.4, "ψ_j3 ⋆ x   (branche directe, à la résolution grossière)", ha="center", fontsize=10, color=INK)
-    ax.text(6.3, 3.15, "résolution fine  ──────────────────────▶  résolution grossière (4^(n−d) fois moins de pixels)",
+    ax.text(5.8, 0.4, "ψ_j3 ⋆ x   (direct branch, at the coarse resolution)", ha="center", fontsize=10, color=INK)
+    ax.text(6.3, 3.15, "fine resolution  ──────────────────────▶  coarse resolution (4^(n−d) times fewer pixels)",
             ha="center", fontsize=10, color=ACCENT)
     fig.savefig(os.path.join(OUT, "s3_chain.png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -57,19 +57,19 @@ def pyramid():
         ax.add_patch(Rectangle((x - 0.13, y0 - 0.13), 1.16, 1.16, facecolor="none", edgecolor=GREY, linestyle="--", linewidth=1.2))
         ax.add_patch(Rectangle((x, y0), 0.9, 0.9, facecolor=LIGHT if k == 2 else "white", edgecolor=ACCENT if k == 2 else INK, linewidth=1.5))
         ax.text(x + 0.45, y0 + 0.45, f"F{k+1}", ha="center", va="center", fontsize=11)
-    ax.text(0.2, 0.12, "niveau fin d : blocs F_k de taille constante, chacun avec son halo (stencil + cône de décimation)", fontsize=10)
+    ax.text(0.2, 0.12, "fine level d: blocks F_k of constant size, each with its halo (wavelet stencil + decimation cone)", fontsize=10)
     # coarse level: one block
     ax.add_patch(Rectangle((2.2, 3.5), 2.6, 0.9, facecolor="white", edgecolor=INK, linewidth=1.5))
     ax.add_patch(Rectangle((1.95, 3.25), 3.1, 1.4, facecolor="none", edgecolor=GREY, linestyle="--", linewidth=1.2))
-    ax.text(3.5, 3.95, "niveau grossier n\nm[d][n] sur le bloc + halo", ha="center", va="center", fontsize=10.5)
+    ax.text(3.5, 3.95, "coarse level n\nm[d][n] on the block + halo", ha="center", va="center", fontsize=10.5)
     # arrows from fine blocks to coarse block
     for k in range(6):
         x = 0.75 + k * 1.1
         ax.add_patch(FancyArrowPatch((x, y0 + 1.05), (2.5 + k * 0.4, 3.45), arrowstyle="-|>", mutation_scale=12,
                                      color=ACCENT if k == 2 else GREY, linewidth=1.3 if k == 2 else 0.9))
     ax.text(8.3, 3.0, "m = Σ_k D^(n−d)( |ψ_j1 ⋆ x| · 1_{F_k} )", ha="center", va="center", fontsize=11, color=ACCENT)
-    ax.text(8.3, 2.0, "chaque bloc fin pousse sa\ncontribution vers le haut ;\nla somme est exacte parce que\nla chaîne est linéaire\naprès le module", ha="center", va="center", fontsize=10.5)
-    ax.text(5.0, 4.95, "mémoire : un bloc fin + son halo, quelle que soit la distance d'échelle n − d", ha="center", fontsize=10.5, color=ACCENT)
+    ax.text(8.3, 2.0, "each fine block pushes its\ncontribution upward;\nthe sum is exact because\nthe chain is linear\nafter the modulus", ha="center", va="center", fontsize=10.5)
+    ax.text(5.0, 4.95, "memory: one fine block + its halo, whatever the scale distance n − d", ha="center", fontsize=10.5, color=ACCENT)
     fig.savefig(os.path.join(OUT, "pyramid.png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -78,16 +78,16 @@ def sweeps():
     """Ascending (statistics) and descending (gradient) sweeps over levels."""
     fig, ax = plt.subplots(figsize=(8, 4.4))
     ax.set_xlim(0, 8); ax.set_ylim(0, 4.4); ax.axis("off")
-    levels = ["d = 0   (nside 2048 : 768 blocs)", "d = 1   (192 blocs)", "d = 2   (48 blocs)", "…", "d = n   (un seul bloc : tout le niveau)"]
+    levels = ["d = 0   (nside 2048: 768 blocks)", "d = 1   (192 blocks)", "d = 2   (48 blocks)", "…", "d = n   (a single block: the whole level)"]
     for i, name in enumerate(levels):
         y = 0.4 + i * 0.85
-        w = 5.2 - i * 0.4
+        w = 5.4 - i * 0.3
         ax.add_patch(Rectangle((4.0 - w / 2, y), w, 0.55, facecolor="white" if i % 2 else LIGHT, edgecolor=INK, linewidth=1.2))
         ax.text(4.0, y + 0.275, name, ha="center", va="center", fontsize=10)
     ax.add_patch(FancyArrowPatch((1.2, 0.5), (1.2, 4.1), arrowstyle="-|>", mutation_scale=16, color=ACCENT, linewidth=2))
-    ax.text(1.0, 2.3, "balayage\nmontant :\nstatistiques,\nmodules décimés\nm[d][n] stockés", ha="right", va="center", fontsize=10, color=ACCENT)
+    ax.text(1.0, 2.3, "upward\nsweep:\nstatistics,\ndecimated moduli\nm[d][n] stored", ha="right", va="center", fontsize=10, color=ACCENT)
     ax.add_patch(FancyArrowPatch((6.8, 4.1), (6.8, 0.5), arrowstyle="-|>", mutation_scale=16, color=INK, linewidth=2))
-    ax.text(7.0, 2.3, "balayage\ndescendant :\ncotangents,\ntransposées,\ndérivée du module,\nadjoint de l'ondelette", ha="left", va="center", fontsize=10)
+    ax.text(7.0, 2.3, "downward\nsweep:\ncotangents,\ntransposes,\nmodulus derivative,\nwavelet adjoint", ha="left", va="center", fontsize=10)
     fig.savefig(os.path.join(OUT, "sweeps.png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -115,9 +115,9 @@ def loss_curve():
     ys = first + [later[k] for k in sorted(later)]
     fig, ax = plt.subplots(figsize=(6.2, 3.8))
     ax.semilogy(xs, ys, color=ACCENT, lw=2, marker=".", ms=5)
-    ax.set_xlabel("évaluation de la perte (LBFGS, 500 itérations)")
-    ax.set_ylabel("Σ |S(x) − S(cible)|²")
-    ax.set_title("WebSky kappa, nside 256, L = 4, 5 882 coefficients", fontsize=11)
+    ax.set_xlabel("loss evaluation (LBFGS, 500 iterations)")
+    ax.set_ylabel("Σ |S(x) − S(target)|²")
+    ax.set_title("WebSky kappa, nside 256, L = 4, 5,882 coefficients", fontsize=11)
     ax.grid(True, which="both", alpha=0.25)
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
