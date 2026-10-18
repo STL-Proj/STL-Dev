@@ -196,7 +196,7 @@ def eye(n, device=None, dtype=None):
     return torch.eye(n, dtype=fix_dtype, device=device)
 
 
-def maskmean(x, dim=(-2, -1), mask=None):
+def maskmean(x, dim, keepdim=False, mask=None):
     """
     Compute the mean of x along given dims, optionally masked.
     If mask is given, assumes mask.shape == x.shape[-mask.ndim:],
@@ -205,15 +205,18 @@ def maskmean(x, dim=(-2, -1), mask=None):
     Args:
         x: input tensor
         mask: boolean tensor, same shape as the last dimensions of x
+        keepdim: bool whether to keep the averaged dimensions
         dim: int or tuple of ints along which to compute the mean.
 
     Returns:
         Tensor with the mean
     """
     if mask is None:
-        return x.mean() if dim is None else x.mean(dim=dim)
+        return (
+            x.mean(keepdim=keepdim) if dim is None else x.mean(dim=dim, keepdim=keepdim)
+        )
     else:
-        assert dim == (-2, -1)
+        assert dim == (-2, -1) or dim == (-1,)
         assert (
             mask.shape[-len(dim) :] == x.shape[-len(dim) :]
         )  # check mask shape matches x shape on masked dims
@@ -223,7 +226,11 @@ def maskmean(x, dim=(-2, -1), mask=None):
             (~mask).sum() if dim is None else (~mask).sum(dim=dim)
         )  ########################################## can be improved in the future by normalizing masks once for all beforehand
         # assert count != 0, "mask is full of NaNs, cannot compute mean"
-        return (x_masked.sum() if dim is None else x_masked.sum(dim=dim)) / count
+        return (
+            x_masked.sum(keepdim=keepdim)
+            if dim is None
+            else x_masked.sum(dim=dim, keepdim=keepdim)
+        ) / count
 
 
 def dim(x) -> int:

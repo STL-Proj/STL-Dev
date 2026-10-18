@@ -31,6 +31,15 @@ class Base_DataClass(ABC):
 
     # Common class constant(s) (shall be defined in child classes)
     DT: ClassVar[str]
+    ndim: ClassVar[int] = (
+        2  # number of intrinsic dimensions of the data (ie dimensions on which convolutions are applied, excluding batch and channel dimensions)
+    )
+    wavelet_op_class: ClassVar[
+        Any
+    ]  # Class variable to hold the wavelet operator class, to be defined in child classes
+    cs_op_class: ClassVar[
+        Any
+    ]  # Class variable to hold the cross spectrum operator class, to be defined in child classes
 
     # Common instance attributes
     array: (
@@ -38,7 +47,7 @@ class Base_DataClass(ABC):
     )  # Other types will be converted to torch.Tensor in __post_init__ if possible
     pbc: Optional[bool] = None
     dg: Optional[int] = None
-    N0: Optional[tuple[int, int]] = None
+    N0: Optional[tuple[int, ...]] = None
     conv_history: list[int] = field(default_factory=list)  # empty list by default
     device: torch.device = field(init=False)
     dtype: torch.dtype = field(init=False)
@@ -52,10 +61,14 @@ class Base_DataClass(ABC):
 
         if self.dg is None:
             self.dg = 0
-            self.N0 = self.array.shape[-2:]
+            self.N0 = self.array.shape[-self.__class__.ndim :]
 
         if self.dg is not None and self.N0 is None:
             raise ValueError("dg is given, N0 should not be None")
+
+        assert self.__class__.ndim == len(
+            self.N0
+        ), f"ndim ({self.__class__.ndim}) must match the length of N0 ({len(self.N0)})"
 
         self.device = self.array.device
         self.dtype = self.array.dtype
@@ -106,7 +119,10 @@ class Base_DataClass(ABC):
         # Copy metadata
         for k, v in self.__dict__.items():
             if k != "array":
-                setattr(new, k, v)
+                if isinstance(v, (list, dict)):
+                    setattr(new, k, cp.deepcopy(v))  # deep copy for mutable types
+                else:
+                    setattr(new, k, v)
 
         # Copy array
         if empty:

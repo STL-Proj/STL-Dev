@@ -39,158 +39,11 @@ from STL_main.torch_backend import (
 )
 
 
-###############################################################################
-###############################################################################
-@dataclass
-class STL_2D_Kernel_Torch(Base_DataClass):
-    """
-    STL_2D_Kernel_Torch child class for 2D planar STL Kernel using PyTorch
-
-    Inherits Base_DataClass.
-
-    See Base_DataClass for parameter descriptions.
-
-    Additional comments
-    -------------------
-    The initial resolution N0 is fixed, but the maps can be downgraded. The
-    downgrading factor is the power of 2 that is used. A map of initial
-    resolution N0=256 and with dg = 3 is thus at resolution 256/2^3 = 32.
-    The downgraded resolutions are called N0, N1, N2, ...
-
-    Can store array at a given downgradind dg:
-        - attribute MR is False
-        - attribute N0 gives the initial resolution
-        - attribute dg gives the downgrading level
-        - array is an array of size (..., N) with N = N0 // 2^dg
-    Or at multi-resolution (MR):
-        - attribute MR is True
-        - attribute N0 gives the initial resolution
-        - attribute dg is None
-        - array is a list of array of sizes (..., N1), (..., N2), etc.,
-        with the same dimensions excepts N.
-
-    Method usages if MR=True.
-        - mean, cov give a single vector or last dim len(list_N)
-        - downsample gives an output of size (..., len(list_N), Nout). Only
-          possible if all resolution are downsampled this way.
-
-    The class initialization is the frontend one, which can work from DT and
-    data only. It enforces MR=False and dg=0. Two backend init functions for
-    MR=False and MR=True also exist.
-
-    Attributes
-    ----------
-    - DT : str
-        Type of data (1d, 2d planar, HealPix, 3d)
-    - N0 : tuple of int
-        Initial size of array (can be multiple dimensions)
-    - dg : int
-        2^dg is the downgrading level w.r.t. N0.
-    - array : array (..., N)
-          array(s) to store
-    """
-
-    # child class constant
-    DT = "Planar2D_kernel_torch"
-
-    def __post_init__(self):
-        super().__post_init__()
-
-    ###########################################################################
-    def modulus(self, inplace=False):
-        """
-        Compute the modulus (absolute value) of the array attribute of data.
-
-        Parameters
-        ----------
-        - inplace : bool
-            If True, acts in-place and returns self.
-            If False, returns a new STL_2D_Kernel_Torch instance.
-
-        Returns
-        -------
-        STL_2D_Kernel_Torch
-            STL_2D_Kernel_Torch instance whose array attribute is the modulus
-        """
-        data = self.copy(empty=False) if not inplace else self
-
-        data.array = data.array.abs()
-
-        data.dtype = data.array.dtype
-
-        return data
-
-    def divide(self, data2, epsilon=1e-8, pow=1.0, inplace=False):
-        """
-        Divide self.array by data2.array raised to a power, with a small epsilon added to the denominator for numerical stability.
-
-        Division is still performed in real space
-
-        Parameters
-        ----------
-        data2 : STL_2D_FFT_Torch
-            Another instance whose array is used as the denominator. Its Fourier
-            status determines the computation domain.
-        epsilon : float, optional
-            Small constant added to the denominator for numerical stability
-            (default is 1e-8).
-        power : float, optional
-            Exponent applied to the denominator (default is 1).
-        inplace : bool
-            If True, performs the operation in-place and returns self.
-            If False, returns a new instance.
-
-        Returns
-        -------
-        STL_2D_FFT_Torch
-            Result of the division in the appropriate domain.
-        """
-
-        data1 = self.copy(empty=False) if not inplace else self
-
-        # Apply the division in real space
-        data1.array = data1.array / (data2.array + epsilon) ** pow
-        data1.dtype = data1.array.dtype
-
-        return data1
-
-    def get_wavelet_op(
-        self,
-        J=None,
-        mask_full_res=None,
-        *args,
-        **kwargs,
-    ):
-
-        J = J if J is not None else int(np.log2(min(self.N0))) - 2
-
-        if mask_full_res is None:
-            if torch.any(self.array.isnan()):
-                mask_full_res = STL_2D_Kernel_Torch(array=self.array.isnan())
-
-        return WaveletOperator2Dkernel_torch(
-            J=J,
-            DT=self.DT,
-            device=self.device,
-            dtype=self.dtype,
-            mask_full_res=mask_full_res,
-            *args,
-            **kwargs,
-        )
-
-    def get_ST_op(self, *args, **kwargs):
-
-        return ST_Operator(data_example=self, *args, **kwargs)
-
-    ###############################################################################
-    def get_CS_op(self, *args, **kwargs):
-
-        return CS_operator_2D_Kernel_Torch(
-            shape=self.N0, device=self.device, dtype=self.dtype, *args, **kwargs
-        )
-
-
 class WaveletOperator2Dkernel_torch:
+
+    # class constant
+    ndim = 2
+
     @staticmethod
     def _get_padding_mode(pbc: bool = True) -> str:
         assert pbc is not None, "pbc must be specified"
@@ -198,9 +51,9 @@ class WaveletOperator2Dkernel_torch:
             "circular" if pbc else "replicate"
         )  # most suited option for non-PBC, better than 'constant' and 'reflect'
 
-    @staticmethod
-    def _conv2d_circular(
-        x: torch.Tensor, w: torch.Tensor, padding_mode: str
+    @classmethod
+    def _conv_circular(  # conv_dims dependant
+        cls, x: torch.Tensor, w: torch.Tensor, padding_mode: str
     ) -> torch.Tensor:
         """
         Backend-style 2D convolution mirroring FoCUS/BkTorch strategy.
@@ -217,30 +70,41 @@ class WaveletOperator2Dkernel_torch:
         torch.Tensor
             Convolved tensor with shape [..., O_c, Nx, Ny].
         """
-
-        *leading_dims, Nx, Ny = x.shape
-        O_c, wx, wy = w.shape
+        ndim = cls.ndim
+        leading_dims = x.shape[:-ndim]
+        conv_dims = x.shape[-ndim:]
 
         B = int(torch.prod(torch.tensor(leading_dims))) if leading_dims else 1
-        x4d = x.reshape(B, 1, Nx, Ny)
+        x4d = x.reshape(B, 1, *conv_dims)
 
-        weight = w[:, None, :, :]
-        pad_x = wx // 2
-        pad_y = wy // 2
+        if ndim == 2:
+            O_c, wx, wy = w.shape
+            weight = w[:, None, :, :]
+            pad_x = wx // 2
+            pad_y = wy // 2
 
-        x_padded = F.pad(x4d, (pad_y, pad_y, pad_x, pad_x), mode=padding_mode)
-        y = F.conv2d(x_padded, weight)
+            x_padded = F.pad(x4d, (pad_y, pad_y, pad_x, pad_x), mode=padding_mode)
+            y = F.conv2d(x_padded, weight)
+        elif ndim == 1:
+            O_c, wx = w.shape
+            weight = w[:, None, :]
+            pad_x = wx // 2
 
-        return y.reshape(*leading_dims, O_c, Nx, Ny)
+            x_padded = F.pad(x4d, (pad_x, pad_x), mode=padding_mode)
+            y = F.conv1d(x_padded, weight)
+        else:
+            raise ValueError(f"Convolution not yet implemented for ndim={ndim}")
+
+        return y.reshape(*leading_dims, O_c, *conv_dims)
 
     @classmethod
-    def _semicomplex_conv2d_circular(
+    def _semicomplex_conv_circular(
         cls, x: torch.Tensor, w: torch.Tensor, padding_mode: str
     ) -> torch.Tensor:
         """
         Perform a 2D convolution with a real input and complex kernel.
         This method decomposes the complex kernel ``w`` into its real and
-        imaginary parts, applies ``_conv2d_circular`` separately to each part
+        imaginary parts, applies ``_conv_circular`` separately to each part
         using the real-valued input ``x``, and combines the two real-valued
         results into a complex-valued output tensor.
         Parameters
@@ -256,7 +120,7 @@ class WaveletOperator2Dkernel_torch:
             ``x`` separately.
         padding_mode : str
             Padding mode passed through to ``torch.nn.functional.pad`` in
-            ``_conv2d_circular``. Typically ``"circular"`` for periodic
+            ``_conv_circular``. Typically ``"circular"`` for periodic
             boundary conditions or ``"replicate"`` for non-periodic padding,
             but any mode supported by ``torch.nn.functional.pad`` may be used.
         Returns
@@ -267,21 +131,19 @@ class WaveletOperator2Dkernel_torch:
             kernel ``w``.
         """
 
-        assert not torch.is_complex(x), "Input tensor x must be real-valued"
         assert torch.is_complex(w), "Kernel w must be complex-valued"
 
-        wr = torch.real(w)  # if torch.is_complex(w) else w
-        wi = torch.imag(w)  # if torch.is_complex(w) else torch.zeros_like(wr)
-
-        # TODO: stack real and imag kernels and convolve once instead of twice for efficiency
-        real_part = cls._conv2d_circular(
-            x, wr, padding_mode=padding_mode
-        )  # - cls._conv2d_circular(xi, wi)
-        imag_part = cls._conv2d_circular(
-            x, wi, padding_mode=padding_mode
-        )  # + cls._conv2d_circular(xi, wr)
-
-        return torch.complex(real_part, imag_part)
+        if torch.is_complex(x):
+            # 1 complex-complex convolution = 4 real-real convolutions ?
+            return cls._conv_circular(x, w, padding_mode=padding_mode)
+        else:
+            # 2 real-real convolutions only (more efficient?)
+            # TODO: stack real and imag kernels and convolve once instead of twice for efficiency
+            wr = torch.real(w)
+            wi = torch.imag(w)
+            real_part = cls._conv_circular(x, wr, padding_mode=padding_mode)
+            imag_part = cls._conv_circular(x, wi, padding_mode=padding_mode)
+            return torch.complex(real_part, imag_part)
 
     @staticmethod
     def _get_crop_border_size_largest_scale_second_layer(data, wavelet_op):
@@ -354,6 +216,12 @@ class WaveletOperator2Dkernel_torch:
         self.L = L if L is not None else 4
         self.KERNELSZ = kernel_size if kernel_size is not None else 5
         self.DT = DT
+        if self.DT == "Planar2D_kernel_torch":
+            self.data_class = STL_2D_Kernel_Torch
+        else:
+            raise ValueError(
+                f"DT {self.DT} not recognized. Available option: 'Planar2D_kernel_torch'."
+            )
 
         self.device = _get_device(torch.device(device))
         self.dtype = _get_dtype(dtype=dtype, device=self.device)
@@ -388,7 +256,7 @@ class WaveletOperator2Dkernel_torch:
             mask_full_res  # None if no NaN in the data. Is True where the data is NaN.
         )
         if self.mask_full_res is not None:
-            if self.mask_full_res.array.ndim != 2:
+            if self.mask_full_res.array.ndim != self.__class__.ndim:
                 raise NotImplementedError(
                     "For now, mask_full_res.array must be 2D if provided."
                 )
@@ -402,7 +270,7 @@ class WaveletOperator2Dkernel_torch:
         ) = self._build_reweighting_maps_and_scattering_layer_masks()
         self.j_to_dg = range(J)
 
-    def _build_reweighting_maps_and_scattering_layer_masks(self):
+    def _build_reweighting_maps_and_scattering_layer_masks(self):  # conv_dims dependant
         if self.mask_full_res is None:
             return None, None, None, None
         else:
@@ -434,8 +302,8 @@ class WaveletOperator2Dkernel_torch:
                         if dg > 1
                         else self.mask_full_res.array.to(dtype=self.dtype)
                     )
-                    local_nan_weight_maps_smooth[dg] = STL_2D_Kernel_Torch(
-                        array=self._downsample_tensor(
+                    local_nan_weight_maps_smooth[dg] = self.data_class(
+                        array=self.__class__._downsample_tensor(
                             x=parent_array,
                             smooth_kernel=smooth_kernel,
                             dg_inc=1,
@@ -454,7 +322,9 @@ class WaveletOperator2Dkernel_torch:
 
                 # 2) reweighting maps needed in downsampling of layer 1 data (convolved once with wavelets)
                 wav_kernels_envelope = torch.ones(
-                    self._wav_kernel.shape[-2:], dtype=self.dtype, device=self.device
+                    self._wav_kernel.shape[-self.__class__.ndim :],
+                    dtype=self.dtype,
+                    device=self.device,
                 ).unsqueeze(
                     0
                 )  # (1,K,K) assumes identical wavelet support for all angles
@@ -462,9 +332,9 @@ class WaveletOperator2Dkernel_torch:
 
                 # Stores at every dg=j3 NaNs position of layer 1 data (convolved once with wavelets at j3) in a mask.
                 layer1_mask = {  # {J: (N3)} one mask per scale j at resolution dg=j, same for all angles
-                    dg: STL_2D_Kernel_Torch(
+                    dg: self.data_class(
                         array=torch.abs(
-                            self.__class__._conv2d_circular(
+                            self.__class__._conv_circular(
                                 x=(
                                     self.mask_full_res.array
                                     if dg == 0
@@ -499,8 +369,8 @@ class WaveletOperator2Dkernel_torch:
                                 .to(dtype=self.dtype)
                             )
 
-                        local_nan_weight_maps_wav[dg][j] = STL_2D_Kernel_Torch(
-                            array=self._downsample_tensor(
+                        local_nan_weight_maps_wav[dg][j] = self.data_class(
+                            array=self.__class__._downsample_tensor(
                                 x=parent_array,
                                 smooth_kernel=smooth_kernel,
                                 dg_inc=1,
@@ -521,9 +391,9 @@ class WaveletOperator2Dkernel_torch:
                 # 3) Stores at every dg=j3 and every j2 NaNs position of layer 2 data (convolved first with wavelets at j2, then possibly local operations such as modulus, and then convolved a second time with wavelets at j3) in a mask.
                 layer2_mask = {
                     j3: {
-                        j2: STL_2D_Kernel_Torch(
+                        j2: self.data_class(
                             array=(
-                                self.__class__._conv2d_circular(  # convolve with wavelet support at resolution j3
+                                self.__class__._conv_circular(  # convolve with wavelet support at resolution j3
                                     x=(
                                         local_nan_weight_maps_wav[j3][j2].array.isnan()
                                         if j2 < j3
@@ -620,10 +490,10 @@ class WaveletOperator2Dkernel_torch:
             fft_wavelet_builder=WaveletOperator2D_FFT_torch.gaussian_bank
         )  # (1, L, K, K)
 
-    def _crop(self, array, border):
+    def _crop(self, array, border):  # conv_dims dependant
         """
         Crops an array by removing 'border' pixels from each side
-        along the last two dimensions.
+        along the last self.__class__.ndim dimensions.
 
         Parameters
         ----------
@@ -643,29 +513,38 @@ class WaveletOperator2Dkernel_torch:
         else:
             # handling of borders larger than array can be adapted depending on desired behavior
             if False:  # conservative handling of borders larger than array
-                assert array.shape[-2] > 2 * border
-                assert array.shape[-1] > 2 * border
+                for i in range(self.__class__.ndim):
+                    assert (
+                        array.shape[-(i + 1)] > 2 * border
+                    ), f"Array shape {array.shape} is too small to be cropped with border {border}."
             elif True:  # flexible handling of borders larger than array
-                if min(array.shape[-2:]) <= 2 * border:
+                if min(array.shape[-self.__class__.ndim :]) <= 2 * border:
                     if not getattr(
                         self, "_border_warning_raised", False
                     ):  # warns the user only once per wavelet operator
                         print(
                             "Warning! Data with shape {:} too small to be cropped with border {:}. Using border={:} instead.".format(
-                                array.detach().cpu().numpy().shape[-2:],
+                                array.detach()
+                                .cpu()
+                                .numpy()
+                                .shape[-self.__class__.ndim :],
                                 border,
-                                (min(array.shape[-2:]) - 1) // 2,
+                                (min(array.shape[-self.__class__.ndim :]) - 1) // 2,
                             )
                         )
                         self._border_warning_raised = True
-                    border = (min(array.shape[-2:]) - 1) // 2
-            else:  # simple handling of borders larger than array: maskmean will return nan
+                    border = (min(array.shape[-self.__class__.ndim :]) - 1) // 2
+            else:  # simple handling of borders larger than array: empty maskmean will return nan
                 pass
-            return array[..., border:-border, border:-border]
+            # crop the array along the last self.__class__.ndim dimensions
+            slices = [slice(None)] * (array.ndim - self.__class__.ndim) + [
+                slice(border, -border)
+            ] * self.__class__.ndim
+            return array[tuple(slices)]
 
-    def mean(self, data, dim=None):
+    def mean(self, data, dim=None, keepdim=False):  # conv_dims dependant
         """
-        Compute the mean on the last two dimensions (Nx, Ny).
+        Compute the mean on the last self.ndim dimensions.
         """
         if data.pbc is None and len(data.conv_history) > 0:
             raise ValueError("data.pbc should be specified (True or False).")
@@ -674,16 +553,18 @@ class WaveletOperator2Dkernel_torch:
         cropped_array = self._crop(array=data.array, border=border)
         cropped_mask = self._crop(array=self._find_mask(data), border=border)
 
-        dim = dim if dim is not None else (-2, -1)
+        dim = (
+            dim if dim is not None else tuple(range(-self.ndim, 0))
+        )  # default to last self.ndim dimensions
 
         return maskmean(
             x=cropped_array,
             dim=dim,
             mask=cropped_mask,
+            keepdim=keepdim,
         )
 
-    def square_mean(self, data, dim=(-2, -1), **kwargs):
-
+    def square_mean(self, data, dim=None, **kwargs):  # conv_dims dependant
         if data.pbc is None and len(data.conv_history) > 0:
             raise ValueError("data.pbc should be specified (True or False).")
 
@@ -691,12 +572,24 @@ class WaveletOperator2Dkernel_torch:
         cropped_array = self._crop(array=data.array * data.array.conj(), border=border)
         cropped_mask = self._crop(array=self._find_mask(data), border=border)
 
+        dim = (
+            dim if dim is not None else tuple(range(-self.ndim, 0))
+        )  # default to last self.ndim dimensions
+
         return maskmean(x=cropped_array, dim=dim, mask=cropped_mask)
 
-    def cov(self, data1, data2, remove_mean=None, dim=None, specific_channel_pair=None):
+    def cov(
+        self,
+        data1,
+        data2,
+        remove_mean=None,
+        dim=None,
+        keepdim=False,
+        specific_channel_pair=None,
+    ):  # conv_dims dependant
         """
-        Compute the covariance between data1=self and data2 on the last two
-        dimensions (Nx, Ny).
+        Compute the covariance between data1=self and data2 on the last self.ndim
+        dimensions.
         """
 
         if (data1.pbc is None and len(data1.conv_history) > 0) or (
@@ -707,7 +600,9 @@ class WaveletOperator2Dkernel_torch:
             )
 
         assert data1.dg == data2.dg, "data1 and data2 must have the same resolution."
-        dim = dim if dim is not None else (-2, -1)
+        dim = (
+            dim if dim is not None else tuple(range(-self.ndim, 0))
+        )  # default to last self.ndim dimensions
         remove_mean = remove_mean if remove_mean is not None else False
 
         # finding the appropriate mask
@@ -759,15 +654,18 @@ class WaveletOperator2Dkernel_torch:
             x=cropped_array,
             dim=dim,
             mask=self._crop(array=mask, border=border),
+            keepdim=keepdim,
         )
 
         return cov
 
     ###########################################################################
-    def standardize(self, data, mean_field, inplace=False, dim=None):
+    def standardize(
+        self, data, mean_field, inplace=False, dim=None
+    ):  # conv_dims dependant
         """
         Standardize the data by removing the mean and scaling to unit variance
-        on the last two dimensions (Nx, Ny) in real space.
+        on the last self.ndim dimensions in real space.
 
         Parameters
         ----------
@@ -790,31 +688,32 @@ class WaveletOperator2Dkernel_torch:
             Standard deviation used for standardization.
         """
 
-        if dim is None:
-            dim = (-2, -1)
+        dim = dim if dim is not None else tuple(range(-self.ndim, 0))
+        if dim != tuple(range(-self.ndim, 0)):
+            raise NotImplementedError  # must be compatible with unstandardize interpretation of dim
 
         l_data = data.copy(empty=False) if not inplace else data
 
-        mean = self.mean(l_data)  # [Nb,Nc]
+        mean = self.mean(l_data, dim=dim, keepdim=True)  # [Nb,Nc] by default
         if mean_field:
             mean = mean.mean(dim=0, keepdim=True)  # [1,Nc]
 
         l_data.array = (
-            l_data.array - mean[..., None, None]
+            l_data.array - mean
         )  # centering first because no remove_mean in cov
 
-        var = self.cov(l_data, l_data)
+        var = self.cov(l_data, l_data, dim=dim, keepdim=True)  # [Nb,Nc,Nc] by default
         if mean_field:
             var = var.mean(dim=0, keepdim=True)  # [1,Nc]
 
         std = torch.sqrt(var)
 
-        l_data.array = l_data.array / std[..., None, None]
+        l_data.array = l_data.array / std
 
-        return l_data, mean, std
+        return l_data, mean.squeeze(dim), std.squeeze(dim)
 
     ###########################################################################
-    def unstandardize(self, data, mean, std, inplace=False):
+    def unstandardize(self, data, mean, std, inplace=False):  # conv_dims dependant
         """
         Unstandardize the data by scaling back using the provided mean and std.
 
@@ -834,12 +733,16 @@ class WaveletOperator2Dkernel_torch:
         """
         l_data = data.copy(empty=False) if not inplace else data
 
+        ndim = self.ndim
+
         # No need for mean_field parameter here as the folloowing operation is the same whether mean and std are averaged over the batch dimension or not.
-        l_data.array = l_data.array * std[..., None, None] + mean[..., None, None]
+        l_data.array = (
+            l_data.array * std[(...,) + ndim * (None,)] + mean[(...,) + ndim * (None,)]
+        )
 
         return l_data
 
-    def _compute_and_store_cross_cov(
+    def _compute_and_store_cross_cov(  # conv_dims dependant
         self,
         data1,
         data2,
@@ -847,8 +750,11 @@ class WaveletOperator2Dkernel_torch:
         compute_cross_matrix,
         redundant_channels,
         remove_mean=False,
-        dim=(-2, -1),
+        dim=None,
     ):
+        dim = (
+            dim if dim is not None else tuple(range(-self.ndim, 0))
+        )  # default to last self.ndim dimensions
         assert (
             data1.array.shape[1] == data2.array.shape[1]
         ), "data1 and data2 arrays must have the same number of channels."
@@ -903,9 +809,9 @@ class WaveletOperator2Dkernel_torch:
             Convolved data with shape [..., L, Nx, Ny].
         """
         # Check coherence of input data.
-        if type(data).__name__ != "STL_2D_Kernel_Torch":
+        if type(data).__name__ != self.data_class.__name__:
             raise Exception(
-                f"Data should be a STL_2D_Kernel_Torch instance, got {type(data)}"
+                f"Data should be a {self.data_class.__name__} instance, got {type(data)}"
             )
         if self.DT != data.DT:
             raise Exception("Data and wavelet transform should have same DT")
@@ -920,11 +826,11 @@ class WaveletOperator2Dkernel_torch:
 
         weight = self._wav_kernel.squeeze(0)  # [L, K, K]
 
-        convolved = self.__class__._semicomplex_conv2d_circular(
+        convolved = self.__class__._semicomplex_conv_circular(
             x, weight, padding_mode=self.__class__._get_padding_mode(pbc=data.pbc)
         )
 
-        return STL_2D_Kernel_Torch(
+        return self.data_class(
             convolved,
             dg=data.dg,
             N0=data.N0,
@@ -932,9 +838,13 @@ class WaveletOperator2Dkernel_torch:
             conv_history=data.conv_history + [j],
         )
 
-    @staticmethod
-    def _downsample_tensor(
-        x: torch.Tensor, smooth_kernel: torch.Tensor, dg_inc: int, padding_mode: str
+    @classmethod
+    def _downsample_tensor(  # conv_dims dependant
+        cls,
+        x: torch.Tensor,
+        smooth_kernel: torch.Tensor,
+        dg_inc: int,
+        padding_mode: str,
     ) -> torch.Tensor:
         """
         Downsample a tensor by a factor 2**dg_inc along the last two
@@ -942,50 +852,62 @@ class WaveletOperator2Dkernel_torch:
 
         Requires that both spatial dimensions be divisible by 2**dg_inc.
         """
-        assert not torch.is_complex(x), "Input tensor x must be real-valued"
+        # assert not torch.is_complex(x), "Input tensor x must be real-valued"
         assert not torch.is_complex(smooth_kernel), "smooth_kernel must be real-valued"
 
         if dg_inc < 0:
             raise ValueError("dg_inc must be non-negative")
         if dg_inc == 0:
             return x
-
+        ndim = cls.ndim
         scale = 2**dg_inc
-        H, W = x.shape[-2:]
-        if H % scale != 0 or W % scale != 0:
+        conv_dims = x.shape[-ndim:]
+        if np.any(np.asarray(conv_dims) % scale != 0):
             raise ValueError(
-                f"Cannot downsample from ({H},{W}) by 2^{dg_inc}: "
+                f"Cannot downsample from {conv_dims} by 2^{dg_inc}: "
                 "dimensions must be divisible."
             )
-        if len(smooth_kernel.shape) != 2:
-            raise ValueError("Smooth kernel must be of dimension 2.")
-        if smooth_kernel.shape[0] != smooth_kernel.shape[1]:
-            raise ValueError("Smooth kernel must be a square.")
+        if len(smooth_kernel.shape) != ndim:
+            raise ValueError(
+                f"Smooth kernel must be of dimension {ndim}, but is shape {smooth_kernel.shape}."
+            )
+        if np.any(np.diff(smooth_kernel.shape) != 0):
+            raise ValueError(
+                f"Smooth kernel shape must be a square but is {smooth_kernel.shape}."
+            )
 
-        leading_dims = x.shape[:-2]
+        leading_dims = x.shape[:-ndim]
         B = int(torch.prod(torch.tensor(leading_dims))) if leading_dims else 1
-        y = x.reshape(B, 1, H, W)
+        y = x.reshape(B, 1, *conv_dims)
 
         for _ in range(dg_inc):
-            h, w = y.shape[-2:]
-            if h % 2 != 0 or w % 2 != 0:
+            current_conv_dims = y.shape[-ndim:]
+            if np.any(np.asarray(current_conv_dims) % 2 != 0):
                 raise ValueError(
                     "Downsampling requires even spatial dimensions at each step."
                 )
-            if smooth_kernel.shape == (2, 2) and torch.allclose(
+            if smooth_kernel.shape == ndim * (2,) and torch.allclose(
                 smooth_kernel,
-                0.25
+                2 ** (-ndim)
                 * torch.ones(
-                    (2, 2), device=smooth_kernel.device, dtype=smooth_kernel.dtype
+                    ndim * (2,), device=smooth_kernel.device, dtype=smooth_kernel.dtype
                 ),
             ):
-                # Fast path for 2x2 average pooling (equivalent to convolution with a 2x2 kernel of 0.25)
-                y = 0.25 * (
-                    y[..., ::2, ::2]
-                    + y[..., 1::2, ::2]
-                    + y[..., ::2, 1::2]
-                    + y[..., 1::2, 1::2]
-                )
+                if ndim == 2:
+                    # Fast path for 2x2 average pooling (equivalent to convolution with a 2x2 kernel of 0.25)
+                    y = 0.25 * (
+                        y[..., ::2, ::2]
+                        + y[..., 1::2, ::2]
+                        + y[..., ::2, 1::2]
+                        + y[..., 1::2, 1::2]
+                    )
+                elif ndim == 1:
+                    # Fast path for 1D average pooling (equivalent to convolution with a 2-element kernel of 0.5)
+                    y = 0.5 * (y[..., ::2] + y[..., 1::2])
+                else:
+                    raise NotImplementedError(
+                        f"Fast path for average pooling is not yet implemented for {ndim}D."
+                    )
             else:
                 # if smooth_kernel.shape[-1] % 2 == 0:
                 #    raise ValueError("Smooth kernel side length must be odd.")
@@ -994,18 +916,49 @@ class WaveletOperator2Dkernel_torch:
                 # Add circular padding for periodic boundaries
                 pad_before = (smooth_kernel.shape[-1] - 1) // 2
                 pad_after = smooth_kernel.shape[-1] // 2
-                y_padded = F.pad(
-                    y, (pad_before, pad_after, pad_before, pad_after), mode=padding_mode
-                )
-                # TODO: rely on self.__class__._conv2d_circular instead
-                y = F.conv2d(
-                    input=y_padded,
-                    weight=smooth_kernel.unsqueeze(0).unsqueeze(0),
-                    stride=2,
-                )
+                y_padded = F.pad(y, ndim * (pad_before, pad_after), mode=padding_mode)
+                # TODO: rely on self.__class__._conv_circular instead
+                if ndim == 1:
+                    if torch.is_complex(y_padded):
+                        y = F.conv1d(
+                            input=y_padded.real,
+                            weight=smooth_kernel.unsqueeze(0).unsqueeze(0),
+                            stride=2,
+                        ) + 1j * F.conv1d(
+                            input=y_padded.imag,
+                            weight=smooth_kernel.unsqueeze(0).unsqueeze(0),
+                            stride=2,
+                        )
+                    else:
+                        y = F.conv1d(
+                            input=y_padded,
+                            weight=smooth_kernel.unsqueeze(0).unsqueeze(0),
+                            stride=2,
+                        )
+                elif ndim == 2:
+                    if torch.is_complex(y_padded):
+                        y = F.conv2d(
+                            input=y_padded.real,
+                            weight=smooth_kernel.unsqueeze(0).unsqueeze(0),
+                            stride=2,
+                        ) + 1j * F.conv2d(
+                            input=y_padded.imag,
+                            weight=smooth_kernel.unsqueeze(0).unsqueeze(0),
+                            stride=2,
+                        )
+                    else:
+                        y = F.conv2d(
+                            input=y_padded,
+                            weight=smooth_kernel.unsqueeze(0).unsqueeze(0),
+                            stride=2,
+                        )
+                else:
+                    raise NotImplementedError(
+                        f"Downsampling is not yet implemented for {ndim}D."
+                    )
 
-        H2, W2 = y.shape[-2:]
-        return y.reshape(*leading_dims, H2, W2)
+        final_conv_dims = y.shape[-ndim:]
+        return y.reshape(*leading_dims, *final_conv_dims)
 
     ###########################################################################
     def downsample(self, data, dg_out, inplace=True, replace_nan_value=nan):
@@ -1033,12 +986,17 @@ class WaveletOperator2Dkernel_torch:
 
         if dg_inc > 0:
             smooth_kernel = self._get_smooth_kernel(
-                device=data.array.device, dtype=data.array.dtype
+                device=data.array.device,
+                dtype=(
+                    data.array.dtype
+                    if not torch.is_complex(data.array)
+                    else data.array.real.dtype
+                ),
             )
             padding_mode = self.__class__._get_padding_mode(pbc=data.pbc)
 
             if self.mask_full_res is None:  # no mask
-                data.array = self._downsample_tensor(
+                data.array = self.__class__._downsample_tensor(
                     x=data.array,
                     smooth_kernel=smooth_kernel,
                     dg_inc=dg_inc,
@@ -1082,7 +1040,7 @@ class WaveletOperator2Dkernel_torch:
                 for _ in range(
                     dg_inc
                 ):  # downsampling is done step by step to apply reweighting at each step
-                    data.array = self._downsample_tensor(
+                    data.array = self.__class__._downsample_tensor(
                         x=data.array,
                         smooth_kernel=smooth_kernel,
                         dg_inc=1,
@@ -1225,6 +1183,10 @@ class CS_operator_2D_Kernel_Torch:
     The operator is applied through apply method and is DT-dependent.
     """
 
+    # class constant
+    ndim = 2
+    default_DT = "Planar2D_kernel_torch"
+
     # Useful functions for the bin mask wavelet bank construction
     @staticmethod
     def s(t):
@@ -1260,6 +1222,7 @@ class CS_operator_2D_Kernel_Torch:
         n_bins=None,
         J=None,
         Jmin=0,
+        DT=None,
         power_spectrum_method="gaussian_rings",
         device=_DEFAULT_DEVICE,
         dtype=_DEFAULT_DTYPE,
@@ -1270,7 +1233,7 @@ class CS_operator_2D_Kernel_Torch:
         Initialize a frequency binning object.
 
         Args:
-            N0 (tuple): Image size (N, M)
+            N0 (tuple): Data shape
             n_bins (int): Number of radial frequency bins
             Jmin (int): Coarsest scale index included in the bin masks
                 (0 <= Jmin < J). Only used if power_spectrum_method is
@@ -1295,6 +1258,7 @@ class CS_operator_2D_Kernel_Torch:
                 f"Jmin must satisfy 0 <= Jmin < J (got Jmin={Jmin}, J={self.J})."
             )
         self.Jmin = Jmin
+        self.DT = DT if DT is not None else self.default_DT
         self.power_spectrum_method = power_spectrum_method.lower().strip()
         if self.power_spectrum_method not in {"legacy", "gaussian_rings"}:
             raise ValueError(
@@ -1462,9 +1426,9 @@ class CS_operator_2D_Kernel_Torch:
             Crop mask. Shape [n_bins, N, M].
         """
 
-        if array.ndim < 3:
+        if array.ndim < 1 + self.__class__.ndim:
             raise ValueError(
-                "Input tensor must have at least 3 dimensions to apply per-bin crop."
+                f"Input tensor must have at least {1 + self.__class__.ndim} dimensions to apply per-bin crop."
             )
         if self.power_spectrum_method == "gaussian_rings":
             return self._build_hard_mask_crop(array, border)
@@ -1535,10 +1499,8 @@ class CS_operator_2D_Kernel_Torch:
             Cross spectrum values of shape [..., Nc, Nc, n_bins]
         """
         # consistency check
-        if type(data).__name__ != "STL_2D_Kernel_Torch":
-            raise Exception(
-                f"Data should be a STL_2D_Kernel_Torch instance, got {type(data)}"
-            )
+        if data.DT != self.DT:
+            raise Exception(f"Data Type should be {self.DT}, got {data.DT}.")
         if self.shape != data.N0:
             raise Exception("Data shape does not match operator shape")
         if data.dg != 0:
@@ -1717,3 +1679,157 @@ class CS_operator_2D_Kernel_Torch:
         plt.title(f"Radial Cross Spectra c{c1+1}-c{c2+1} for image {b+1}")
         plt.grid(True, which="both", ls="-", alpha=0.5)
         plt.legend()
+
+
+###############################################################################
+###############################################################################
+@dataclass
+class STL_2D_Kernel_Torch(Base_DataClass):
+    """
+    STL_2D_Kernel_Torch child class for 2D planar STL Kernel using PyTorch
+
+    Inherits Base_DataClass.
+
+    See Base_DataClass for parameter descriptions.
+
+    Additional comments
+    -------------------
+    The initial resolution N0 is fixed, but the maps can be downgraded. The
+    downgrading factor is the power of 2 that is used. A map of initial
+    resolution N0=256 and with dg = 3 is thus at resolution 256/2^3 = 32.
+    The downgraded resolutions are called N0, N1, N2, ...
+
+    Can store array at a given downgradind dg:
+        - attribute MR is False
+        - attribute N0 gives the initial resolution
+        - attribute dg gives the downgrading level
+        - array is an array of size (..., N) with N = N0 // 2^dg
+    Or at multi-resolution (MR):
+        - attribute MR is True
+        - attribute N0 gives the initial resolution
+        - attribute dg is None
+        - array is a list of array of sizes (..., N1), (..., N2), etc.,
+        with the same dimensions excepts N.
+
+    Method usages if MR=True.
+        - mean, cov give a single vector or last dim len(list_N)
+        - downsample gives an output of size (..., len(list_N), Nout). Only
+          possible if all resolution are downsampled this way.
+
+    The class initialization is the frontend one, which can work from DT and
+    data only. It enforces MR=False and dg=0. Two backend init functions for
+    MR=False and MR=True also exist.
+
+    Attributes
+    ----------
+    - DT : str
+        Type of data (1d, 2d planar, HealPix, 3d)
+    - N0 : tuple of int
+        Initial size of array (can be multiple dimensions)
+    - dg : int
+        2^dg is the downgrading level w.r.t. N0.
+    - array : array (..., N)
+          array(s) to store
+    """
+
+    # child class constant
+    DT = "Planar2D_kernel_torch"
+    ndim = 2
+    wavelet_op_class = WaveletOperator2Dkernel_torch
+    cs_op_class = CS_operator_2D_Kernel_Torch
+
+    def __post_init__(self):
+        super().__post_init__()
+
+    ###########################################################################
+    def modulus(self, inplace=False):
+        """
+        Compute the modulus (absolute value) of the array attribute of data.
+
+        Parameters
+        ----------
+        - inplace : bool
+            If True, acts in-place and returns self.
+            If False, returns a new STL_2D_Kernel_Torch instance.
+
+        Returns
+        -------
+        STL_2D_Kernel_Torch
+            STL_2D_Kernel_Torch instance whose array attribute is the modulus
+        """
+        data = self.copy(empty=False) if not inplace else self
+
+        data.array = data.array.abs()
+
+        data.dtype = data.array.dtype
+
+        return data
+
+    def divide(self, data2, epsilon=1e-8, pow=1.0, inplace=False):
+        """
+        Divide self.array by data2.array raised to a power, with a small epsilon added to the denominator for numerical stability.
+
+        Division is still performed in real space
+
+        Parameters
+        ----------
+        data2 : STL_2D_FFT_Torch
+            Another instance whose array is used as the denominator. Its Fourier
+            status determines the computation domain.
+        epsilon : float, optional
+            Small constant added to the denominator for numerical stability
+            (default is 1e-8).
+        power : float, optional
+            Exponent applied to the denominator (default is 1).
+        inplace : bool
+            If True, performs the operation in-place and returns self.
+            If False, returns a new instance.
+
+        Returns
+        -------
+        STL_2D_FFT_Torch
+            Result of the division in the appropriate domain.
+        """
+
+        data1 = self.copy(empty=False) if not inplace else self
+
+        # Apply the division in real space
+        data1.array = data1.array / (data2.array + epsilon) ** pow
+        data1.dtype = data1.array.dtype
+
+        return data1
+
+    def get_wavelet_op(
+        self,
+        J=None,
+        mask_full_res=None,
+        *args,
+        **kwargs,
+    ):
+
+        J = J if J is not None else int(np.log2(min(self.N0))) - 2
+
+        if mask_full_res is None:
+            if torch.any(self.array.isnan()):
+                mask_full_res = self.__class__(array=self.array.isnan())
+
+        return self.__class__.wavelet_op_class(
+            J=J,
+            DT=self.DT,
+            device=self.device,
+            dtype=self.dtype,
+            mask_full_res=mask_full_res,
+            *args,
+            **kwargs,
+        )
+
+    def get_ST_op(self, *args, **kwargs):
+
+        return ST_Operator(data_example=self, *args, **kwargs)
+
+    ###############################################################################
+    def get_CS_op(self, *args, **kwargs):
+
+        return self.__class__.cs_op_class(
+            shape=self.N0, device=self.device, dtype=self.dtype, *args, **kwargs
+        )

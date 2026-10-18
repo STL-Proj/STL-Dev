@@ -64,7 +64,9 @@ class ScatteringMatchModel(nn.Module):
             assert (
                 not self.u.isnan().any()
             ), "Cannot apply Nyquist filter on intial map with NaNs. Either remove NaNs from the initial map or specify prefilter_Nyquist=False."
-            self.u = apply_nyquist_filter(self.u)
+            self.u = apply_nyquist_filter(
+                self.u, dim=tuple(range(-self.DataClass.ndim, 0))
+            )
 
         # === Apply mask constraints ===
         self.mask_full_res = st_op.wavelet_op.mask_full_res
@@ -198,32 +200,41 @@ def optimize_from_maps(
 
     # ------- Determine initial shape for u (from target) -------
     input_dim = target.array.ndim
+    conv_dim = target.ndim
 
-    if input_dim == 2:
+    if input_dim == conv_dim:
         target_shape = (1, 1, *target.array.shape)
         if running_shape is None:
             init_shape = (nbatch, 1, *target.array.shape)
         else:
-            assert len(running_shape) == 2, "running_shape should be a tuple of (H,W)"
+            assert (
+                len(running_shape) == conv_dim
+            ), f"running_shape should be of dim {conv_dim}"
             init_shape = (nbatch, 1, *running_shape)
 
-    elif input_dim == 3:
+    elif input_dim == conv_dim + 1:
         target_shape = (1, *target.array.shape)
         if running_shape is None:
             init_shape = (nbatch, *target.array.shape)
         else:
-            assert len(running_shape) == 2, "running_shape should be a tuple of (H,W)"
+            assert (
+                len(running_shape) == conv_dim
+            ), f"running_shape should be of dim {conv_dim}"
             init_shape = (nbatch, target.array.shape[0], *running_shape)
 
-    elif input_dim == 4:
+    elif input_dim == conv_dim + 2:
         target_shape = target.array.shape
         if running_shape is None:
-            init_shape = (nbatch, *target.array.shape[-3:])
+            init_shape = (nbatch, *target.array.shape[1:])
         else:
-            assert len(running_shape) == 2, "running_shape should be a tuple of (H,W)"
+            assert (
+                len(running_shape) == conv_dim
+            ), f"running_shape should be of dim {conv_dim}"
             init_shape = (nbatch, target.array.shape[1], *running_shape)
     else:
-        raise ValueError("target.array must be 2D, 3D or 4D tensor")
+        raise ValueError(
+            f"target.array must be {conv_dim}D, {conv_dim+1}D or {conv_dim+2}D tensor"
+        )
     print("Initial shape for u:", init_shape)
 
     if not mean_field and target.array.shape[0] != init_shape[0]:
@@ -245,7 +256,9 @@ def optimize_from_maps(
                 )
             else:
                 print("Prefiltering target to remove frequencies above Nyquist")
-                l_target.array = apply_nyquist_filter(l_target.array)
+                l_target.array = apply_nyquist_filter(
+                    l_target.array, dim=tuple(range(-conv_dim, 0))
+                )
 
         l_target, mean_target, std_target = st_op_target.wavelet_op.standardize(
             l_target, mean_field=mean_field, inplace=True
@@ -318,7 +331,7 @@ def optimize_from_maps(
     if st_op_running.wavelet_op.mask_full_res is not None:
         u_opt[..., st_op_running.wavelet_op.mask_full_res.array] = torch.nan
 
-    if input_dim == 2:
+    if input_dim == conv_dim:
         u_opt = u_opt[:, 0, ...]  # remove channel dim
     if nbatch == 1:
         u_opt = u_opt[0]  # remove batch dim
@@ -360,7 +373,7 @@ def optimize_from_stats(
     print("Running synthesis on device:", device, "dtype:", dtype)
 
     # ------- Determine initial shape for u (from target stats) -------
-    Nb, Nc, N, M = target_stats.Nb, target_stats.Nc, *target_stats.N0
+    Nb, Nc = target_stats.Nb, target_stats.Nc
 
     if nbatch != Nb and not mean_field:
         raise ValueError(
@@ -370,7 +383,7 @@ def optimize_from_stats(
     if running_shape is not None:
         init_shape = (nbatch, Nc, *running_shape)
     else:
-        init_shape = (nbatch, Nc, N, M)
+        init_shape = (nbatch, Nc, target_stats.N0)
 
     print(f"Initial shape for u: {init_shape}")
 
@@ -461,7 +474,7 @@ def optimize_from_stats(
 
 #######################################################################################
 # ------- Pre/Post-processing functions -------
-def apply_nyquist_filter(tensor, plot=False):
+def apply_nyquist_filter(tensor, dim, plot=False):
     """
     Apply a low-pass filter to an input tensor, keeping only frequencies within the Nyquist radius.
 
@@ -475,40 +488,73 @@ def apply_nyquist_filter(tensor, plot=False):
     torch.Tensor
         Filtered tensor in real space of the same shape as input, with high frequencies removed
     """
-    dim = (-2, -1)
+    if dim == (-2, -1):
 
-    # Compute frequency grids
-    N, M = tensor.shape[-2:]
-    fx = N * torch.fft.fftfreq(N, d=1.0, device=tensor.device)
-    fy = M * torch.fft.fftfreq(M, d=1.0, device=tensor.device)
-    FX, FY = torch.meshgrid(fx, fy, indexing="ij")
+        # Compute frequency grids
+        N, M = tensor.shape[-2:]
+        fx = N * torch.fft.fftfreq(N, d=1.0, device=tensor.device)
+        fy = M * torch.fft.fftfreq(M, d=1.0, device=tensor.device)
+        FX, FY = torch.meshgrid(fx, fy, indexing="ij")
 
-    # Create low-pass mask based on Nyquist radius
-    r2 = FX**2 + FY**2
-    nyquist_radius = min(N, M) / 2
-    mask = r2 <= nyquist_radius**2
+        # Create low-pass mask based on Nyquist radius
+        r2 = FX**2 + FY**2
+        nyquist_radius = min(N, M) / 2
+        mask = r2 <= nyquist_radius**2
 
-    # Apply mask in Fourier space
-    tensor_fft = torch.fft.fft2(tensor, dim=dim)
-    tensor_fft[..., ~mask] = 0.0
+        # Apply mask in Fourier space
+        tensor_fft = torch.fft.fft2(tensor, dim=dim)
+        tensor_fft[..., ~mask] = 0.0
 
-    # Inverse Fourier transform to get the filtered tensor in real space
-    tensor_filtered = torch.fft.ifft2(tensor_fft, dim=dim)
+        # Inverse Fourier transform to get the filtered tensor in real space
+        tensor_filtered = torch.fft.ifft2(tensor_fft, dim=dim)
 
-    if not tensor.is_complex():
-        tensor_filtered = tensor_filtered.real
+        if not tensor.is_complex():
+            tensor_filtered = tensor_filtered.real
 
-    if plot:
-        import matplotlib.pyplot as plt
+        if plot:
+            import matplotlib.pyplot as plt
 
-        plt.imshow(
-            np.abs(torch.fft.fftshift(torch.fft.fft2(tensor[0, 0])).cpu().numpy()),
-            cmap="plasma",
-            norm="log",
-        )
-        plt.colorbar()
-        plt.title("Nyquist filtered tensor (Fourier)")
-        plt.show()
+            plt.imshow(
+                np.abs(torch.fft.fftshift(torch.fft.fft2(tensor[0, 0])).cpu().numpy()),
+                cmap="plasma",
+                norm="log",
+            )
+            plt.colorbar()
+            plt.title("Nyquist filtered tensor (Fourier)")
+            plt.show()
+
+    elif dim == (-1,):
+        # Compute frequency grids
+        (N,) = tensor.shape[-1:]
+        FX = N * torch.fft.fftfreq(N, d=1.0, device=tensor.device)
+
+        # Create low-pass mask based on Nyquist radius
+        r2 = FX**2
+        nyquist_radius = N / 2
+        mask = r2 <= nyquist_radius**2
+
+        # Apply mask in Fourier space
+        tensor_fft = torch.fft.fft(tensor, dim=dim[0])
+        tensor_fft[..., ~mask] = 0.0
+
+        # Inverse Fourier transform to get the filtered tensor in real space
+        tensor_filtered = torch.fft.ifft(tensor_fft, dim=dim[0])
+
+        if not tensor.is_complex():
+            tensor_filtered = tensor_filtered.real
+
+        if plot:
+            import matplotlib.pyplot as plt
+
+            plt.plot(
+                np.abs(torch.fft.fftshift(torch.fft.fft(tensor[0, 0])).cpu().numpy()),
+            )
+            plt.yscale("log")
+            plt.colorbar()
+            plt.title("Nyquist filtered tensor (Fourier)")
+            plt.show()
+    else:
+        raise NotImplementedError("Dim must be for now either (-2,-1) or (-1,)")
 
     return tensor_filtered
 
@@ -558,7 +604,10 @@ def synthesize_from_maps(
         )
         data_running = data_target.__class__(array=array, pbc=pbc_running)
     else:
-        if running_shape is None and data_target.array.shape[-2:] != running_mask.shape:
+        if (
+            running_shape is None
+            and data_target.array.shape[-data_target.ndim :] != running_mask.shape
+        ):
             raise ValueError("running_mask shape should match target array shape")
         elif running_shape is not None and running_shape != running_mask.shape:
             raise ValueError("running_mask shape should match running_shape")
