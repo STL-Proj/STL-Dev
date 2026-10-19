@@ -232,10 +232,10 @@ class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
                     device=device,
                     dtype=dtype,
                 )
-            self._smooth_kernel = self._smooth_kernel[
-                2, :
-            ]  # TODO: check if this is correct for 1D kernel data
-            self._smooth_kernel /= self._smooth_kernel.sum()
+                self._smooth_kernel = self._smooth_kernel[
+                    2, :
+                ]  # TODO: check if this is correct for 1D kernel data
+                self._smooth_kernel /= self._smooth_kernel.sum()
         return self._smooth_kernel
 
 

@@ -798,7 +798,7 @@ class ST_Operator:
 
         else:
             raise Exception(f"Unknown norm type: {norm}.")
-        print("before iso ", data_st.S3.shape, data_st.S4.shape)
+
         if iso:
             data_st.to_iso()
 

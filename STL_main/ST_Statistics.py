@@ -164,7 +164,7 @@ class ST_Statistics:
         Normalize the ScatCov statistics S1,S2,S3,S4
         using self.S2_ref_sqrt_chan_diag
         """
-        print("before normalization", self.S3.shape, self.S4.shape)
+
         # self.S1 = self.S1 / self.S2_ref_sqrt_chan_diag  # [Nb,Nc,J1,L1]
         self.S1 = self.S1 / bk.sqrt(
             self.S2_ref_sqrt_chan_diag[(slice(None), slice(None)) + (None,)]
@@ -215,7 +215,6 @@ class ST_Statistics:
                 + (None,) * self.nblock
             ]
         )  # [Nb,Nc,Nc,J1,J2,J3,L1,L2,L3]
-        print("after normalization", self.S3.shape, self.S4.shape)
 
     ########################################
     def to_norm(
