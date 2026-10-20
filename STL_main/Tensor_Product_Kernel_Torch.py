@@ -149,8 +149,7 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
 
             for block_id in range(self.nblock):
                 # handling of borders larger than array can be adapted depending on desired behavior
-                first_spatial_dim = array.ndim - self.ndim
-                block_start_dim = first_spatial_dim + self.start_dim[block_id]
+                block_start_dim = self.start_dim[block_id]
                 block_end_dim = block_start_dim + self.dim[block_id]
                 if False:  # conservative handling of borders larger than array
                     assert (
@@ -284,7 +283,7 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
         torch.Tensor
             Convolved data with shape [..., L, Nx, Ny].
         """
-
+     
         convolved_data = self.wavelet_ops[block_id].apply(
             data=data._as_data_class_of(block_id),
             j=j,
@@ -357,7 +356,7 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
     N0: Optional[list[tuple[int, ...]]] = None
     conv_history: list[list[int]] = None
     nblock: int = field(init=False)
-    start_dim: list[int] = field(init=False)
+    start_dim: list[int] = field(init=False) # TODO: implement as a property (non static)
 
     #    device: torch.device = field(init=False) # already defined in Base_DataClass
     #    dtype: torch.dtype = field(init=False)   # already defined in Base_DataClass
@@ -395,7 +394,7 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
         for ind in range(self.nblock):
 
             if ind == 0:
-                self.start_dim = [0]
+                self.start_dim = [self.array.ndim - self.ndim]
             else:
                 self.start_dim.append(self.start_dim[ind - 1] + self.dim[ind - 1])
 
@@ -433,9 +432,7 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
         data_class = self.data_structure[block_id]
 
         # Permute the data dimensions of the block to the last dimensions
-        first_spatial_dim = self.array.ndim - self.ndim
-
-        block_start_dim = first_spatial_dim + self.start_dim[block_id]
+        block_start_dim = self.start_dim[block_id]
         block_end_dim = block_start_dim + self.dim[block_id]
 
         dims = list(range(self.array.ndim))
@@ -479,9 +476,7 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
         # dtype is not checked because the wavelet transform may change the dtype (eg float32 -> complex64)
 
         # Permute the data dimensions back to their original order
-        first_spatial_dim = data_instance.array.ndim - self.ndim
-
-        block_start_dim = first_spatial_dim + self.start_dim[block_id]
+        block_start_dim = data_instance.array.ndim - sum(self.dim[block_id:])
 
         dims = list(range(data_instance.array.ndim))
         dims = (
@@ -493,6 +488,16 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
         transposed_array = data_instance.array.permute(dims)
 
         data = self.copy(empty=True) if not inplace else self
+        
+        if data_instance.array.ndim != self.array.ndim:
+            # update start_dim instead of herting it in case where first conv dim might have changed (eg if the data has been convolved)
+            for ind in range(self.nblock):
+                if ind == 0:
+                    start_dim = [data_instance.array.ndim - self.ndim]
+                else:
+                    start_dim.append(start_dim[ind - 1] + self.dim[ind - 1])
+            data.start_dim = start_dim
+
 
         data.array = transposed_array
         data.dtype = (

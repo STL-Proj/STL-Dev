@@ -43,6 +43,7 @@ class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
         self.WType = WType
 
         self.J = J
+
         if L is None:
             L = 1
         if L != 1:

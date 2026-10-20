@@ -401,14 +401,17 @@ class ST_Operator:
             data.array = bk.from_numpy(data.array)
 
         # Put in the expected size: (Nb, Nc, N)
-        N_DT = (
-            data.ndim
-        )  # WARNING!!!!! this will break Fourier DataClass, replace by len(N0) instead
-        #        N_DT = len(N0) # TODO replace len(N0) by data.ndim once this is implemented in Fourier DataClass
+        N_DT = data.ndim if hasattr(data, "ndim") else len(N0) # .ndim will break Fourier DataClass, replace by len(N0) for now
+#        N_DT = len(N0) # TODO replace len(N0) by data.ndim once this is implemented in Fourier DataClass
         if data.array.dim() == N_DT:
             data.array = data.array[None, None, ...]  # (1,1,N)
+            if hasattr(data, "start_dim"):
+                data.start_dim = [start_dim + 2 for start_dim in data.start_dim]
         elif data.array.dim() == N_DT + 1:
             data.array = data.array[None, ...]  # (1,Nc,N)
+            if hasattr(data, "start_dim"):
+                data.start_dim = [start_dim + 1 for start_dim in data.start_dim]
+
         Nb, Nc = data.array.shape[0], data.array.shape[1]
 
         compute_cross_matrix = (
