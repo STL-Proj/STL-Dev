@@ -147,6 +147,9 @@ class WaveletOperator2Dkernel_torch:
 
     @staticmethod
     def _get_crop_border_size_largest_scale_second_layer(data, wavelet_op):
+        assert isinstance(
+            data.pbc, bool
+        ), "data.pbc should be specified (True or False)."
         if data.pbc:
             return 0
         else:
@@ -159,6 +162,9 @@ class WaveletOperator2Dkernel_torch:
 
     @staticmethod
     def _get_crop_border_size_largest_scale_layer_flexible(data, wavelet_op):
+        assert (
+            isinstance(data.pbc, bool) or len(data.conv_history) > 0
+        ), "data.pbc should be specified for convolved data (True or False)."
         if data.pbc or len(data.conv_history) == 0:
             return 0
         else:
@@ -170,6 +176,9 @@ class WaveletOperator2Dkernel_torch:
 
     @staticmethod
     def _get_crop_border_size_fully_flexible(data, wavelet_op):
+        assert (
+            isinstance(data.pbc, bool) or len(data.conv_history) > 0
+        ), "data.pbc should be specified for convolved data (True or False)."
         if data.pbc or len(data.conv_history) == 0:
             return 0
         elif len(data.conv_history) == 1:
@@ -546,8 +555,6 @@ class WaveletOperator2Dkernel_torch:
         """
         Compute the mean on the last self.ndim dimensions.
         """
-        if data.pbc is None and len(data.conv_history) > 0:
-            raise ValueError("data.pbc should be specified (True or False).")
 
         border = self._get_crop_border_size_method(data=data, wavelet_op=self)
         cropped_array = self._crop(array=data.array, border=border)
@@ -565,8 +572,6 @@ class WaveletOperator2Dkernel_torch:
         )
 
     def square_mean(self, data, dim=None, **kwargs):  # conv_dims dependant
-        if data.pbc is None and len(data.conv_history) > 0:
-            raise ValueError("data.pbc should be specified (True or False).")
 
         border = self._get_crop_border_size_method(data=data, wavelet_op=self)
         cropped_array = self._crop(array=data.array * data.array.conj(), border=border)
@@ -591,13 +596,6 @@ class WaveletOperator2Dkernel_torch:
         Compute the covariance between data1=self and data2 on the last self.ndim
         dimensions.
         """
-
-        if (data1.pbc is None and len(data1.conv_history) > 0) or (
-            data2.pbc is None and len(data2.conv_history) > 0
-        ):
-            raise ValueError(
-                "data1.pbc and data2.pbc should be specified (True or False)."
-            )
 
         assert data1.dg == data2.dg, "data1 and data2 must have the same resolution."
         dim = (

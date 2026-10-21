@@ -105,9 +105,11 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
         else:
             slices = [slice(None)] * (array.ndim - self.ndim)
 
+            block_start_dim = (
+                array.ndim - self.ndim
+            )  # need to recompute start_dim instead of using self.start_dim because the array may have been convolved
             for block_id in range(self.nblock):
                 # handling of borders larger than array can be adapted depending on desired behavior
-                block_start_dim = self.start_dim[block_id]
                 block_end_dim = block_start_dim + self.dim[block_id]
                 if False:  # conservative handling of borders larger than array
                     assert (
@@ -143,9 +145,14 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
                 else:  # simple handling of borders larger than array: empty maskmean will return nan
                     pass
                 # crop the array along the dimensions [block_start_dim:block_end_dim]
-                slices += [slice(border[block_id], -border[block_id])] * self.dim[
-                    block_id
-                ]
+                slices += [
+                    (
+                        slice(border[block_id], -border[block_id])
+                        if border[block_id] > 0
+                        else slice(None)
+                    )
+                ] * self.dim[block_id]
+                block_start_dim = block_end_dim
 
             return array[tuple(slices)]
 
