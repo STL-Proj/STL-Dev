@@ -292,91 +292,8 @@ class ST_Operator_TensorProd(ST_Operator):
                             redundant_channels=False,
                         )  # (Nb,Nc,Nc,L1,L2,L3)
 
-            # Downsample inplace at Nj3x
-            block_id = 0  # downsample first dimension
-
-            if next_j3[block_id] is not None and j3[block_id] < next_j3[block_id]:
-
-                print(
-                    f"j3={j3} | block_id: {block_id} | downsampling l_data_multi_res[{block_id}]"
-                )
-                self.wavelet_op.downsample(
-                    data=l_data_multi_res[block_id],
-                    dg_out=self.wavelet_op.wavelet_ops[block_id].j_to_dg[
-                        j3[block_id] + 1
-                    ],
-                    block_id=block_id,
-                    inplace=True,
-                    replace_nan_value=self.replace_nan_value,
-                )  # (Nb,Nc,j3x+1,j3y,...,j3z,L,N3)
-
-                # remove children that are not needed anymore
-                for child_block_id in range(block_id, l_data.nblock):
-                    print(
-                        f"j3={j3} | block_id: {block_id} | deleting data_l1[{j3[:child_block_id + 1]}]"
-                    )
-                    del data_l1[j3[: child_block_id + 1]]
-                    assert j3[: child_block_id + 1] not in data_l1
-
-                for j2 in j3_range:
-
-                    # for key_bloc_id in range(l_data.nblock):
-                    #    self.wavelet_op.downsample(
-                    #        data=data_l1[j2[:key_bloc_id + 1]],
-                    #        dg_out=self.wavelet_op.wavelet_ops[block_id].j_to_dg[j3[block_id] + 1],
-                    #        block_id=block_id,
-                    #        inplace=True,
-                    #        replace_nan_value=self.replace_nan_value,
-                    #    )  # (Nb,Nc,j3x+1,j3y,...,j3z,L,N3)
-
-                    for ind, val in enumerate(data_l1m_multi_res[j2]):
-                        if val is None:
-                            print(
-                                f"j3={j3} | block_id: {block_id} | j2={j2} | before data_l1m_multi_res[{j2}][{ind}] is None"
-                            )
-                        else:
-                            print(
-                                f"j3={j3} | block_id: {block_id} | j2={j2} | before data_l1m_multi_res[{j2}][{ind}].conv_history: {val.conv_history} | dg: {val.dg}"
-                            )
-
-                    print(
-                        f"j3={j3} | block_id: {block_id} | j2={j2} | downsampling data_l1m_multi_res[{j2}][{0}]"
-                    )
-                    self.wavelet_op.downsample(
-                        data=data_l1m_multi_res[j2][0],
-                        dg_out=self.wavelet_op.wavelet_ops[block_id].j_to_dg[
-                            j3[block_id] + 1
-                        ],
-                        block_id=block_id,
-                        inplace=True,
-                        replace_nan_value=self.replace_nan_value,
-                    )  # (Nb,Nc,j3x+1,j3y,...,j3z,L,N3)
-
-                    for ind in range(1, len(data_l1m_multi_res[j2])):
-                        print(
-                            f"j3={j3} | block_id: {block_id} | j2={j2} | deleting data_l1m_multi_res[{j2}][{ind}]"
-                        )
-                        obj = data_l1m_multi_res[j2][ind]
-                        data_l1m_multi_res[j2][ind] = None
-                        del obj
-                        assert data_l1m_multi_res[j2][ind] is None
-
-                    for ind, val in enumerate(data_l1m_multi_res[j2]):
-                        if val is None:
-                            print(
-                                f"j3={j3} | block_id: {block_id} | j2={j2} | before data_l1m_multi_res[{j2}][{ind}] is None"
-                            )
-                        else:
-                            print(
-                                f"j3={j3} | block_id: {block_id} | j2={j2} | before data_l1m_multi_res[{j2}][{ind}].conv_history: {val.conv_history} | dg: {val.dg}"
-                            )
-
-                print(f"j3={j3} | block_id: {block_id} | deleting entirely data_l1m_l2")
-                del data_l1m_l2  # j3x=j3[0] part of the loop done,free memory for next one: j3x=j3[0]+1
-                data_l1m_l2 = {}
-
-            # Downsample inplace at Nj3_block_id for block_id in range(1, l_data.nblock)
-            for block_id in range(1, l_data.nblock):
+            # Downsample inplace at Nj3_block_id for all block_id in range(l_data.nblock)
+            for block_id in range(l_data.nblock):
                 if next_j3[block_id] is not None and j3[block_id] < next_j3[block_id]:
 
                     print(
@@ -392,18 +309,19 @@ class ST_Operator_TensorProd(ST_Operator):
                         replace_nan_value=self.replace_nan_value,
                     )  # (Nb,Nc,j3x+1,j3y+1,...,j3[block_id]+1,j3[block_id+1],...,j3z,L,N3)
 
-                    print(
-                        f"j3={j3} | block_id: {block_id} | downsampling data_l1[{j3[:block_id]}]",
-                    )
-                    self.wavelet_op.downsample(
-                        data=data_l1[j3[:block_id]],
-                        dg_out=self.wavelet_op.wavelet_ops[block_id].j_to_dg[
-                            j3[block_id] + 1
-                        ],
-                        block_id=block_id,
-                        inplace=True,
-                        replace_nan_value=self.replace_nan_value,
-                    )  # (Nb,Nc,j3x+1,...,j3[block_id]+1,j3[block_id+1],...,j3z,L,N3)
+                    if block_id > 0:
+                        print(
+                            f"j3={j3} | block_id: {block_id} | downsampling data_l1[{j3[:block_id]}]",
+                        )
+                        self.wavelet_op.downsample(
+                            data=data_l1[j3[:block_id]],
+                            dg_out=self.wavelet_op.wavelet_ops[block_id].j_to_dg[
+                                j3[block_id] + 1
+                            ],
+                            block_id=block_id,
+                            inplace=True,
+                            replace_nan_value=self.replace_nan_value,
+                        )  # (Nb,Nc,j3x+1,...,j3[block_id]+1,j3[block_id+1],...,j3z,L,N3)
 
                     # remove children that are not needed anymore
                     for child_block_id in range(block_id, l_data.nblock):
@@ -414,9 +332,7 @@ class ST_Operator_TensorProd(ST_Operator):
                         assert j3[: child_block_id + 1] not in data_l1
 
                     for j2 in j3_range:
-                        print(
-                            f"j3={j3} | block_id: {block_id} | j2={j2} | data_l1m_multi_res[j2]="
-                        )
+
                         for ind, val in enumerate(data_l1m_multi_res[j2]):
                             if val is None:
                                 print(
@@ -426,13 +342,22 @@ class ST_Operator_TensorProd(ST_Operator):
                                 print(
                                     f"j3={j3} | block_id: {block_id} | j2={j2} | before data_l1m_multi_res[{j2}][{ind}].conv_history: {val.conv_history} | dg: {val.dg}"
                                 )
-                        if len(data_l1m_multi_res[j2]) > 1:
-                            block_id_loc_in_list = 1 + sum(
-                                [
-                                    1 if j3[test_block_id] < J[test_block_id] - 1 else 0
-                                    for test_block_id in range(1, block_id)
-                                ]
-                            )
+
+                        if len(data_l1m_multi_res[j2]) > 1 or block_id == 0:
+
+                            if block_id == 0:
+                                block_id_loc_in_list = 0
+                            else:
+                                block_id_loc_in_list = 1 + sum(
+                                    [
+                                        (
+                                            1
+                                            if j3[test_block_id] < J[test_block_id] - 1
+                                            else 0
+                                        )
+                                        for test_block_id in range(1, block_id)
+                                    ]
+                                )
 
                             # populating the None blocks from 0 (always populated) to block_id_loc_in_list included
                             for intermediate_block_id_loc_in_list in range(
@@ -454,6 +379,7 @@ class ST_Operator_TensorProd(ST_Operator):
                                     ].copy(
                                         empty=False
                                     )
+
                             print(
                                 f"j3={j3} | block_id: {block_id} | j2={j2} | downsampling data_l1m_multi_res[{j2}][{block_id_loc_in_list}]"
                             )
@@ -479,31 +405,38 @@ class ST_Operator_TensorProd(ST_Operator):
                                 del obj
                                 assert data_l1m_multi_res[j2][ind] is None
 
-                            # for ind, obj in enumerate(data_l1m_multi_res[j2][block_id_loc_in_list + 1:]):
-                            #    data_l1m_multi_res[j2][block_id_loc_in_list + 1:][ind] = None
-                            #    del obj
-                            #    assert data_l1m_multi_res[j2][block_id_loc_in_list + 1:][ind] is None
-
-                            print(
-                                f"j3={j3} | block_id: {block_id} | j2={j2} | downsampling data_l1m_l2[({j3[:block_id]}, {j2})] of shape: {data_l1m_l2[(j3[:block_id], j2)].array.shape}"
-                            )
-                            self.wavelet_op.downsample(
-                                data=data_l1m_l2[(j3[:block_id], j2)],
-                                dg_out=self.wavelet_op.wavelet_ops[block_id].j_to_dg[
-                                    j3[block_id] + 1
-                                ],
-                                block_id=block_id,
-                                inplace=True,
-                                replace_nan_value=self.replace_nan_value,
-                            )  # (Nb,Nc,j3x+1,...,j3[block_id]+1,j3[block_id+1],...,j3z,L,N3) ############################################
+                            if block_id > 0:
+                                print(
+                                    f"j3={j3} | block_id: {block_id} | j2={j2} | downsampling data_l1m_l2[({j3[:block_id]}, {j2})] of shape: {data_l1m_l2[(j3[:block_id], j2)].array.shape}"
+                                )
+                                self.wavelet_op.downsample(
+                                    data=data_l1m_l2[(j3[:block_id], j2)],
+                                    dg_out=self.wavelet_op.wavelet_ops[
+                                        block_id
+                                    ].j_to_dg[j3[block_id] + 1],
+                                    block_id=block_id,
+                                    inplace=True,
+                                    replace_nan_value=self.replace_nan_value,
+                                )  # (Nb,Nc,j3x+1,...,j3[block_id]+1,j3[block_id+1],...,j3z,L,N3) ############################################
 
                             # remove children that are not needed anymore
-                            for child_block_id in range(block_id, l_data.nblock):
+                            if block_id == 0:
+                                # in this case the delete loop can be replaced by a single delete of the entire dict
                                 print(
-                                    f"j3={j3} | block_id: {block_id} | j2={j2} | deleting data_l1m_l2[({j3[:child_block_id+1]}, {j2})]"
+                                    f"j3={j3} | block_id: {block_id} | deleting entirely data_l1m_l2"
                                 )
-                                del data_l1m_l2[(j3[: child_block_id + 1], j2)]
-                                assert (j3[: child_block_id + 1], j2) not in data_l1m_l2
+                                del data_l1m_l2  # j3x=j3[0] part of the loop done, free memory for next one: j3x=j3[0]+1
+                                data_l1m_l2 = {}
+                            else:
+                                for child_block_id in range(block_id, l_data.nblock):
+                                    print(
+                                        f"j3={j3} | block_id: {block_id} | j2={j2} | deleting data_l1m_l2[({j3[:child_block_id+1]}, {j2})]"
+                                    )
+                                    del data_l1m_l2[(j3[: child_block_id + 1], j2)]
+                                    assert (
+                                        j3[: child_block_id + 1],
+                                        j2,
+                                    ) not in data_l1m_l2
 
                 elif (next_j3[block_id] is None) or (j3[block_id] > next_j3[block_id]):
                     to_del = l_data_multi_res[block_id]

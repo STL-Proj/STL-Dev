@@ -82,48 +82,6 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
         self.L = [wavelet_op.L for wavelet_op in self.wavelet_ops]
         self.WType = [wavelet_op.WType for wavelet_op in self.wavelet_ops]
 
-    def old__init__(
-        self,
-        data_structure,
-        nblock,
-        dim,
-        ndim,
-        start_dim,
-        DT,
-        device,
-        dtype,
-        list_of_wavelet_op_kwargs,
-        mask_full_res=None,
-    ):
-        self.data_structure = data_structure
-        self.nblock = nblock
-        self.dim = dim
-        self.ndim = ndim
-        self.start_dim = start_dim
-        self.DT = DT
-        self.device = device
-        self.dtype = dtype
-        self.mask_full_res = mask_full_res
-
-        wavelet_ops = []
-        for ind, data_class in enumerate(self.data_structure):
-            wavelet_op = data_class.wavelet_op_class(
-                **list_of_wavelet_op_kwargs[ind],
-                device=self.device,
-                dtype=self.dtype,
-                mask_full_res=self.mask_full_res,
-            )
-            # self.DT[ind] is not sent to the wavelet operator, so we check that the DT of the wavelet operator matches the DT of the data class
-            assert (
-                wavelet_op.DT == self.DT[ind]
-            ), f"Wavelet operator DT mismatch: {wavelet_op.DT} != {self.DT[ind]}"
-            wavelet_ops.append(wavelet_op)
-        self.wavelet_ops = wavelet_ops
-
-        self._get_crop_border_size_method = (
-            self.__class__._get_crop_border_size_from_children
-        )
-
     def _crop(self, array, border):  # conv_dims dependant
         """
         Crops an array by removing 'border' pixels from each side
@@ -283,7 +241,7 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
         torch.Tensor
             Convolved data with shape [..., L, Nx, Ny].
         """
-     
+
         convolved_data = self.wavelet_ops[block_id].apply(
             data=data._as_data_class_of(block_id),
             j=j,
@@ -356,7 +314,9 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
     N0: Optional[list[tuple[int, ...]]] = None
     conv_history: list[list[int]] = None
     nblock: int = field(init=False)
-    start_dim: list[int] = field(init=False) # TODO: implement as a property (non static)
+    start_dim: list[int] = field(
+        init=False
+    )  # TODO: implement as a property (non static)
 
     #    device: torch.device = field(init=False) # already defined in Base_DataClass
     #    dtype: torch.dtype = field(init=False)   # already defined in Base_DataClass
@@ -488,7 +448,7 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
         transposed_array = data_instance.array.permute(dims)
 
         data = self.copy(empty=True) if not inplace else self
-        
+
         if data_instance.array.ndim != self.array.ndim:
             # update start_dim instead of herting it in case where first conv dim might have changed (eg if the data has been convolved)
             for ind in range(self.nblock):
@@ -497,7 +457,6 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
                 else:
                     start_dim.append(start_dim[ind - 1] + self.dim[ind - 1])
             data.start_dim = start_dim
-
 
         data.array = transposed_array
         data.dtype = (
@@ -542,46 +501,6 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
             mask_full_res=mask_full_res,
             *args,
             **kwargs,
-        )
-
-    def get_wavelet_op_old(
-        self,
-        mask_full_res=None,
-        list_of_wavelet_op_kwargs=None,
-    ):
-        if list_of_wavelet_op_kwargs is None:
-            list_of_wavelet_op_kwargs = [{}] * self.nblock
-
-        assert isinstance(
-            list_of_wavelet_op_kwargs, list
-        ), "list_of_wavelet_op_kwargs must be a list"
-        assert (
-            len(list_of_wavelet_op_kwargs) == self.nblock
-        ), f"list_of_wavelet_op_kwargs must have length {self.nblock}"
-
-        for ind in range(self.nblock):
-            if "J" not in list_of_wavelet_op_kwargs[ind].keys():
-                list_of_wavelet_op_kwargs[ind]["J"] = (
-                    int(np.log2(min(self.N0[ind]))) - 2
-                )
-
-        if mask_full_res is None:
-            if torch.any(self.array.isnan()):
-                mask_full_res = self.__class__(
-                    array=self.array.isnan(), data_structure=self.data_structure
-                )
-
-        return self.__class__.wavelet_op_class(
-            data_structure=self.data_structure,
-            nblock=self.nblock,
-            dim=self.dim,
-            ndim=self.ndim,
-            start_dim=self.start_dim,
-            DT=self.DT,
-            device=self.device,
-            dtype=self.dtype,
-            list_of_wavelet_op_kwargs=list_of_wavelet_op_kwargs,
-            mask_full_res=mask_full_res,
         )
 
     def get_ST_op(self, *args, **kwargs):
