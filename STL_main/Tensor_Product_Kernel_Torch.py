@@ -2,7 +2,7 @@
 # - extension to non tensor prod nan mask
 # - extension to to tendor prod channels (eg bathy, daylight, etc)
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 import numpy as np
 import torch
@@ -19,7 +19,57 @@ from STL_main.torch_backend import (
 )
 
 
+@dataclass
+class DimHandler:
+
+    _dim: list[int] = field(init=False)
+    _ndim: int = field(init=False)
+    _nblock: int = field(init=False)
+    _start_dim_buffer: dict[int, list[int]] = field(init=False)
+
+    def __init__(self, dim):
+        self._dim = dim
+        self._ndim = sum(dim)
+        self._nblock = len(dim)
+        self._start_dim_buffer = {}  # buffer for start_dim computation
+
+    @property
+    def dim(self) -> list[int]:
+        return self._dim
+
+    @property
+    def ndim(self) -> int:
+        return self._ndim
+
+    @property
+    def nblock(self) -> int:
+        return self._nblock
+
+    def _compute_start_dim(self, array_ndim) -> list[int]:
+        start_dim = [array_ndim - self.ndim]
+        for ind in range(1, self.nblock):
+            start_dim.append(start_dim[ind - 1] + self.dim[ind - 1])
+        return start_dim
+
+    def start_dim(self, array_ndim) -> list[int]:
+        if array_ndim not in self._start_dim_buffer:
+            self._start_dim_buffer[array_ndim] = self._compute_start_dim(array_ndim)
+        return self._start_dim_buffer[array_ndim]
+
+
 class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
+
+    @property
+    def dim(self) -> list[int]:
+        return self._dim_handler.dim
+
+    @property
+    def nblock(self) -> int:
+        return self._dim_handler.nblock
+
+    @property
+    def ndim(self) -> int:
+        return self._dim_handler.ndim
 
     @staticmethod
     def _get_crop_border_size_from_children(data, wavelet_op):
@@ -33,10 +83,6 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
     def __init__(
         self,
         data_structure,
-        nblock,
-        dim,
-        ndim,
-        start_dim,
         J,
         DT,
         device,
@@ -45,10 +91,10 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
         **kwargs,
     ):
         self.data_structure = data_structure
-        self.nblock = nblock
-        self.dim = dim
-        self.ndim = ndim
-        self.start_dim = start_dim
+        self._dim_handler = DimHandler(
+            dim=[data_class.ndim for data_class in self.data_structure]
+        )
+        self.start_dim = self._dim_handler.start_dim  # method copy
         self.DT = DT
         self.device = device
         self.dtype = dtype
@@ -105,11 +151,9 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
         else:
             slices = [slice(None)] * (array.ndim - self.ndim)
 
-            block_start_dim = (
-                array.ndim - self.ndim
-            )  # need to recompute start_dim instead of using self.start_dim because the array may have been convolved
             for block_id in range(self.nblock):
                 # handling of borders larger than array can be adapted depending on desired behavior
+                block_start_dim = self.start_dim(array.ndim)[block_id]
                 block_end_dim = block_start_dim + self.dim[block_id]
                 if False:  # conservative handling of borders larger than array
                     assert (
@@ -152,7 +196,6 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
                         else slice(None)
                     )
                 ] * self.dim[block_id]
-                block_start_dim = block_end_dim
 
             return array[tuple(slices)]
 
@@ -314,36 +357,76 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
     #    array: (  # already defined in Base_DataClass
     #        torch.Tensor
     #    )  # Other types will be converted to torch.Tensor in __post_init__ if possible
-    data_structure: list[Any] = None
-
-    pbc: Optional[list[bool]] = None
-    dg: Optional[list[int]] = None
-    N0: Optional[list[tuple[int, ...]]] = None
-    conv_history: list[list[int]] = None
-    nblock: int = field(init=False)
-    start_dim: list[int] = field(
-        init=False
-    )  # TODO: implement as a property (non static)
+    data_structure: list[Any] | None = field(
+        default=None, metadata={"help": "List of data classes for each block"}
+    )
+    pbc: Optional[list[bool]] | None = field(
+        default=None,
+        metadata={"help": "List of periodic boundary condition for each block"},
+    )
+    dg: Optional[list[int]] | None = field(
+        default=None, metadata={"help": "List of downsampling factor for each block"}
+    )
+    N0: Optional[list[tuple[int, ...]]] | None = field(
+        default=None, metadata={"help": "List of shape for each block"}
+    )
+    conv_history: list[list[int]] | None = field(
+        default=None, metadata={"help": "List of convolution history for each block"}
+    )
 
     #    device: torch.device = field(init=False) # already defined in Base_DataClass
     #    dtype: torch.dtype = field(init=False)   # already defined in Base_DataClass
 
     DT: list[str] = field(init=False)
-    dim: list[int] = field(init=False)  # list of intrinsic dimensions of the data
-    ndim: int = field(init=False)  # overrides class attribute of Base_DataClass
+    _dim_handler: DimHandler = field(init=False)
+
+    @property
+    def dim(self) -> list[int]:
+        return self._dim_handler.dim
+
+    @property
+    def nblock(self) -> int:
+        return self._dim_handler.nblock
+
+    @property
+    def ndim(self) -> int:
+        return self._dim_handler.ndim
+
+    @property
+    def start_dim(self) -> list[int]:
+        return self._dim_handler.start_dim(self.array.ndim)
+
+    @classmethod
+    def _get_frozen_class_from_data_structure(cls, data_structure_arg):
+        class FrozenClassFromDataStructure(cls):
+            data_structure: ClassVar[list[Any]] = data_structure_arg
+
+        frozen_class_name = f"Frozen[{cls.__name__}]@({' x '.join(data_class.__name__ for data_class in data_structure_arg)})"
+        FrozenClassFromDataStructure.__name__ = frozen_class_name
+        FrozenClassFromDataStructure.__qualname__ = frozen_class_name
+
+        return FrozenClassFromDataStructure
 
     def __post_init__(self):
-
+        if self.data_structure is None:
+            assert hasattr(
+                self.__class__, "data_structure"
+            ), "data_structure must be provided either as an instance attribute or as a class attribute"
+            self.data_structure = self.__class__.data_structure
+        if hasattr(self.__class__, "data_structure"):
+            assert (self.__class__.data_structure is None) or (
+                self.__class__.data_structure == self.data_structure
+            ), f"data_structure at class level: {self.__class__.data_structure} must be None or match the one of instance: {self.data_structure}"
         assert self.data_structure is not None
         assert isinstance(self.data_structure, list)
-        self.nblock = len(self.data_structure)
-        assert self.nblock > 0
+        assert len(self.data_structure) > 0
 
         self.array = self._to_array(self.array)
 
         self.DT = [data_class.DT for data_class in self.data_structure]
-        self.dim = [data_class.ndim for data_class in self.data_structure]
-        self.ndim = sum(self.dim)
+        self._dim_handler = DimHandler(
+            dim=[data_class.ndim for data_class in self.data_structure]
+        )
 
         if self.pbc is None:
             self.pbc = [None] * self.nblock
@@ -360,11 +443,6 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
 
         for ind in range(self.nblock):
 
-            if ind == 0:
-                self.start_dim = [self.array.ndim - self.ndim]
-            else:
-                self.start_dim.append(self.start_dim[ind - 1] + self.dim[ind - 1])
-
             if self.dg[ind] is None:
                 self.dg[ind] = 0
                 self.N0[ind] = self.array.shape[
@@ -380,6 +458,10 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
 
         self.device = self.array.device
         self.dtype = self.array.dtype
+
+        self.__class__ = self.__class__._get_frozen_class_from_data_structure(
+            self.data_structure
+        )
 
     def _as_data_class_of(self, block_id):
         """
@@ -456,15 +538,6 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
 
         data = self.copy(empty=True) if not inplace else self
 
-        if data_instance.array.ndim != self.array.ndim:
-            # update start_dim instead of herting it in case where first conv dim might have changed (eg if the data has been convolved)
-            for ind in range(self.nblock):
-                if ind == 0:
-                    start_dim = [data_instance.array.ndim - self.ndim]
-                else:
-                    start_dim.append(start_dim[ind - 1] + self.dim[ind - 1])
-            data.start_dim = start_dim
-
         data.array = transposed_array
         data.dtype = (
             data_instance.dtype
@@ -497,10 +570,6 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
 
         return self.__class__.wavelet_op_class(
             data_structure=self.data_structure,
-            nblock=self.nblock,
-            dim=self.dim,
-            ndim=self.ndim,
-            start_dim=self.start_dim,
             J=J,
             DT=self.DT,
             device=self.device,

@@ -16,6 +16,7 @@ class ST_Operator_TensorProd(ST_Operator):
         channels_with_auto_stats,
         compute_cross_matrix,
         has_fewer_convolutions,
+        verbose=False,
     ):
 
         ########################################
@@ -51,13 +52,21 @@ class ST_Operator_TensorProd(ST_Operator):
         )  # [(0, ..., 0), (0, ..., 1), ..., (Jx-1, ..., Jz-1)] lexicographic order
 
         for j3, next_j3 in zip(J_range, J_range[1:] + [(None,) * len(J)]):
-            print(
-                f"\n****************** NEW ITERATION ******************\nj3={j3}, next_j3={next_j3}"
+            (
+                print(
+                    f"\n****************** NEW ITERATION ******************\nj3={j3}, next_j3={next_j3}"
+                )
+                if verbose > 0
+                else None
             )
 
             for block_id in range(1, l_data.nblock):
-                print(
-                    f"j3={j3} | block_id={block_id} | copying l_data_multi_res[{block_id - 1}] to l_data_multi_res[{block_id}]"
+                (
+                    print(
+                        f"j3={j3} | block_id={block_id} | copying l_data_multi_res[{block_id - 1}] to l_data_multi_res[{block_id}]"
+                    )
+                    if verbose > 1
+                    else None
                 )
                 if l_data_multi_res[block_id] is None:
                     l_data_multi_res[block_id] = l_data_multi_res[block_id - 1].copy(
@@ -68,16 +77,24 @@ class ST_Operator_TensorProd(ST_Operator):
             # Compute first convolution and modulus
             for block_id, j3_block in enumerate(j3):
                 if j3[: block_id + 1] not in data_l1:
-                    print(
-                        f"j3={j3} | block_id={block_id} | computing first convolution: data_l1[{j3[: block_id + 1]}]"
+                    (
+                        print(
+                            f"j3={j3} | block_id={block_id} | computing first convolution: data_l1[{j3[: block_id + 1]}]"
+                        )
+                        if verbose > 1
+                        else None
                     )
                     data_l1[j3[: block_id + 1]] = self.wavelet_op.apply(
                         l_data_to_use if block_id == 0 else data_l1[j3[:block_id]],
                         j=j3_block,
                         block_id=block_id,
                     )  # (Nb,Nc,L,Nx_3,...,Nblock_id_3,...,Nz)
-                print(
-                    f"j3={j3} | block_id={block_id} | data_l1[{j3[: block_id + 1]}].conv_history: {data_l1[j3[: block_id + 1]].conv_history} | dg: {data_l1[j3[: block_id + 1]].dg}"
+                (
+                    print(
+                        f"j3={j3} | block_id={block_id} | data_l1[{j3[: block_id + 1]}].conv_history: {data_l1[j3[: block_id + 1]].conv_history} | dg: {data_l1[j3[: block_id + 1]].dg}"
+                    )
+                    if verbose > 1
+                    else None
                 )
 
             data_l1m_multi_res[j3] = [
@@ -91,8 +108,12 @@ class ST_Operator_TensorProd(ST_Operator):
             )
             data_l1m[j3] = data_l1m_multi_res[j3][0]  # (Nb,Nc,L,Nx_3,...,Nz_3)
             for key, val in data_l1m.items():
-                print(
-                    f"j3={j3} | data_l1m[{key}].conv_history: {val.conv_history} | dg: {val.dg}"
+                (
+                    print(
+                        f"j3={j3} | data_l1m[{key}].conv_history: {val.conv_history} | dg: {val.dg}"
+                    )
+                    if verbose > 1
+                    else None
                 )
 
             if False and self.wavelet_op.mask_full_res is not None:
@@ -104,7 +125,7 @@ class ST_Operator_TensorProd(ST_Operator):
             ##############################################################################
             ########################## S1(j3) = Mean(|I*psi3|) ###########################
             ##############################################################################
-            print(f"j3={j3} | computing S1")
+            print(f"j3={j3} | computing S1") if verbose > 0 else None
 
             #            data_st.S1[:, channels_with_auto_stats, j3, :] = self.wavelet_op.mean(
             #                data_l1m[j3][:, channels_with_auto_stats, :, :],
@@ -147,7 +168,7 @@ class ST_Operator_TensorProd(ST_Operator):
             ##############################################################################
             ######################### S2(j3) = Mean(|I*psi3|^2) ##########################
             ##############################################################################
-            print(f"j3={j3} | computing S2")
+            print(f"j3={j3} | computing S2") if verbose > 0 else None
             # auto S2 terms
             data_st.S2[
                 (
@@ -188,8 +209,12 @@ class ST_Operator_TensorProd(ST_Operator):
                 for block_id, j3_block in enumerate(j3):
 
                     if (j3[: block_id + 1], j2) not in data_l1m_l2:
-                        print(
-                            f"j3={j3} | j2={j2} | block_id={block_id} | computing second convolution: data_l1m_l2[({j3[: block_id + 1]}, {j2})]"
+                        (
+                            print(
+                                f"j3={j3} | j2={j2} | block_id={block_id} | computing second convolution: data_l1m_l2[({j3[: block_id + 1]}, {j2})]"
+                            )
+                            if verbose > 2
+                            else None
                         )
                         data_l1m_l2[(j3[: block_id + 1], j2)] = self.wavelet_op.apply(
                             (
@@ -202,8 +227,12 @@ class ST_Operator_TensorProd(ST_Operator):
                         )  # (Nb,Nc,L2,L3,Nx_3,...,Nblock_id_3,...,Nz_2)
                         for key, val in data_l1m_l2.items():
                             if key[1] == j2:
-                                print(
-                                    f"j3={j3} | j2={j2} | block_id={block_id} | data_l1m_l2[{key}].conv_history: {val.conv_history} | dg: {val.dg}"
+                                (
+                                    print(
+                                        f"j3={j3} | j2={j2} | block_id={block_id} | data_l1m_l2[{key}].conv_history: {val.conv_history} | dg: {val.dg}"
+                                    )
+                                    if verbose > 2
+                                    else None
                                 )
 
                 # data_l1m_l2[(j3, j2)] of shape (Nb,Nc,L2,L3,Nx_3,...,Nz_3)
@@ -219,7 +248,13 @@ class ST_Operator_TensorProd(ST_Operator):
                 ##############################################################################
                 ################### S3(j2,j3) = Cov(|I*psi2|*psi3, I*psi3) ###################
                 ##############################################################################
-                print(f"j3={j3} | j2={j2} | computing S3 and S4 (over none printed j1)")
+                (
+                    print(
+                        f"j3={j3} | j2={j2} | computing S3 and S4 (over none printed j1)"
+                    )
+                    if verbose > 1
+                    else None
+                )
                 if not has_fewer_convolutions:
                     self.wavelet_op._compute_and_store_cross_cov(
                         data_l1m_l2[(j3, j2)],
@@ -296,8 +331,12 @@ class ST_Operator_TensorProd(ST_Operator):
             for block_id in range(l_data.nblock):
                 if next_j3[block_id] is not None and j3[block_id] < next_j3[block_id]:
 
-                    print(
-                        f"j3={j3} | block_id: {block_id} | downsampling l_data_multi_res[{block_id}]"
+                    (
+                        print(
+                            f"j3={j3} | block_id: {block_id} | downsampling l_data_multi_res[{block_id}]"
+                        )
+                        if verbose > 1
+                        else None
                     )
                     self.wavelet_op.downsample(
                         data=l_data_multi_res[block_id],
@@ -310,8 +349,12 @@ class ST_Operator_TensorProd(ST_Operator):
                     )  # (Nb,Nc,j3x+1,j3y+1,...,j3[block_id]+1,j3[block_id+1],...,j3z,L,N3)
 
                     if block_id > 0:
-                        print(
-                            f"j3={j3} | block_id: {block_id} | downsampling data_l1[{j3[:block_id]}]",
+                        (
+                            print(
+                                f"j3={j3} | block_id: {block_id} | downsampling data_l1[{j3[:block_id]}]",
+                            )
+                            if verbose > 1
+                            else None
                         )
                         self.wavelet_op.downsample(
                             data=data_l1[j3[:block_id]],
@@ -325,8 +368,12 @@ class ST_Operator_TensorProd(ST_Operator):
 
                     # remove children that are not needed anymore
                     for child_block_id in range(block_id, l_data.nblock):
-                        print(
-                            f"j3={j3} | block_id: {block_id} | deleting data_l1[{j3[:child_block_id + 1]}]"
+                        (
+                            print(
+                                f"j3={j3} | block_id: {block_id} | deleting data_l1[{j3[:child_block_id + 1]}]"
+                            )
+                            if verbose > 1
+                            else None
                         )
                         del data_l1[j3[: child_block_id + 1]]
                         assert j3[: child_block_id + 1] not in data_l1
@@ -335,12 +382,20 @@ class ST_Operator_TensorProd(ST_Operator):
 
                         for ind, val in enumerate(data_l1m_multi_res[j2]):
                             if val is None:
-                                print(
-                                    f"j3={j3} | block_id: {block_id} | j2={j2} | before data_l1m_multi_res[{j2}][{ind}] is None"
+                                (
+                                    print(
+                                        f"j3={j3} | block_id: {block_id} | j2={j2} | before data_l1m_multi_res[{j2}][{ind}] is None"
+                                    )
+                                    if verbose > 2
+                                    else None
                                 )
                             else:
-                                print(
-                                    f"j3={j3} | block_id: {block_id} | j2={j2} | before data_l1m_multi_res[{j2}][{ind}].conv_history: {val.conv_history} | dg: {val.dg}"
+                                (
+                                    print(
+                                        f"j3={j3} | block_id: {block_id} | j2={j2} | before data_l1m_multi_res[{j2}][{ind}].conv_history: {val.conv_history} | dg: {val.dg}"
+                                    )
+                                    if verbose > 2
+                                    else None
                                 )
 
                         if len(data_l1m_multi_res[j2]) > 1 or block_id == 0:
@@ -369,8 +424,12 @@ class ST_Operator_TensorProd(ST_Operator):
                                     ]
                                     is None
                                 ):
-                                    print(
-                                        f"j3={j3} | block_id: {block_id} | j2={j2} | copying data_l1m_multi_res[{j2}] block_id {intermediate_block_id_loc_in_list - 1} to {intermediate_block_id_loc_in_list}"
+                                    (
+                                        print(
+                                            f"j3={j3} | block_id: {block_id} | j2={j2} | copying data_l1m_multi_res[{j2}] block_id {intermediate_block_id_loc_in_list - 1} to {intermediate_block_id_loc_in_list}"
+                                        )
+                                        if verbose > 2
+                                        else None
                                     )
                                     data_l1m_multi_res[j2][
                                         intermediate_block_id_loc_in_list
@@ -380,8 +439,12 @@ class ST_Operator_TensorProd(ST_Operator):
                                         empty=False
                                     )
 
-                            print(
-                                f"j3={j3} | block_id: {block_id} | j2={j2} | downsampling data_l1m_multi_res[{j2}][{block_id_loc_in_list}]"
+                            (
+                                print(
+                                    f"j3={j3} | block_id: {block_id} | j2={j2} | downsampling data_l1m_multi_res[{j2}][{block_id_loc_in_list}]"
+                                )
+                                if verbose > 2
+                                else None
                             )
                             self.wavelet_op.downsample(
                                 data=data_l1m_multi_res[j2][block_id_loc_in_list],
@@ -397,8 +460,12 @@ class ST_Operator_TensorProd(ST_Operator):
                             for ind in range(
                                 block_id_loc_in_list + 1, len(data_l1m_multi_res[j2])
                             ):
-                                print(
-                                    f"j3={j3} | block_id: {block_id} | j2={j2} | deleting data_l1m_multi_res[{j2}][{ind}]"
+                                (
+                                    print(
+                                        f"j3={j3} | block_id: {block_id} | j2={j2} | deleting data_l1m_multi_res[{j2}][{ind}]"
+                                    )
+                                    if verbose > 2
+                                    else None
                                 )
                                 obj = data_l1m_multi_res[j2][ind]
                                 data_l1m_multi_res[j2][ind] = None
@@ -406,8 +473,12 @@ class ST_Operator_TensorProd(ST_Operator):
                                 assert data_l1m_multi_res[j2][ind] is None
 
                             if block_id > 0:
-                                print(
-                                    f"j3={j3} | block_id: {block_id} | j2={j2} | downsampling data_l1m_l2[({j3[:block_id]}, {j2})] of shape: {data_l1m_l2[(j3[:block_id], j2)].array.shape}"
+                                (
+                                    print(
+                                        f"j3={j3} | block_id: {block_id} | j2={j2} | downsampling data_l1m_l2[({j3[:block_id]}, {j2})] of shape: {data_l1m_l2[(j3[:block_id], j2)].array.shape}"
+                                    )
+                                    if verbose > 2
+                                    else None
                                 )
                                 self.wavelet_op.downsample(
                                     data=data_l1m_l2[(j3[:block_id], j2)],
@@ -422,15 +493,23 @@ class ST_Operator_TensorProd(ST_Operator):
                             # remove children that are not needed anymore
                             if block_id == 0:
                                 # in this case the delete loop can be replaced by a single delete of the entire dict
-                                print(
-                                    f"j3={j3} | block_id: {block_id} | deleting entirely data_l1m_l2"
+                                (
+                                    print(
+                                        f"j3={j3} | block_id: {block_id} | deleting entirely data_l1m_l2"
+                                    )
+                                    if verbose > 1
+                                    else None
                                 )
                                 del data_l1m_l2  # j3x=j3[0] part of the loop done, free memory for next one: j3x=j3[0]+1
                                 data_l1m_l2 = {}
                             else:
                                 for child_block_id in range(block_id, l_data.nblock):
-                                    print(
-                                        f"j3={j3} | block_id: {block_id} | j2={j2} | deleting data_l1m_l2[({j3[:child_block_id+1]}, {j2})]"
+                                    (
+                                        print(
+                                            f"j3={j3} | block_id: {block_id} | j2={j2} | deleting data_l1m_l2[({j3[:child_block_id+1]}, {j2})]"
+                                        )
+                                        if verbose > 2
+                                        else None
                                     )
                                     del data_l1m_l2[(j3[: child_block_id + 1], j2)]
                                     assert (
@@ -449,21 +528,37 @@ class ST_Operator_TensorProd(ST_Operator):
             for j2 in j3_range:
                 for ind, val in enumerate(data_l1m_multi_res[j2]):
                     if val is None:
-                        print(
-                            f"j3={j3} | block_id: {block_id} | j2={j2} | after data_l1m_multi_res[{j2}][{ind}] is None"
+                        (
+                            print(
+                                f"j3={j3} | block_id: {block_id} | j2={j2} | after data_l1m_multi_res[{j2}][{ind}] is None"
+                            )
+                            if verbose > 2
+                            else None
                         )
                     else:
-                        print(
-                            f"j3={j3} | block_id: {block_id} | j2={j2} | after data_l1m_multi_res[{j2}][{ind}].conv_history: {val.conv_history} | dg: {val.dg}"
+                        (
+                            print(
+                                f"j3={j3} | block_id: {block_id} | j2={j2} | after data_l1m_multi_res[{j2}][{ind}].conv_history: {val.conv_history} | dg: {val.dg}"
+                            )
+                            if verbose > 2
+                            else None
                         )
-                print(
-                    f"j3={j3} | block_id: {block_id} | j2={j2} | SETTING data_l1m[{j2}] to last non-None value in data_l1m_multi_res[{j2}] at index {len([val for val in data_l1m_multi_res[j2] if val is not None]) - 1}"
+                (
+                    print(
+                        f"j3={j3} | block_id: {block_id} | j2={j2} | SETTING data_l1m[{j2}] to last non-None value in data_l1m_multi_res[{j2}] at index {len([val for val in data_l1m_multi_res[j2] if val is not None]) - 1}"
+                    )
+                    if verbose > 2
+                    else None
                 )
                 data_l1m[j2] = [
                     val for val in data_l1m_multi_res[j2] if val is not None
                 ][-1]
-                print(
-                    f"j3={j3} | block_id: {block_id} | j2={j2} | data_l1m[{j2}].conv_history: {data_l1m[j2].conv_history} | dg: {data_l1m[j2].dg}"
+                (
+                    print(
+                        f"j3={j3} | block_id: {block_id} | j2={j2} | data_l1m[{j2}].conv_history: {data_l1m[j2].conv_history} | dg: {data_l1m[j2].dg}"
+                    )
+                    if verbose > 2
+                    else None
                 )
 
         return data_st

@@ -570,6 +570,8 @@ def synthesize_from_maps(
     has_fewer_convolutions=False,
     compute_cross_matrix=None,
     mean_field=True,
+    compute_PS=True,
+    prefilter_Nyquist=True,
     **optim_kwargs,
 ):
     """
@@ -596,6 +598,13 @@ def synthesize_from_maps(
         This is particularly useful for syntheses involving NaN values, as it allows the use of two distinct masks: one for the target and one for the running map.
         For other types of syntheses, the same ST operator is used for both.
     """
+    if hasattr(data_target, "nblock") and isinstance(
+        pbc_running, bool
+    ):  # tensor product data structure case
+        print(
+            "⚠️ Warning: pbc_running is a boolean. It will be converted to\na list of booleans with length equal to the number of dimension blocks of the target data."
+        )
+        pbc_running = [pbc_running] * data_target.nblock
 
     if running_mask is None:
         # Same mask for running and target
@@ -615,42 +624,86 @@ def synthesize_from_maps(
         data_running = data_target.__class__(array=running_mask, pbc=pbc_running)
 
     # Select J used for synthesis
-    J_target = data_target.get_wavelet_op().J - (not data_target.pbc)
-    J_running = data_running.get_wavelet_op().J - (not data_running.pbc)
-    J = min(J_target, J_running)
+    J_target = data_target.get_wavelet_op().J
+    J_running = data_running.get_wavelet_op().J
 
-    n_bins_target = data_target.get_CS_op().n_bins
-    n_bins_running = data_running.get_CS_op().n_bins
-    n_bins = min(n_bins_target, n_bins_running)
+    if isinstance(J_target, int) and isinstance(J_running, int):
+        J_target -= not data_target.pbc
+        J_running -= not data_running.pbc
+        J = min(J_target, J_running)
+    elif isinstance(J_target, list) and isinstance(
+        J_running, list
+    ):  # tensor product data structure case
+        J_target = [
+            block_J - (not block_pbc)
+            for block_J, block_pbc in zip(J_target, data_target.pbc)
+        ]
+        J_running = [
+            block_J - (not block_pbc)
+            for block_J, block_pbc in zip(J_running, data_running.pbc)
+        ]
+        J = [
+            min(block_J_target, block_J_running)
+            for block_J_target, block_J_running in zip(J_target, J_running)
+        ]
+    else:
+        raise ValueError(
+            f"J_target and J_running should be both int or both list, got {type(J_target)} and {type(J_running)}"
+        )
 
     if J_target != J_running:
         print(
             f"Warning: target.J = {J_target}, running.J = {J_running}. Synthesis will use J = {J}."
         )
 
+    if compute_PS:
+        # Disable power spectrum optimization if NaN values are present in target and/or running data
+        target_has_nan = data_target.array.isnan().any()
+        running_has_nan = data_running.array.isnan().any()
+
+        if target_has_nan or running_has_nan:
+            print(
+                "⚠️ Warning: NaN detected in target and/or running data.\n"
+                "Power spectrum optimization is disabled because its computation is not yet implemented for NaN values in any dataclass. \n"
+            )
+            compute_PS = False
+
+    if compute_PS:
+        n_bins_target = data_target.get_CS_op().n_bins
+        n_bins_running = data_running.get_CS_op().n_bins
+        n_bins = (
+            min(n_bins_target, n_bins_running)
+            if isinstance(n_bins_target, int) and isinstance(n_bins_running, int)
+            else [
+                min(block_n_bins_target, block_n_bins_running)
+                for block_n_bins_target, block_n_bins_running in zip(
+                    n_bins_target, n_bins_running
+                )
+            ]
+        )
+    else:
+        n_bins = None
+
     # Get scattering operators for target and running data with selected J
     st_op_target = data_target.get_ST_op(
-        J=J, n_bins=n_bins, has_fewer_convolutions=has_fewer_convolutions
+        J=J,
+        compute_PS=compute_PS,
+        n_bins=n_bins,
+        has_fewer_convolutions=has_fewer_convolutions,
     )
 
     st_op_running = data_running.get_ST_op(
         J=J,
+        compute_PS=compute_PS,
         n_bins=n_bins,
         has_fewer_convolutions=has_fewer_convolutions,
         replace_nan_value=None,
     )
 
-    # Disable power spectrum optimization if NaN values are present in target and/or running data
-    target_has_nan = data_target.array.isnan().any()
-    running_has_nan = data_running.array.isnan().any()
-
-    if target_has_nan or running_has_nan:
-        print(
-            "⚠️ Warning: NaN detected in target and/or running data.\n"
-            "Power spectrum optimization is disabled because its computation is not yet implemented for NaN values in any dataclass. \n"
-        )
-
-    compute_PS = not (target_has_nan or running_has_nan)
+    if prefilter_Nyquist:
+        prefilter_Nyquist = (
+            True if init_running is None else not init_running.isnan.any()
+        )  # TODO: why do we check init_running.isnan.any() here but data_running.array.isnan().any() above for PS
 
     # Set default optimization parameters and update with user-provided values
     optim_params = dict(
@@ -660,9 +713,7 @@ def synthesize_from_maps(
         print_iter=10,
         verbose=True,
         seed=26,
-        prefilter_Nyquist=(
-            True if init_running is None else not init_running.isnan.any()
-        ),
+        prefilter_Nyquist=prefilter_Nyquist,
         adhoc_weights={"S3": 3.5, "S4": 3.5**2},
     )
     optim_params.update(optim_kwargs)

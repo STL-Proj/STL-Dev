@@ -254,6 +254,7 @@ class ST_Operator:
         PS_ref_sqrt_chan_diag=None,
         var_ref=None,
         compute_cross_matrix=None,
+        verbose=False,
     ):
         """
         Compute the Scattering Transform (ST) of data, which are either stored
@@ -318,7 +319,7 @@ class ST_Operator:
                 - for c1 > c2, compute_cross_matrix[c1,c2] is ignored and should not be specified
             If None, it is replaced by a boolean matrix full of True, so that all cross-statistics are computed.
 
-
+        - verbose : bool, default False
         Output
         ----------
         - data_st : ST_Statistics instance, or 1D array
@@ -401,16 +402,14 @@ class ST_Operator:
             data.array = bk.from_numpy(data.array)
 
         # Put in the expected size: (Nb, Nc, N)
-        N_DT = data.ndim if hasattr(data, "ndim") else len(N0) # .ndim will break Fourier DataClass, replace by len(N0) for now
-#        N_DT = len(N0) # TODO replace len(N0) by data.ndim once this is implemented in Fourier DataClass
+        N_DT = (
+            data.ndim if hasattr(data, "ndim") else len(N0)
+        )  # .ndim will break Fourier DataClass, replace by len(N0) for now
+        #        N_DT = len(N0) # TODO replace len(N0) by data.ndim once this is implemented in Fourier DataClass
         if data.array.dim() == N_DT:
             data.array = data.array[None, None, ...]  # (1,1,N)
-            if hasattr(data, "start_dim"):
-                data.start_dim = [start_dim + 2 for start_dim in data.start_dim]
         elif data.array.dim() == N_DT + 1:
             data.array = data.array[None, ...]  # (1,Nc,N)
-            if hasattr(data, "start_dim"):
-                data.start_dim = [start_dim + 1 for start_dim in data.start_dim]
 
         Nb, Nc = data.array.shape[0], data.array.shape[1]
 
@@ -510,6 +509,7 @@ class ST_Operator:
             channels_with_auto_stats,
             compute_cross_matrix,
             has_fewer_convolutions,
+            verbose=verbose,
         )
 
         data_st = self._finalize_compute(
@@ -541,6 +541,7 @@ class ST_Operator:
         channels_with_auto_stats,
         compute_cross_matrix,
         has_fewer_convolutions,
+        verbose=False,
     ):
 
         ########################################
