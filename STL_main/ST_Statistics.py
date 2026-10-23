@@ -109,7 +109,7 @@ class ST_Statistics:
 
         # Wavelet transform related parameters
         self.wavelet_op = wavelet_op
-        self.nblock = wavelet_op.nblock
+        self.nblock = getattr(wavelet_op, "nblock", 1)
         self.J = self.wavelet_op.J
         self.L = self.wavelet_op.L
         self.WType = self.wavelet_op.WType

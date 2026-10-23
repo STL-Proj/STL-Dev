@@ -163,7 +163,7 @@ class WaveletOperator2Dkernel_torch:
     @staticmethod
     def _get_crop_border_size_largest_scale_layer_flexible(data, wavelet_op):
         assert (
-            isinstance(data.pbc, bool) or len(data.conv_history) > 0
+            isinstance(data.pbc, bool) or len(data.conv_history) == 0
         ), "data.pbc should be specified for convolved data (True or False)."
         if data.pbc or len(data.conv_history) == 0:
             return 0
@@ -177,7 +177,7 @@ class WaveletOperator2Dkernel_torch:
     @staticmethod
     def _get_crop_border_size_fully_flexible(data, wavelet_op):
         assert (
-            isinstance(data.pbc, bool) or len(data.conv_history) > 0
+            isinstance(data.pbc, bool) or len(data.conv_history) == 0
         ), "data.pbc should be specified for convolved data (True or False)."
         if data.pbc or len(data.conv_history) == 0:
             return 0

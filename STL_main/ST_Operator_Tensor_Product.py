@@ -27,12 +27,6 @@ class ST_Operator_TensorProd(ST_Operator):
         # S3 = Cov(|I*psi1|*psi2, I*psi2)
         # S4 = Cov(|I*psi1|*psi3, |I*psi2|*psi3)
 
-        # WARNING !! This is the version coded by JMD, that should be correct
-        # for all DataTypes
-
-        # See at the bottom of this file for the previous versions developped
-        # for FFT
-
         l_data_multi_res = [
             None
         ] * l_data.nblock  # list of l_data for each block_id, to be used in the loop over j3
@@ -269,6 +263,7 @@ class ST_Operator_TensorProd(ST_Operator):
                     )  # (Nb,Nc,Nc,L2,L3)
 
                 else:
+                    raise NotImplementedError
                     # Sihao S3 version : S3(j1,j2,j3) = Cov(I, |I*psi2|*psi3)
                     self.wavelet_op._compute_and_store_cross_cov(
                         l_data_to_use[
@@ -310,6 +305,7 @@ class ST_Operator_TensorProd(ST_Operator):
                         )  # (Nb,Nc,Nc,L1,L2,L3)
 
                     else:
+                        raise NotImplementedError
                         # Sihao S4 version : S4(j1,j2,j3) = Cov(|I*psi1|, |I*psi2|*psi3)
                         self.wavelet_op._compute_and_store_cross_cov(
                             data_l1m[j1][
