@@ -547,6 +547,34 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
 
         return data
 
+    def apply_nyquist_filter(self, inplace=False, plot=False):
+        """
+        Apply a low-pass filter to self.array, keeping only frequencies within the Nyquist radius.
+
+        Parameters
+        ----------
+        inplace : bool, optional
+            If True, modifies the instance in place. Default is False.
+        plot : bool, optional
+            If True, plots the filtered tensor in the frequency domain. Default is False.
+
+        Returns
+        -------
+        instance of self.__class__
+            Filtered tensor in real space of the same shape as input, with high frequencies removed.
+        """
+        data_filtered = self.copy(empty=False) if not inplace else self
+
+        for block_id in range(self.nblock):
+            partial_data_filtered = self._as_data_class_of(
+                block_id
+            ).apply_nyquist_filter(inplace=True, plot=plot)
+            data_filtered = data_filtered._from_data_class_of(
+                block_id, partial_data_filtered, inplace=True
+            )
+
+        return data_filtered
+
     def get_wavelet_op(
         self,
         J=None,

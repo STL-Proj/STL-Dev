@@ -64,8 +64,8 @@ class ScatteringMatchModel(nn.Module):
             assert (
                 not self.u.isnan().any()
             ), "Cannot apply Nyquist filter on intial map with NaNs. Either remove NaNs from the initial map or specify prefilter_Nyquist=False."
-            self.u = apply_nyquist_filter(
-                self.u, dim=tuple(range(-self.DataClass.ndim, 0))
+            self.u = (
+                self.DataClass(array=self.u).apply_nyquist_filter(inplace=True).array
             )
 
         # === Apply mask constraints ===
@@ -256,9 +256,7 @@ def optimize_from_maps(
                 )
             else:
                 print("Prefiltering target to remove frequencies above Nyquist")
-                l_target.array = apply_nyquist_filter(
-                    l_target.array, dim=tuple(range(-conv_dim, 0))
-                )
+                l_target = l_target.apply_nyquist_filter(inplace=True)
 
         l_target, mean_target, std_target = st_op_target.wavelet_op.standardize(
             l_target, mean_field=mean_field, inplace=True
@@ -470,93 +468,6 @@ def optimize_from_stats(
         u_opt = u_opt[0]  # remove batch dim
 
     return u_opt
-
-
-#######################################################################################
-# ------- Pre/Post-processing functions -------
-def apply_nyquist_filter(tensor, dim, plot=False):
-    """
-    Apply a low-pass filter to an input tensor, keeping only frequencies within the Nyquist radius.
-
-    Parameters
-    ----------
-    tensor : torch.Tensor
-        Input tensor in real space of shape (..., N, M) where N and M are the spatial dimensions
-
-    Returns
-    -------
-    torch.Tensor
-        Filtered tensor in real space of the same shape as input, with high frequencies removed
-    """
-    if dim == (-2, -1):
-
-        # Compute frequency grids
-        N, M = tensor.shape[-2:]
-        fx = N * torch.fft.fftfreq(N, d=1.0, device=tensor.device)
-        fy = M * torch.fft.fftfreq(M, d=1.0, device=tensor.device)
-        FX, FY = torch.meshgrid(fx, fy, indexing="ij")
-
-        # Create low-pass mask based on Nyquist radius
-        r2 = FX**2 + FY**2
-        nyquist_radius = min(N, M) / 2
-        mask = r2 <= nyquist_radius**2
-
-        # Apply mask in Fourier space
-        tensor_fft = torch.fft.fft2(tensor, dim=dim)
-        tensor_fft[..., ~mask] = 0.0
-
-        # Inverse Fourier transform to get the filtered tensor in real space
-        tensor_filtered = torch.fft.ifft2(tensor_fft, dim=dim)
-
-        if not tensor.is_complex():
-            tensor_filtered = tensor_filtered.real
-
-        if plot:
-            import matplotlib.pyplot as plt
-
-            plt.imshow(
-                np.abs(torch.fft.fftshift(torch.fft.fft2(tensor[0, 0])).cpu().numpy()),
-                cmap="plasma",
-                norm="log",
-            )
-            plt.colorbar()
-            plt.title("Nyquist filtered tensor (Fourier)")
-            plt.show()
-
-    elif dim == (-1,):
-        # Compute frequency grids
-        (N,) = tensor.shape[-1:]
-        FX = N * torch.fft.fftfreq(N, d=1.0, device=tensor.device)
-
-        # Create low-pass mask based on Nyquist radius
-        r2 = FX**2
-        nyquist_radius = N / 2
-        mask = r2 <= nyquist_radius**2
-
-        # Apply mask in Fourier space
-        tensor_fft = torch.fft.fft(tensor, dim=dim[0])
-        tensor_fft[..., ~mask] = 0.0
-
-        # Inverse Fourier transform to get the filtered tensor in real space
-        tensor_filtered = torch.fft.ifft(tensor_fft, dim=dim[0])
-
-        if not tensor.is_complex():
-            tensor_filtered = tensor_filtered.real
-
-        if plot:
-            import matplotlib.pyplot as plt
-
-            plt.plot(
-                np.abs(torch.fft.fftshift(torch.fft.fft(tensor[0, 0])).cpu().numpy()),
-            )
-            plt.yscale("log")
-            plt.colorbar()
-            plt.title("Nyquist filtered tensor (Fourier)")
-            plt.show()
-    else:
-        raise NotImplementedError("Dim must be for now either (-2,-1) or (-1,)")
-
-    return tensor_filtered
 
 
 # === User-friendly wrapper for synthesis from target maps (high level) ===

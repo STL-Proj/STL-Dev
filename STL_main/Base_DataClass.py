@@ -175,4 +175,115 @@ class Base_DataClass(ABC):
         """
         pass
 
+    #######################################################################################
+    # ------- Pre/Post-processing functions -------
+    def apply_nyquist_filter(self, inplace=False, plot=False):
+        """
+        Apply a low-pass filter to self.array, keeping only frequencies within the Nyquist radius.
+        The filter is applied along the last self.ndim dimensions.
+
+        Parameters
+        ----------
+        self : Base_DataClass
+            The instance of the class to which the method is applied.
+        plot : bool, optional
+            If True, plot the filtered tensor in the frequency domain.
+
+        Returns
+        -------
+        instance of self.__class__
+            Filtered tensor in real space of the same shape as input, with high frequencies removed
+        """
+        assert (
+            not self.array.isnan().any()
+        ), "Cannot apply Nyquist filter on map with NaNs."
+
+        dim = tuple(
+            range(-self.__class__.ndim, 0)
+        )  # dimensions to apply the Fourier transform
+        print(
+            f"Applying Nyquist filter on dimensions {dim} of the array with shape {self.array.shape}"
+        )
+
+        if dim == (-2, -1):
+
+            # Compute frequency grids
+            N, M = self.array.shape[-2:]
+            fx = N * torch.fft.fftfreq(N, d=1.0, device=self.array.device)
+            fy = M * torch.fft.fftfreq(M, d=1.0, device=self.array.device)
+            FX, FY = torch.meshgrid(fx, fy, indexing="ij")
+
+            # Create low-pass mask based on Nyquist radius
+            r2 = FX**2 + FY**2
+            nyquist_radius = min(N, M) / 2
+            mask = r2 <= nyquist_radius**2
+
+            # Apply mask in Fourier space
+            tensor_fft = torch.fft.fft2(self.array, dim=dim)
+            tensor_fft[..., ~mask] = 0.0
+
+            # Inverse Fourier transform to get the filtered tensor in real space
+            tensor_filtered = torch.fft.ifft2(tensor_fft, dim=dim)
+
+            if not self.array.is_complex():
+                tensor_filtered = tensor_filtered.real
+
+            if plot:
+                import matplotlib.pyplot as plt
+
+                plt.imshow(
+                    np.abs(
+                        torch.fft.fftshift(torch.fft.fft2(self.array[0, 0]))
+                        .cpu()
+                        .numpy()
+                    ),
+                    cmap="plasma",
+                    norm="log",
+                )
+                plt.colorbar()
+                plt.title("Nyquist filtered tensor (Fourier)")
+                plt.show()
+
+        elif dim == (-1,):
+            # Compute frequency grids
+            (N,) = self.array.shape[-1:]
+            FX = N * torch.fft.fftfreq(N, d=1.0, device=self.array.device)
+
+            # Create low-pass mask based on Nyquist radius
+            r2 = FX**2
+            nyquist_radius = N / 2
+            mask = r2 <= nyquist_radius**2
+
+            # Apply mask in Fourier space
+            tensor_fft = torch.fft.fft(self.array, dim=dim[0])
+            tensor_fft[..., ~mask] = 0.0
+
+            # Inverse Fourier transform to get the filtered tensor in real space
+            tensor_filtered = torch.fft.ifft(tensor_fft, dim=dim[0])
+
+            if not self.array.is_complex():
+                tensor_filtered = tensor_filtered.real
+
+            if plot:
+                import matplotlib.pyplot as plt
+
+                plt.plot(
+                    np.abs(
+                        torch.fft.fftshift(torch.fft.fft(self.array[0, 0]))
+                        .cpu()
+                        .numpy()
+                    ),
+                )
+                plt.yscale("log")
+                plt.colorbar()
+                plt.title("Nyquist filtered tensor (Fourier)")
+                plt.show()
+        else:
+            raise NotImplementedError("Dim must be for now either (-2,-1) or (-1,)")
+
+        data_filtered = self.copy(empty=True) if not inplace else self
+        data_filtered.array = tensor_filtered
+
+        return data_filtered
+
     # TODO: add get_ST_op and get_PS_op when instance methods are implemented in STL_2D_Kernel_Torch
