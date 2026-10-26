@@ -201,9 +201,6 @@ class Base_DataClass(ABC):
         dim = tuple(
             range(-self.__class__.ndim, 0)
         )  # dimensions to apply the Fourier transform
-        print(
-            f"Applying Nyquist filter on dimensions {dim} of the array with shape {self.array.shape}"
-        )
 
         if dim == (-2, -1):
 

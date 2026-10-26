@@ -1524,16 +1524,25 @@ class CS_operator_2D_Kernel_Torch:
         l_data.array = torch.fft.fftshift(l_data.array, dim=(-2, -1))  # [Nb, Nc, N, M]
 
         # Put in the expected shape if not already (should be already done in ST_op apply)
-        if l_data.array.ndim == 2:
-            l_data.array = l_data.array[None, None, :, :]  # [1, 1, N, M]
-        elif l_data.array.ndim == 3:
-            l_data.array = l_data.array[None, :, :, :]  # [1, Nc, N, M]
+        if False:
+            if l_data.array.ndim == l_data.ndim:
+                l_data.array = l_data.array[None, None, ...]  # [1, 1, ..., N, M]
+            elif l_data.array.ndim == l_data.ndim + 1:
+                l_data.array = l_data.array[None, ...]  # [1, Nc, ..., N, M]
+            else:
+                raise NotImplementedError(
+                    f"Data array has unexpected shape {l_data.array.shape}."
+                )
 
-        Nb, Nc, N, M = l_data.array.shape
+        Nb, Nc = l_data.array.shape[:2]
         n_bins = self.n_bins
 
         cross_spectrum = (
-            bk.zeros((Nb, Nc, Nc, n_bins), dtype=bk._DEFAULT_COMPLEX_DTYPE) + bk.nan
+            bk.zeros(
+                (Nb, Nc, Nc) + l_data.array.shape[3 : -l_data.ndim] + (n_bins,),
+                dtype=bk._DEFAULT_COMPLEX_DTYPE,
+            )
+            + bk.nan
         )
 
         compute_cross_spectrum_matrix = (
@@ -1548,12 +1557,13 @@ class CS_operator_2D_Kernel_Torch:
 
             cross_vals = (
                 torch.einsum(
-                    "jxy,bcxy,bdxy->bcdj",
+                    "jxy,bc...xy,bd...xy->bcd...j",
                     self.bin_masks.to(dtype=l_data.array.dtype),
                     l_data.array,
                     torch.conj(l_data.array),
                 )
-                / bin_norm[None, None, None, :]
+                #                / bin_norm[None, None, None, :]
+                / bin_norm[..., :]
             ).to(dtype=bk._DEFAULT_COMPLEX_DTYPE)
 
             # Symetric part is redundant and then not filled as cross_spectrum(c1, c2) and cross_spectrum(c2, c1) are conjugates
@@ -1561,7 +1571,7 @@ class CS_operator_2D_Kernel_Torch:
                 :, compute_cross_spectrum_matrix, :
             ]
 
-            return cross_spectrum  # [Nb, Nc, Nc, n_bins]
+            return cross_spectrum  # [Nb, Nc, Nc, ..., n_bins]
 
         if get_crop_border_size_method == "flexible_crop":
             border = self.crop_borders  # [n_bins]

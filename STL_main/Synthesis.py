@@ -582,16 +582,19 @@ def synthesize_from_maps(
     if compute_PS:
         n_bins_target = data_target.get_CS_op().n_bins
         n_bins_running = data_running.get_CS_op().n_bins
-        n_bins = (
-            min(n_bins_target, n_bins_running)
-            if isinstance(n_bins_target, int) and isinstance(n_bins_running, int)
-            else [
+        if isinstance(n_bins_target, int) and isinstance(n_bins_running, int):
+            n_bins = min(n_bins_target, n_bins_running)
+        elif isinstance(n_bins_target, list) and isinstance(n_bins_running, list):
+            n_bins = [
                 min(block_n_bins_target, block_n_bins_running)
                 for block_n_bins_target, block_n_bins_running in zip(
                     n_bins_target, n_bins_running
                 )
             ]
-        )
+        else:
+            raise ValueError(
+                f"n_bins_target and n_bins_running should be both int or both list, got {type(n_bins_target)} and {type(n_bins_running)}"
+            )
     else:
         n_bins = None
 

@@ -343,7 +343,163 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
 
 
 class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
-    pass
+
+    @property
+    def dim(self) -> list[int]:
+        return self._dim_handler.dim
+
+    @property
+    def nblock(self) -> int:
+        return self._dim_handler.nblock
+
+    @property
+    def ndim(self) -> int:
+        return self._dim_handler.ndim
+
+    def __init__(
+        self,
+        data_structure,
+        shape,
+        DT,
+        device,
+        dtype,
+        mask_full_res=None,
+        **kwargs,
+    ):
+        self.data_structure = data_structure
+        self._dim_handler = DimHandler(
+            dim=[data_class.ndim for data_class in self.data_structure]
+        )
+        self.start_dim = self._dim_handler.start_dim  # method copy
+        self.DT = DT
+        self.device = device
+        self.dtype = dtype
+        self.mask_full_res = mask_full_res
+
+        if mask_full_res is not None:
+            raise NotImplementedError(
+                "mask_full_res is not yet implemented for tensor product cross spectrum operators."
+            )
+
+        for key, value in kwargs.items():
+            if value is None:
+                kwargs[key] = [None] * self.nblock
+            assert isinstance(kwargs[key], list), f"{key} must be a list"
+
+        cs_ops = []
+        for ind, data_class in enumerate(self.data_structure):
+            cs_op = data_class.cs_op_class(
+                shape=shape[ind],
+                DT=self.DT[ind],
+                device=self.device,
+                dtype=self.dtype,
+                **{key: kwargs[key][ind] for key in kwargs.keys()},
+            )
+            # self.DT[ind] is not sent to the cross spectrum operator, so we check that the DT of the cross spectrum operator matches the DT of the data class
+            assert (
+                cs_op.DT == self.DT[ind]
+            ), f"Cross spectrum operator DT mismatch: {cs_op.DT} != {self.DT[ind]}"
+            cs_ops.append(cs_op)
+
+        self.cs_ops = cs_ops
+
+        self.n_bins = [cs_op.n_bins for cs_op in self.cs_ops]
+
+    def apply(
+        self,
+        data,
+        compute_cross_spectrum_matrix=None,
+        get_crop_border_size_method=None,
+        cross_spectrum_method=None,
+        **kwargs,
+    ):
+
+        if not isinstance(get_crop_border_size_method, list):
+            get_crop_border_size_method = [
+                get_crop_border_size_method
+            ] * self.nblock  # default to the same method for all blocks
+
+        if not isinstance(cross_spectrum_method, list):
+            cross_spectrum_method = [
+                cross_spectrum_method
+            ] * self.nblock  # default to the same method for all blocks
+
+        result_data = data.copy(
+            empty=False
+        )  # initialize result_data with the same structure as data, but empty
+        if result_data.array.ndim == result_data.ndim:
+            result_data.array = result_data.array[
+                None, None, None, ...
+            ]  # [Nb=1, Nc=1, Nc=1]
+        elif result_data.array.ndim == result_data.ndim + 1:
+            result_data.array = result_data.array[
+                None, :, None, ...
+            ]  # [Nb=1, Nc=Nc, Nc=1]
+        elif result_data.array.ndim == result_data.ndim + 2:
+            result_data.array = result_data.array[
+                :, :, None, ...
+            ]  # [Nb=Nb, Nc=Nc, Nc=Nc]
+        else:
+            raise NotImplementedError(
+                f"Data array has unexpected shape {result_data.array.shape} with ndim={result_data.ndim}."
+            )
+
+        for block_id in range(self.nblock):
+
+            input_data = result_data._as_data_class_of(block_id)
+
+            block_cross_spectrum = self.cs_ops[block_id].apply(
+                data=input_data,
+                compute_cross_spectrum_matrix=compute_cross_spectrum_matrix,
+                get_crop_border_size_method=get_crop_border_size_method[block_id],
+                cross_spectrum_method=cross_spectrum_method[block_id],
+                **{key: kwargs[key][block_id] for key in kwargs.keys()},
+            )
+
+            # small hack to use the same data class for the cross spectrum as for the input data, even if the cross spectrum has less dimensions than the input data (eg 1D cross spectrum from 2D input data)
+            if block_cross_spectrum.ndim < input_data.array.ndim:
+                # if the cross spectrum number of dimensions is less than the input data, we need to add the missing dimensions back
+                block_cross_spectrum = block_cross_spectrum[
+                    (Ellipsis,)
+                    + (None,) * (input_data.array.ndim - block_cross_spectrum.ndim)
+                ]  # add necessary dimensions at the end
+            elif block_cross_spectrum.ndim > input_data.array.ndim:
+                raise ValueError(
+                    f"block_cross_spectrum.ndim ({block_cross_spectrum.ndim}) > input_data.array.ndim ({input_data.array.ndim})."
+                )
+            else:
+                pass
+            assert (
+                block_cross_spectrum.ndim == input_data.array.ndim
+            ), f"block_cross_spectrum.ndim ({block_cross_spectrum.ndim}) != input_data.array.ndim ({input_data.array.ndim})."
+
+            result_data = result_data._from_data_class_of(
+                block_id, input_data.__class__(array=block_cross_spectrum), inplace=True
+            )
+
+        result_tensor = result_data.array
+
+        # revert the small hack by squeezing the dimensions that were added back to the cross spectrum
+        ps_related_dims = result_data.nblock
+        ps_non_related_dims = result_tensor.ndim - result_data.ndim
+        expected_ndim = ps_related_dims + ps_non_related_dims
+
+        if result_tensor.ndim > expected_ndim:
+            result_tensor = result_tensor.squeeze(
+                dim=tuple(
+                    [
+                        ps_non_related_dims + dim
+                        for dim in range(result_tensor.ndim - ps_non_related_dims)
+                        if not ps_non_related_dims + dim in result_data.start_dim
+                    ]
+                )
+            )
+
+        assert (
+            result_tensor.ndim == expected_ndim
+        ), f"result_tensor.ndim ({result_tensor.ndim}) != expected_ndim ({expected_ndim})."
+
+        return result_tensor
 
 
 @dataclass
@@ -612,11 +768,21 @@ class STL_TensorProd_Kernel_Torch(STL_2D_Kernel_Torch):
         return ST_Operator_TensorProd(data_example=self, *args, **kwargs)
 
     ###############################################################################
-    def get_CS_op(self, *args, **kwargs):
+    def get_CS_op(self, mask_full_res=None, *args, **kwargs):
 
-        raise NotImplementedError
+        if mask_full_res is None:
+            if torch.any(self.array.isnan()):
+                mask_full_res = self.__class__(
+                    array=self.array.isnan(), data_structure=self.data_structure
+                )
 
-
-#        return self.__class__.cs_op_class(
-#            shape=self.N0, device=self.device, dtype=self.dtype, *args, **kwargs
-#        )
+        return self.__class__.cs_op_class(
+            data_structure=self.data_structure,
+            shape=self.N0,
+            DT=self.DT,
+            device=self.device,
+            dtype=self.dtype,
+            mask_full_res=mask_full_res,
+            *args,
+            **kwargs,
+        )
