@@ -616,8 +616,8 @@ def synthesize_from_maps(
 
     if prefilter_Nyquist:
         prefilter_Nyquist = (
-            True if init_running is None else not init_running.isnan.any()
-        )  # TODO: why do we check init_running.isnan.any() here but data_running.array.isnan().any() above for PS
+            True if init_running is None else not init_running.isnan().any()
+        )  # TODO: why do we check init_running.isnan().any() here but data_running.array.isnan().any() above for PS
 
     # Set default optimization parameters and update with user-provided values
     optim_params = dict(
@@ -715,7 +715,7 @@ def synthesize_from_stats(
         verbose=True,
         seed=26,
         prefilter_Nyquist=(
-            True if init_running is None else not init_running.isnan.any()
+            True if init_running is None else not init_running.isnan().any()
         ),
         adhoc_weights={"S3": 3.5, "S4": 3.5**2},
     )
