@@ -438,7 +438,7 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         elif result_data.array.ndim == result_data.ndim + 2:
             result_data.array = result_data.array[
                 :, :, None, ...
-            ]  # [Nb=Nb, Nc=Nc, Nc=Nc]
+            ]  # [Nb=Nb, Nc=Nc, Nc=1]
         else:
             raise NotImplementedError(
                 f"Data array has unexpected shape {result_data.array.shape} with ndim={result_data.ndim}."

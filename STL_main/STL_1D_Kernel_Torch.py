@@ -386,17 +386,26 @@ class CS_operator_1D_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         # Ensure data is in Fourier space
         l_data = data.copy(empty=False)
         l_data.array = torch.fft.fft(
-            l_data.array, norm="ortho"
+            l_data.array, norm="ortho", dim=tuple(range(-self.ndim, 0))[0]  # [..., N]
         )  # copy of data in Fourier space
-        l_data.array = torch.fft.fftshift(l_data.array, dim=(-1,))  # [Nb, Nc, N]
+        l_data.array = torch.fft.fftshift(
+            l_data.array, dim=tuple(range(-self.ndim, 0))
+        )  # [..., N]
 
         # Put in the expected shape if not already (should be already done in ST_op apply)
-
         if False:
             if l_data.array.ndim == l_data.ndim:
-                l_data.array = l_data.array[None, None, ...]  # [1, 1, ..., N]
+                l_data.array = l_data.array[
+                    None, None, None, ...
+                ]  # [Nb=1, Nc=1, Nc=1, ..., N]
             elif l_data.array.ndim == l_data.ndim + 1:
-                l_data.array = l_data.array[None, ...]  # [1, Nc, ..., N]
+                l_data.array = l_data.array[
+                    None, :, None, ...
+                ]  # [Nb=1, Nc=Nc, Nc=1, ..., N]
+            elif l_data.array.ndim == l_data.ndim + 2:
+                l_data.array = l_data.array[
+                    :, :, None, ...
+                ]  # [Nb=Nb, Nc=Nc, Nc=1, ..., N]
             else:
                 raise NotImplementedError(
                     f"Data array has unexpected shape {l_data.array.shape}."
@@ -419,19 +428,18 @@ class CS_operator_1D_Kernel_Torch(CS_operator_2D_Kernel_Torch):
             else compute_cross_spectrum_matrix
         )
 
-        bin_norm = self.bin_masks.sum(dim=(-1,))  # [nbins]
+        bin_norm = self.bin_masks.sum(dim=tuple(range(-self.ndim, 0)))  # [nbins]
 
         if l_data.pbc:
 
             cross_vals = (
                 torch.einsum(
-                    "jx,bc...x,bd...x->bcd...j",
-                    self.bin_masks.to(dtype=l_data.array.dtype),
+                    "bcd...x,bcd...x,jx,j->bcd...j",
                     l_data.array,
                     torch.conj(l_data.array),
+                    self.bin_masks.to(dtype=l_data.array.dtype),
+                    1 / bin_norm,
                 )
-                #                / bin_norm[None, None, None, :]
-                / bin_norm[..., :]
             ).to(dtype=bk._DEFAULT_COMPLEX_DTYPE)
 
             # Symetric part is redundant and then not filled as cross_spectrum(c1, c2) and cross_spectrum(c2, c1) are conjugates
@@ -454,37 +462,41 @@ class CS_operator_1D_Kernel_Torch(CS_operator_2D_Kernel_Torch):
             )
 
         l_data_bin = (
-            l_data.array[:, :, None, :] * self.bin_masks[None, None, :, :]
-        )  # [Nb, Nc, n_bins, N]
+            l_data.array[:, :, :, ..., None, :] * self.bin_masks[None, None, None, ...]
+        )  # [Nb, Nc, Nc, ..., n_bins, N]
 
         ifft_l_data_bin = torch.fft.ifft(
-            l_data_bin, norm="ortho", dim=-1
-        )  # [Nb, Nc, n_bins, N]
-        l_data.array = torch.fft.ifft(l_data.array, norm="ortho")  # [Nb, Nc, N]
+            l_data_bin, norm="ortho", dim=tuple(range(-self.ndim, 0))[0]
+        )  # [Nb, Nc, Nc, ..., n_bins, N]
+        l_data.array = torch.fft.ifft(
+            l_data.array, norm="ortho", dim=tuple(range(-self.ndim, 0))[0]
+        )  # [Nb, Nc, Nc, ..., N]
         mask_source = (
-            ifft_l_data_bin[0, 0]
+            ifft_l_data_bin[0, 0, 0]
             if self.power_spectrum_method == "gaussian_rings"
             else l_data.array
         )
         mask_crop = self.build_mask_crop(mask_source, border=border)  # [n_bins, N]
         mask_crop_c = mask_crop.to(dtype=ifft_l_data_bin.dtype)
-        prefactor = l_data.N0[0] / mask_crop.sum(dim=(-1,))  # [n_bins]
+        prefactor = np.prod(l_data.N0) / mask_crop.sum(
+            dim=tuple(range(-self.ndim, 0))
+        )  # [n_bins]
 
         cross_vals = (
             torch.einsum(
-                "bcjx,bdx,jx->bcdj",
+                "bcd...jx,bcd...x,jx,j->bcd...j",
                 ifft_l_data_bin,
                 torch.conj(l_data.array),
                 mask_crop_c,
+                prefactor / bin_norm,
             )
-            * (prefactor / bin_norm)[None, None, None, :]
         ).to(dtype=bk._DEFAULT_COMPLEX_DTYPE)
 
         cross_spectrum[:, compute_cross_spectrum_matrix, :] = cross_vals[
             :, compute_cross_spectrum_matrix, :
         ]
 
-        return cross_spectrum  # [Nb, Nc, Nc, n_bins]
+        return cross_spectrum  # [Nb, Nc, Nc, ..., n_bins]
 
 
 ###############################################################################
