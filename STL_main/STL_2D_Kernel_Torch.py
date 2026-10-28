@@ -1526,6 +1526,17 @@ class CS_operator_2D_Kernel_Torch:
         )  # [..., N, M]
 
         # Put in the expected shape if not already (should be already done in ST_op apply)
+        if l_data.array.ndim < l_data.ndim + 2:
+            raise ValueError(
+                f"Data array has unexpected shape {l_data.array.shape}. Expected at least {l_data.ndim + 2} dimensions, because batch and channel dimensions are expected."
+            )
+        elif l_data.array.ndim == l_data.ndim + 2:
+            l_data.array = l_data.array[
+                :, :, None, ...
+            ]  # [Nb=Nb, Nc=Nc, Nc=1, ..., N, M]
+        else:
+            pass
+
         if False:
             if l_data.array.ndim == l_data.ndim:
                 l_data.array = l_data.array[

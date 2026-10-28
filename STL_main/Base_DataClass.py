@@ -241,46 +241,16 @@ class Base_DataClass(ABC):
                 plt.title("Nyquist filtered tensor (Fourier)")
                 plt.show()
 
+            data_filtered = self.copy(empty=True) if not inplace else self
+            data_filtered.array = tensor_filtered
+
+            return data_filtered
+
         elif dim == (-1,):
-            # Compute frequency grids
-            (N,) = self.array.shape[-1:]
-            FX = N * torch.fft.fftfreq(N, d=1.0, device=self.array.device)
-
-            # Create low-pass mask based on Nyquist radius
-            r2 = FX**2
-            nyquist_radius = N / 2
-            mask = r2 <= nyquist_radius**2
-
-            # Apply mask in Fourier space
-            tensor_fft = torch.fft.fft(self.array, dim=dim[0])
-            tensor_fft[..., ~mask] = 0.0
-
-            # Inverse Fourier transform to get the filtered tensor in real space
-            tensor_filtered = torch.fft.ifft(tensor_fft, dim=dim[0])
-
-            if not self.array.is_complex():
-                tensor_filtered = tensor_filtered.real
-
-            if plot:
-                import matplotlib.pyplot as plt
-
-                plt.plot(
-                    np.abs(
-                        torch.fft.fftshift(torch.fft.fft(self.array[0, 0]))
-                        .cpu()
-                        .numpy()
-                    ),
-                )
-                plt.yscale("log")
-                plt.colorbar()
-                plt.title("Nyquist filtered tensor (Fourier)")
-                plt.show()
+            # in 1D, the Nyquist filter is simply the identity operation (because the L2 and L-infinity norms are the same)
+            data_filtered = self.copy(empty=False) if not inplace else self
+            return data_filtered
         else:
             raise NotImplementedError("Dim must be for now either (-2,-1) or (-1,)")
-
-        data_filtered = self.copy(empty=True) if not inplace else self
-        data_filtered.array = tensor_filtered
-
-        return data_filtered
 
     # TODO: add get_ST_op and get_PS_op when instance methods are implemented in STL_2D_Kernel_Torch

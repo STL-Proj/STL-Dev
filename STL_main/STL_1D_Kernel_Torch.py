@@ -130,12 +130,12 @@ class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
         kernel = kernel.to(device=self.device, dtype=complex_dtype)
         kernel = kernel.unsqueeze(0)  # (1, L, K, K)
         kernel = kernel[
-            :, :1, :, w + 1
+            :, :1, :, w
         ]  # (1, 1, K) take only the first angle and the central row for 1D kernel
         kernel -= kernel.mean(
             dim=(-1), keepdims=True
         )  # remove mean along the 1D kernel
-        kernel *= 10.0
+        kernel *= 4.0
         # TODO: normalize ##############################################################################################
         return kernel
 
@@ -393,6 +393,15 @@ class CS_operator_1D_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         )  # [..., N]
 
         # Put in the expected shape if not already (should be already done in ST_op apply)
+        if l_data.array.ndim < l_data.ndim + 2:
+            raise ValueError(
+                f"Data array has unexpected shape {l_data.array.shape}. Expected at least {l_data.ndim + 2} dimensions, because batch and channel dimensions are expected."
+            )
+        elif l_data.array.ndim == l_data.ndim + 2:
+            l_data.array = l_data.array[:, :, None, ...]  # [Nb=Nb, Nc=Nc, Nc=1, ..., N]
+        else:
+            pass
+
         if False:
             if l_data.array.ndim == l_data.ndim:
                 l_data.array = l_data.array[
