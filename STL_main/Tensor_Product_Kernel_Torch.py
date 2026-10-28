@@ -2,11 +2,13 @@
 # - extension to non tensor prod nan mask
 # - extension to to tendor prod channels (eg bathy, daylight, etc)
 from dataclasses import dataclass, field
+from itertools import product
 from typing import Any, ClassVar, Optional
 
 import numpy as np
 import torch
 
+import STL_main.torch_backend as bk
 from STL_main.ST_Operator_Tensor_Product import ST_Operator_TensorProd
 from STL_main.STL_2D_Kernel_Torch import (
     CS_operator_2D_Kernel_Torch,
@@ -405,6 +407,41 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
 
         self.n_bins = [cs_op.n_bins for cs_op in self.cs_ops]
 
+    def _block_crop_masks(self, data, get_crop_border_size_method):
+        """
+        Per-bin crop mask of each block, as in CS_operator_2D_Kernel_Torch.apply_fft:
+        all ones for a periodic block, interior of the per-bin border otherwise.
+
+        Returns
+        -------
+        list of torch.Tensor
+            Crop mask of each block. Shape [n_bins[b], *N0[b]].
+        """
+        masks = []
+        for block_id, cs_op in enumerate(self.cs_ops):
+            if data.pbc[block_id]:
+                masks.append(
+                    torch.ones_like(cs_op.bin_masks, dtype=cs_op.bin_masks.dtype)
+                )
+                continue
+            method = (
+                cs_op.get_crop_border_size_method
+                if get_crop_border_size_method[block_id] is None
+                else get_crop_border_size_method[block_id]
+            )
+            if method == "flexible_crop":
+                border = cs_op.crop_borders  # [n_bins]
+            elif method == "largest_crop":
+                border = torch.full_like(cs_op.crop_borders, cs_op.crop_borders.max())
+            else:
+                raise ValueError(f"Invalid get_crop_border_size_method: {method}")
+            masks.append(
+                cs_op.build_mask_crop(cs_op.bin_masks, border=border).to(
+                    dtype=cs_op.bin_masks.dtype
+                )
+            )
+        return masks
+
     def apply(
         self,
         data,
@@ -413,93 +450,153 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         cross_spectrum_method=None,
         **kwargs,
     ):
+        """
+        Joint cross spectrum over all blocks, binned with the tensor product of the block bin masks:
+        CS[c1, c2, j_0, j_1, ...] = mean of X_c1(f) conj(X_c2(f)) weighted by B_0[j_0](f_0) B_1[j_1](f_1) ...,
+        where X is the Fourier transform over the dimensions of all blocks (eg the (k, omega) spectrum
+        for 2D+1D data). Non-periodic blocks use the per-bin crop of their own cross spectrum operator.
 
+        Returns
+        -------
+        torch.Tensor
+            Cross spectrum values of shape [Nb, Nc, Nc, n_bins[0], ..., n_bins[nblock-1]]
+        """
         if not isinstance(get_crop_border_size_method, list):
             get_crop_border_size_method = [
                 get_crop_border_size_method
             ] * self.nblock  # default to the same method for all blocks
 
         if not isinstance(cross_spectrum_method, list):
-            cross_spectrum_method = [
-                cross_spectrum_method
-            ] * self.nblock  # default to the same method for all blocks
+            cross_spectrum_method = [cross_spectrum_method] * self.nblock
+        for block_id, cs_op in enumerate(self.cs_ops):
+            method = (
+                cs_op.cross_spectrum_method
+                if cross_spectrum_method[block_id] is None
+                else cross_spectrum_method[block_id]
+            )
+            if method != "fft":
+                raise NotImplementedError(
+                    f"Tensor product cross spectrum is only implemented with the fft method, got {method} for block {block_id}."
+                )
 
-        result_data = data.copy(
-            empty=False
-        )  # initialize result_data with the same structure as data, but empty
-        if result_data.array.ndim == result_data.ndim:
-            result_data.array = result_data.array[
-                None, None, None, ...
-            ]  # [Nb=1, Nc=1, Nc=1]
-        elif result_data.array.ndim == result_data.ndim + 1:
-            result_data.array = result_data.array[
-                None, :, None, ...
-            ]  # [Nb=1, Nc=Nc, Nc=1]
-        elif result_data.array.ndim == result_data.ndim + 2:
-            result_data.array = result_data.array[
-                :, :, None, ...
-            ]  # [Nb=Nb, Nc=Nc, Nc=1]
-        else:
+        # consistency checks
+        if list(self.DT) != list(data.DT):
+            raise Exception(f"Data Type should be {self.DT}, got {data.DT}.")
+        if any(dg != 0 for dg in data.dg):
+            raise Exception("Data dg must be 0 for power spectrum computation")
+        if any(
+            tuple(cs_op.shape) != tuple(N0) for cs_op, N0 in zip(self.cs_ops, data.N0)
+        ):
+            raise Exception("Data shape does not match operator shape")
+        if data.array.isnan().any():
+            raise ValueError(
+                "Data array contains NaN values, cannot compute power spectrum with fft method."
+            )
+
+        x = data.array
+        if x.ndim == self.ndim:
+            x = x[None, None]  # [Nb=1, Nc=1, ...]
+        elif x.ndim == self.ndim + 1:
+            x = x[None]  # [Nb=1, Nc, ...]
+        elif x.ndim != self.ndim + 2:
             raise NotImplementedError(
-                f"Data array has unexpected shape {result_data.array.shape} with ndim={result_data.ndim}."
+                f"Data array has unexpected shape {x.shape} with ndim={self.ndim}."
             )
+        Nb, Nc = x.shape[:2]
+        fft_dims = tuple(range(-self.ndim, 0))
 
-        for block_id in range(self.nblock):
+        x_hat = torch.fft.fftshift(
+            torch.fft.fftn(x, norm="ortho", dim=fft_dims), dim=fft_dims
+        )  # [Nb, Nc, *N] with the zero frequency at the center, as the bin masks
 
-            input_data = result_data._as_data_class_of(block_id)
+        compute_cross_spectrum_matrix = (
+            torch.eye(Nc, dtype=torch.bool)
+            if compute_cross_spectrum_matrix is None
+            else compute_cross_spectrum_matrix
+        )
+        c1, c2 = torch.nonzero(
+            compute_cross_spectrum_matrix.to(device=x.device), as_tuple=True
+        )  # channel pairs to compute
 
-            block_cross_spectrum = self.cs_ops[block_id].apply(
-                data=input_data,
-                compute_cross_spectrum_matrix=compute_cross_spectrum_matrix,
-                get_crop_border_size_method=get_crop_border_size_method[block_id],
-                cross_spectrum_method=cross_spectrum_method[block_id],
-                **{key: kwargs[key][block_id] for key in kwargs.keys()},
-            )
+        # einsum letters: y for batch, z for channel pairs, one lowercase letter per data
+        # dimension (block by block) and one uppercase letter per block of bins
+        letters = "abcdefghijklmnopqrstuvwx"
+        assert self.ndim <= len(letters), "Too many dimensions for einsum."
+        block_letters, start = [], 0
+        for dim in self.dim:
+            block_letters.append(letters[start : start + dim])
+            start += dim
+        all_letters = "".join(block_letters)
+        bin_letters = "".join(chr(ord("A") + b) for b in range(self.nblock))
 
-            # small hack to use the same data class for the cross spectrum as for the input data, even if the cross spectrum has less dimensions than the input data (eg 1D cross spectrum from 2D input data)
-            if block_cross_spectrum.ndim < input_data.array.ndim:
-                # if the cross spectrum number of dimensions is less than the input data, we need to add the missing dimensions back
-                block_cross_spectrum = block_cross_spectrum[
-                    (Ellipsis,)
-                    + (None,) * (input_data.array.ndim - block_cross_spectrum.ndim)
-                ]  # add necessary dimensions at the end
-            elif block_cross_spectrum.ndim > input_data.array.ndim:
-                raise ValueError(
-                    f"block_cross_spectrum.ndim ({block_cross_spectrum.ndim}) > input_data.array.ndim ({input_data.array.ndim})."
+        bin_masks = [
+            cs_op.bin_masks.to(device=x.device, dtype=x_hat.dtype)
+            for cs_op in self.cs_ops
+        ]  # [n_bins[b], *N0[b]]
+        bin_norm = [
+            cs_op.bin_masks.sum(dim=tuple(range(1, cs_op.bin_masks.ndim)))
+            for cs_op in self.cs_ops
+        ]  # [n_bins[b]]
+        n_bins = [masks.shape[0] for masks in bin_masks]
+
+        cross_spectrum = torch.full(
+            (Nb, Nc, Nc, *n_bins),
+            torch.nan,
+            dtype=bk._DEFAULT_COMPLEX_DTYPE,
+            device=x.device,
+        )
+
+        if all(data.pbc):
+            # sum over f of X_c1 conj(X_c2) B_0[j_0] B_1[j_1] ... / (sum B_0[j_0]) / (sum B_1[j_1]) ...
+            subscripts = (
+                f"yz{all_letters},yz{all_letters},"
+                + ",".join(
+                    bin_letters[b] + block_letters[b] for b in range(self.nblock)
                 )
-            else:
-                pass
-            assert (
-                block_cross_spectrum.ndim == input_data.array.ndim
-            ), f"block_cross_spectrum.ndim ({block_cross_spectrum.ndim}) != input_data.array.ndim ({input_data.array.ndim})."
-
-            result_data = result_data._from_data_class_of(
-                block_id, input_data.__class__(array=block_cross_spectrum), inplace=True
+                + f"->yz{bin_letters}"
             )
+            cross_vals = torch.einsum(
+                subscripts, x_hat[:, c1], torch.conj(x_hat[:, c2]), *bin_masks
+            )  # [Nb, n_pairs, *n_bins]
+            for b in range(self.nblock):
+                shape = [1] * (2 + self.nblock)
+                shape[2 + b] = n_bins[b]
+                cross_vals = cross_vals / bin_norm[b].to(device=x.device).view(shape)
+            cross_spectrum[:, c1, c2] = cross_vals.to(dtype=bk._DEFAULT_COMPLEX_DTYPE)
+            return cross_spectrum  # [Nb, Nc, Nc, *n_bins]
 
-        result_tensor = result_data.array
+        # Non-periodic blocks: as in the 2D operator, the data filtered in each joint bin is correlated
+        # with the data on the interior of the domain, cropped by the support of the bin filter.
+        crop_masks = [
+            mask.to(device=x.device)
+            for mask in self._block_crop_masks(data, get_crop_border_size_method)
+        ]  # [n_bins[b], *N0[b]]
+        x_conj = torch.conj(x[:, c2]).to(dtype=x_hat.dtype)  # [Nb, n_pairs, *N]
+        x_hat_c1 = x_hat[:, c1]  # [Nb, n_pairs, *N]
+        N_total = float(np.prod([np.prod(N0) for N0 in data.N0]))
 
-        # revert the small hack by squeezing the dimensions that were added back to the cross spectrum
-        ps_related_dims = result_data.nblock
-        ps_non_related_dims = result_tensor.ndim - result_data.ndim
-        expected_ndim = ps_related_dims + ps_non_related_dims
-
-        if result_tensor.ndim > expected_ndim:
-            result_tensor = result_tensor.squeeze(
-                dim=tuple(
-                    [
-                        ps_non_related_dims + dim
-                        for dim in range(result_tensor.ndim - ps_non_related_dims)
-                        if not ps_non_related_dims + dim in result_data.start_dim
-                    ]
-                )
+        for bins in product(*[range(n) for n in n_bins]):
+            filt = torch.einsum(
+                ",".join(block_letters) + "->" + all_letters,
+                *[bin_masks[b][j] for b, j in enumerate(bins)],
             )
+            crop = torch.einsum(
+                ",".join(block_letters) + "->" + all_letters,
+                *[crop_masks[b][j] for b, j in enumerate(bins)],
+            )
+            x_bin = torch.fft.ifftn(
+                torch.fft.ifftshift(x_hat_c1 * filt, dim=fft_dims),
+                norm="ortho",
+                dim=fft_dims,
+            )
+            norm = (N_total / crop.real.sum()) / np.prod(
+                [float(bin_norm[b][j]) for b, j in enumerate(bins)]
+            )
+            cross_spectrum[(slice(None), c1, c2) + bins] = (
+                (x_bin * x_conj * crop).sum(dim=fft_dims) * norm
+            ).to(dtype=bk._DEFAULT_COMPLEX_DTYPE)
 
-        assert (
-            result_tensor.ndim == expected_ndim
-        ), f"result_tensor.ndim ({result_tensor.ndim}) != expected_ndim ({expected_ndim})."
-
-        return result_tensor
+        return cross_spectrum  # [Nb, Nc, Nc, *n_bins]
 
 
 @dataclass
