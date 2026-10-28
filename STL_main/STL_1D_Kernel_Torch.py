@@ -21,6 +21,74 @@ from STL_main.torch_backend import (
 class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
     ndim = 1
 
+    @staticmethod
+    def bump_steerable_1d(omega_grid, xi0, eps=1e-12):
+        """
+        Generate a 1D bump steerable wavelet in Fourier space.
+
+        Parameters
+        ----------
+        omega_grid : torch.Tensor
+            Grid of frequencies in Fourier space, of shape [Nx, 2], where the last dimension corresponds to (omega_x, omega_y).
+        xi0 : float
+            Center frequency xi = (xi0, 0) in Fourier space.
+        eps : float
+            Small constant to avoid division by zero in the bump window.
+
+        Returns
+        -------
+        torch.Tensor
+            A 1D bump steerable wavelet in Fourier space, of shape [Nx].
+        """
+
+        # radial part: bump window centered at xi0
+        omega_norm = torch.abs(omega_grid)
+
+        r = abs(omega_norm - xi0) / xi0
+
+        # apply bump window over r: g(r) = exp(-r^2 / (1 - r^2)) * 1_{0<r<1}
+        r2 = r**2
+        support_r = (r >= 0.0) & (r < 1.0)
+        denom = (1.0 - r2).clamp_min(eps)
+        bump = torch.where(support_r, torch.exp(-r2 / denom), torch.zeros_like(r))
+
+        return bump
+
+    @classmethod
+    def bump_steerable_bank(cls, J, size):
+        """
+        Generate a bank of 1D bump steerable wavelets in Fourier space.
+
+        Parameters
+        ----------
+        J : int
+            Number of dyadic scales.
+        size : tuple of int
+            Grid size (Nx,).
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape [J, 1, Nx]
+        """
+        (Nx,) = size
+        L = 1  # For 1D, we only have one orientation
+        filters_bank = torch.empty((J, L, Nx))
+        xi0 = Nx / 2.0  # same convention as 1D scattering spectra
+
+        # Create the frequency grid in Fourier space, with the zero frequency at (0,)
+        omega_x = torch.fft.fftfreq(Nx) * Nx
+        omega_x = torch.fft.fftshift(omega_x)  # Shift zero frequency to center
+
+        for j in range(J):
+            scale_factor = 2**j
+            for l_idx, l in enumerate(range(L)):
+                filters_bank[j, l_idx] = torch.fft.fftshift(
+                    cls.bump_steerable_1d(scale_factor * omega_x, xi0=xi0)
+                )
+
+        return filters_bank
+
     def __init__(
         self,
         J,
@@ -114,30 +182,26 @@ class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
             self.KERNELSZ % 2 == 1
         ), "KERNELSZ must be odd to have a well-defined center."
         w = self.KERNELSZ // 2
-        kernel = fft_wavelet_builder(self.J, L=4, size=(N, N))[
+        kernel = fft_wavelet_builder(self.J, size=(N,))[
             0
-        ]  # [L, N, N] # TODO: improve in the future
-        kernel = torch.fft.fftshift(torch.fft.ifft2(kernel, dim=(-2, -1)), dim=(-2, -1))
-        kernel = kernel[
-            :, N // 2 - w : N // 2 + w + 1, N // 2 - w : N // 2 + w + 1
-        ]  # [L, K, K]
-        kernel -= kernel.mean(dim=(-2, -1), keepdims=True)
+        ]  # [1, N] # TODO: improve in the future
+        kernel = torch.fft.fftshift(torch.fft.ifft(kernel, dim=(-1)), dim=(-1))
+        kernel = kernel[:, N // 2 - w : N // 2 + w + 1]  # [1, K]
+        kernel -= kernel.mean(dim=(-1,), keepdims=True)
         # Cast to the operator's working precision so the kernel matches the data
         # dtype in the convolution (e.g. complex128 for float64 data on CPU).
         complex_dtype = (
             torch.complex128 if self.dtype == torch.float64 else torch.complex64
         )
         kernel = kernel.to(device=self.device, dtype=complex_dtype)
-        kernel = kernel.unsqueeze(0)  # (1, L, K, K)
-        kernel = kernel[
-            :, :1, w, :
-        ]  # (1, 1, K) take only the first angle and the central row for 1D kernel
-        kernel -= kernel.mean(
-            dim=(-1), keepdims=True
-        )  # remove mean along the 1D kernel
-        kernel *= 3.0
-        # TODO: normalize ##############################################################################################
+        kernel = kernel.unsqueeze(0)  # (1, 1, K)
+
         return kernel
+
+    def _build_bump_steerable_wavelet_kernel(self):
+        return self._build_wavelet_kernel_from_ifft_crop(
+            fft_wavelet_builder=WaveletOperator1Dkernel_torch.bump_steerable_bank
+        )  # (1, L, K)
 
     def _get_smooth_kernel(self, device, dtype):
         """

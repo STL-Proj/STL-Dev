@@ -483,6 +483,8 @@ def synthesize_from_maps(
     mean_field=True,
     compute_PS=True,
     prefilter_Nyquist=True,
+    st_op_target_kwargs={},
+    st_op_running_kwargs={},
     **optim_kwargs,
 ):
     """
@@ -604,6 +606,7 @@ def synthesize_from_maps(
         compute_PS=compute_PS,
         n_bins=n_bins,
         has_fewer_convolutions=has_fewer_convolutions,
+        **st_op_target_kwargs,
     )
 
     st_op_running = data_running.get_ST_op(
@@ -612,6 +615,7 @@ def synthesize_from_maps(
         n_bins=n_bins,
         has_fewer_convolutions=has_fewer_convolutions,
         replace_nan_value=None,
+        **st_op_running_kwargs,
     )
 
     if prefilter_Nyquist:
