@@ -130,12 +130,12 @@ class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
         kernel = kernel.to(device=self.device, dtype=complex_dtype)
         kernel = kernel.unsqueeze(0)  # (1, L, K, K)
         kernel = kernel[
-            :, :1, :, w
+            :, :1, w, :
         ]  # (1, 1, K) take only the first angle and the central row for 1D kernel
         kernel -= kernel.mean(
             dim=(-1), keepdims=True
         )  # remove mean along the 1D kernel
-        kernel *= 4.0
+        kernel *= 3.0
         # TODO: normalize ##############################################################################################
         return kernel
 
