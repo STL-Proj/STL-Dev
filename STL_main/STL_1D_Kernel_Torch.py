@@ -29,7 +29,7 @@ class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
         Parameters
         ----------
         omega_grid : torch.Tensor
-            Grid of frequencies in Fourier space, of shape [Nx, 2], where the last dimension corresponds to (omega_x, omega_y).
+            Grid of frequencies in Fourier space, of shape [Nx], where the last dimension corresponds to (omega_x).
         xi0 : float
             Center frequency xi = (xi0, 0) in Fourier space.
         eps : float
@@ -41,10 +41,7 @@ class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
             A 1D bump steerable wavelet in Fourier space, of shape [Nx].
         """
 
-        # radial part: bump window centered at xi0
-        omega_norm = torch.abs(omega_grid)
-
-        r = abs(omega_norm - xi0) / xi0
+        r = abs(omega_grid - xi0) / xi0
 
         # apply bump window over r: g(r) = exp(-r^2 / (1 - r^2)) * 1_{0<r<1}
         r2 = r**2
