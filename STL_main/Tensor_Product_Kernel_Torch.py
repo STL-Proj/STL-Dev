@@ -106,6 +106,17 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
             if value is None:
                 kwargs[key] = [None] * self.nblock
             assert isinstance(kwargs[key], list), f"{key} must be a list"
+        # Blocks may have their own default L inside a tensor product (2 for 1D blocks)
+        kwargs["L"] = [
+            (
+                getattr(data_class.wavelet_op_class, "L_tensor_product", None)
+                if L_block is None
+                else L_block
+            )
+            for data_class, L_block in zip(
+                self.data_structure, kwargs.get("L", [None] * self.nblock)
+            )
+        ]
 
         wavelet_ops = []
         for ind, data_class in enumerate(self.data_structure):

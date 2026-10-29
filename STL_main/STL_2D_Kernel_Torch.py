@@ -1251,7 +1251,7 @@ class CS_operator_2D_Kernel_Torch:
 
         Args:
             N0 (tuple): Data shape
-            n_bins (int): Number of radial frequency bins
+            n_bins (int): Number of radial frequency bins (default: 2 per octave, 2 * (J - Jmin - 1))
             Jmin (int): Coarsest scale index included in the bin masks
                 (0 <= Jmin < J). Only used if power_spectrum_method is
                 "gaussian_rings".
@@ -1266,15 +1266,15 @@ class CS_operator_2D_Kernel_Torch:
                     "kernel": Estimate cross spectrum via convolution with kernel in real space (has to be designed and implemented, not yet available)
         """
         self.shape = shape
-        self.n_bins = (
-            int(2 ** (np.log2(min(shape)) - 4)) if n_bins is None else n_bins
-        )  # adaptive number of bins
         self.J = int(np.log2(min(shape))) - 2 if J is None else J
         if Jmin < 0 or Jmin >= self.J:
             raise ValueError(
                 f"Jmin must satisfy 0 <= Jmin < J (got Jmin={Jmin}, J={self.J})."
             )
         self.Jmin = Jmin
+        # adaptive number of bins: 2 per octave between the frequencies 1/2^J and 0.5/2^Jmin,
+        # so that it grows like log(N) and bins stay wider than the frequency resolution
+        self.n_bins = max(1, 2 * (self.J - self.Jmin - 1)) if n_bins is None else n_bins
         self.DT = DT if DT is not None else self.default_DT
         self.power_spectrum_method = power_spectrum_method.lower().strip()
         if self.power_spectrum_method not in {"legacy", "gaussian_rings"}:
@@ -1603,7 +1603,7 @@ class CS_operator_2D_Kernel_Torch:
             )
 
         l_data_bin = (
-            l_data.array[..., None, :, :] * self.bin_masks[None, None, ...]
+            l_data.array.unsqueeze(-self.ndim - 1) * self.bin_masks
         )  # [Nb, Nc, ..., n_bins, N, M]
 
         ifft_l_data_bin = self.__class__._ifft_block(

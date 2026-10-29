@@ -20,6 +20,10 @@ from STL_main.torch_backend import (
 
 class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
     ndim = 1
+    # Default L when the operator is a block of a tensor product. With L=2, the second
+    # wavelet is the conjugate of the first (it covers negative frequencies), so that
+    # the product wavelets see both directions of propagation.
+    L_tensor_product = 2
 
     @staticmethod
     def bump_steerable_1d(omega_grid, xi0, eps=1e-12):
@@ -111,9 +115,9 @@ class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
 
         if L is None:
             L = 1
-        if L != 1:
+        if L not in (1, 2):
             raise ValueError(
-                f"L must be 1 for WaveletOperator1Dkernel_torch but got {L}"
+                f"L must be 1 or 2 for WaveletOperator1Dkernel_torch but got {L}"
             )
         self.L = L
         self.KERNELSZ = kernel_size if kernel_size is not None else 5
@@ -136,6 +140,12 @@ class WaveletOperator1Dkernel_torch(WaveletOperator2Dkernel_torch):
             raise ValueError(
                 f"WType {self.WType} not recognized. Available options: 'Bump-Steerable' or 'Morlet'."
             )
+        if self.L == 2:
+            # psi(j, theta=1) = conj(psi(j, theta=0)): the mirror of the wavelet in frequency.
+            # Redundant for real 1D data, but not inside tensor products of complex wavelets.
+            self._wav_kernel = torch.cat(
+                [self._wav_kernel, self._wav_kernel.conj()], dim=1
+            )  # [1, 2, K]
 
         self.sigma_smooth = (
             sigma_smooth  # to build smoothing kernel used in downsampling

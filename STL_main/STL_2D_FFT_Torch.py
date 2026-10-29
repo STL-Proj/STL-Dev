@@ -1291,21 +1291,21 @@ class CS_operator_2D_FFT_torch:
 
         Args:
             N0 (tuple): Image size (N, M)
-            n_bins (int): Number of radial frequency bins
+            n_bins (int): Number of radial frequency bins (default: 2 per octave, 2 * (J - Jmin - 1))
             device: torch device
             dtype: torch dtype
             get_crop_border_size_method : str ("flexible_crop" or "largest_crop")
         """
         self.shape = shape
-        self.n_bins = (
-            int(2 ** (np.log2(min(shape)) - 4)) if n_bins is None else n_bins
-        )  # adaptive number of bins
         self.J = int(np.log2(min(shape))) - 2 if J is None else J
         if Jmin < 0 or Jmin >= self.J:
             raise ValueError(
                 f"Jmin must satisfy 0 <= Jmin < J (got Jmin={Jmin}, J={self.J})."
             )
         self.Jmin = Jmin
+        # adaptive number of bins: 2 per octave between the frequencies 1/2^J and 0.5/2^Jmin,
+        # so that it grows like log(N) and bins stay wider than the frequency resolution
+        self.n_bins = max(1, 2 * (self.J - self.Jmin - 1)) if n_bins is None else n_bins
         self.power_spectrum_method = power_spectrum_method.lower().strip()
         if self.power_spectrum_method not in {"legacy", "gaussian_rings"}:
             raise ValueError(
