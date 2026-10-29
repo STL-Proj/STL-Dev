@@ -1213,6 +1213,25 @@ class CS_operator_2D_Kernel_Torch:
         val = cls.k_lambda(t / lam, lam) - cls.k_lambda(t, lam)
         return np.sqrt(max(val, 0))
 
+    @classmethod
+    def _fft_block(cls, x, norm="ortho"):
+        return torch.fft.fftn(x, dim=tuple(range(-cls.ndim, 0)), norm=norm)
+
+    @classmethod
+    def _fftshift_block(cls, x):
+        return torch.fft.fftshift(x, dim=tuple(range(-cls.ndim, 0)))
+
+    @classmethod
+    def _ifft_block(cls, x, norm="ortho"):
+        return torch.fft.ifftn(x, dim=tuple(range(-cls.ndim, 0)), norm=norm)
+
+    @classmethod
+    def _subscripts_block(cls):
+        if cls.ndim > 4:
+            raise NotImplementedError("Need to add more subscripts for ndim > 4.")
+        else:
+            return "xyzt"[: cls.ndim]
+
     ###########################################################################
     def __init__(
         self,
@@ -1518,49 +1537,27 @@ class CS_operator_2D_Kernel_Torch:
 
         # Ensure data is in Fourier space
         l_data = data.copy(empty=False)
-        l_data.array = torch.fft.fft2(
-            l_data.array, norm="ortho", dim=tuple(range(-self.ndim, 0))  # [..., N, M]
-        )  # copy of data in Fourier space
-        l_data.array = torch.fft.fftshift(
-            l_data.array, dim=tuple(range(-self.ndim, 0))
-        )  # [..., N, M]
+        l_data.array = self.__class__._fft_block(l_data.array)  # [..., N, M]
+        l_data.array = self.__class__._fftshift_block(l_data.array)  # [..., N, M]
 
         # Put in the expected shape if not already (should be already done in ST_op apply)
-        if l_data.array.ndim < l_data.ndim + 2:
-            raise ValueError(
-                f"Data array has unexpected shape {l_data.array.shape}. Expected at least {l_data.ndim + 2} dimensions, because batch and channel dimensions are expected."
-            )
+        if l_data.array.ndim == l_data.ndim:
+            l_data.array = l_data.array[None, None, ...]  # [Nb=1, Nc=1, ..., N, M]
+        elif l_data.array.ndim == l_data.ndim + 1:
+            l_data.array = l_data.array[None, ...]  # [Nb=1, Nc=Nc, ..., N, M]
         elif l_data.array.ndim == l_data.ndim + 2:
-            l_data.array = l_data.array[
-                :, :, None, ...
-            ]  # [Nb=Nb, Nc=Nc, Nc=1, ..., N, M]
+            pass  # [Nb=Nb, Nc=Nc, ..., N, M]
         else:
-            pass
-
-        if False:
-            if l_data.array.ndim == l_data.ndim:
-                l_data.array = l_data.array[
-                    None, None, None, ...
-                ]  # [Nb=1, Nc=1, Nc=1, ..., N, M]
-            elif l_data.array.ndim == l_data.ndim + 1:
-                l_data.array = l_data.array[
-                    None, :, None, ...
-                ]  # [Nb=1, Nc=Nc, Nc=1, ..., N, M]
-            elif l_data.array.ndim == l_data.ndim + 2:
-                l_data.array = l_data.array[
-                    :, :, None, ...
-                ]  # [Nb=Nb, Nc=Nc, Nc=1, ..., N, M]
-            else:
-                raise NotImplementedError(
-                    f"Data array has unexpected shape {l_data.array.shape}."
-                )
+            raise NotImplementedError(
+                f"Data array has unexpected shape {l_data.array.shape} with ndim={self.ndim}."
+            )
 
         Nb, Nc = l_data.array.shape[:2]
         n_bins = self.n_bins
 
         cross_spectrum = (
             bk.zeros(
-                (Nb, Nc, Nc) + l_data.array.shape[3 : -l_data.ndim] + (n_bins,),
+                (Nb, Nc, Nc) + l_data.array.shape[2 : -l_data.ndim] + (n_bins,),
                 dtype=bk._DEFAULT_COMPLEX_DTYPE,
             )
             + bk.nan
@@ -1573,12 +1570,12 @@ class CS_operator_2D_Kernel_Torch:
         )
 
         bin_norm = self.bin_masks.sum(dim=tuple(range(-self.ndim, 0)))  # [nbins]
+        block_subscripts = self.__class__._subscripts_block()
 
         if l_data.pbc:
-
             cross_vals = (
                 torch.einsum(
-                    "bcd...xy,bcd...xy,jxy,j->bcd...j",
+                    f"bc...{block_subscripts},bd...{block_subscripts},j{block_subscripts},j->bcd...j",
                     l_data.array,
                     torch.conj(l_data.array),
                     self.bin_masks.to(dtype=l_data.array.dtype),
@@ -1606,18 +1603,15 @@ class CS_operator_2D_Kernel_Torch:
             )
 
         l_data_bin = (
-            l_data.array[:, :, :, ..., None, :, :]
-            * self.bin_masks[None, None, None, ...]
-        )  # [Nb, Nc, Nc, ..., n_bins, N, M]
+            l_data.array[..., None, :, :] * self.bin_masks[None, None, ...]
+        )  # [Nb, Nc, ..., n_bins, N, M]
 
-        ifft_l_data_bin = torch.fft.ifft2(
-            l_data_bin, norm="ortho", dim=tuple(range(-self.ndim, 0))
-        )  # [Nb, Nc, Nc, ..., n_bins, N, M]
-        l_data.array = torch.fft.ifft2(
-            l_data.array, norm="ortho", dim=tuple(range(-self.ndim, 0))
-        )  # [Nb, Nc, Nc, ..., N, M]
+        ifft_l_data_bin = self.__class__._ifft_block(
+            l_data_bin
+        )  # [Nb, Nc, ..., n_bins, N, M]
+        l_data.array = self.__class__._ifft_block(l_data.array)  # [Nb, Nc, ..., N, M]
         mask_source = (
-            ifft_l_data_bin[0, 0, 0]
+            ifft_l_data_bin[0, 0]
             if self.power_spectrum_method == "gaussian_rings"
             else l_data.array
         )
@@ -1629,7 +1623,7 @@ class CS_operator_2D_Kernel_Torch:
 
         cross_vals = (
             torch.einsum(
-                "bcd...jxy,bcd...xy,jxy,j->bcd...j",
+                f"bc...j{block_subscripts},bd...{block_subscripts},j{block_subscripts},j->bcd...j",
                 ifft_l_data_bin,
                 torch.conj(l_data.array),
                 mask_crop_c,

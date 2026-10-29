@@ -521,7 +521,10 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         # einsum letters: y for batch, z for channel pairs, one lowercase letter per data
         # dimension (block by block) and one uppercase letter per block of bins
         letters = "abcdefghijklmnopqrstuvwx"
-        assert self.ndim <= len(letters), "Too many dimensions for einsum."
+        if self.ndim > len(letters):
+            raise NotImplementedError(
+                "Too many dimensions for einsum. Can be fixed by adding more letters to the einsum letters string."
+            )
         block_letters, start = [], 0
         for dim in self.dim:
             block_letters.append(letters[start : start + dim])
