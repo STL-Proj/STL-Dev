@@ -174,8 +174,15 @@ class ST_Statistics:
             self.S2_ref_sqrt_chan_diag[(slice(None), slice(None)) + (None,)]
             * self.S2_ref_sqrt_chan_diag[(slice(None),) + (None,)]
         )  # [Nb,Nc,Nc,J1,L1]
+
+        # S1 and S2 of tensor products can have one more scale per block than S3 and S4 (the low-pass filter,
+        # see ST_Operator_TensorProd), so S3 and S4 are normalized with the wavelet scales of S2 only
+        S2_ref_sqrt_chan_diag = self.S2_ref_sqrt_chan_diag[
+            (slice(None), slice(None))
+            + tuple(slice(0, J_block) for J_block in self.S3.shape[3 : 3 + self.nblock])
+        ]  # [Nb,Nc,J1,L1]
         self.S3 = self.S3 / (
-            self.S2_ref_sqrt_chan_diag[
+            S2_ref_sqrt_chan_diag[
                 (slice(None), slice(None))
                 + (None,)
                 + (slice(None),) * self.nblock
@@ -183,7 +190,7 @@ class ST_Statistics:
                 + (slice(None),) * self.nblock
                 + (None,) * self.nblock
             ]
-            * self.S2_ref_sqrt_chan_diag[
+            * S2_ref_sqrt_chan_diag[
                 (slice(None),)
                 + (None,)
                 + (slice(None),)
@@ -193,7 +200,7 @@ class ST_Statistics:
             ]
         )  # [Nb,Nc,Nc,J1,J2,L1,L2]
         self.S4 = self.S4 / (
-            self.S2_ref_sqrt_chan_diag[
+            S2_ref_sqrt_chan_diag[
                 (slice(None), slice(None))
                 + (None,)
                 + (slice(None),) * self.nblock
@@ -203,7 +210,7 @@ class ST_Statistics:
                 + (None,) * self.nblock
                 + (None,) * self.nblock
             ]
-            * self.S2_ref_sqrt_chan_diag[
+            * S2_ref_sqrt_chan_diag[
                 (slice(None),)
                 + (None,)
                 + (slice(None),)

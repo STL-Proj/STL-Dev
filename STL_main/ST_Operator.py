@@ -464,13 +464,14 @@ class ST_Operator:
         if SC == "ScatCov":
             _J = (J,) if isinstance(J, int) else J
             _L = (L,) if isinstance(L, int) else L
+            _J_S1_S2 = self._scales_S1_S2(_J)
             # data_st.S1 = bk.zeros((Nb, Nc, J, L)) + bk.nan
             data_st.S1 = (
-                bk.zeros((Nb, Nc, Nc, *_J, *_L), dtype=bk._DEFAULT_COMPLEX_DTYPE)
+                bk.zeros((Nb, Nc, Nc, *_J_S1_S2, *_L), dtype=bk._DEFAULT_COMPLEX_DTYPE)
                 + bk.nan
             )
             data_st.S2 = (
-                bk.zeros((Nb, Nc, Nc, *_J, *_L), dtype=bk._DEFAULT_COMPLEX_DTYPE)
+                bk.zeros((Nb, Nc, Nc, *_J_S1_S2, *_L), dtype=bk._DEFAULT_COMPLEX_DTYPE)
                 + bk.nan
             )
             data_st.S3 = (
@@ -530,6 +531,13 @@ class ST_Operator:
         )
 
         return data_st
+
+    def _scales_S1_S2(self, J):
+        """
+        Number of scales per block of S1 and S2: the same as for S3 and S4, unless a subclass adds filters to
+        the first layer only (low-pass filters of tensor products).
+        """
+        return J
 
     def _compute_ST_loop(
         self,

@@ -334,6 +334,29 @@ class Wavelet_Operator_TensorProd_Kernel_Torch(WaveletOperator2Dkernel_torch):
 
         return convolved_data
 
+    def lowpass_dg(self, block_id):
+        """
+        Resolution of the low-pass filter phi_J of the given block: one downsampling below its coarsest wavelet.
+        """
+        return self.wavelet_ops[block_id].j_to_dg[self.J[block_id] - 1] + 1
+
+    def lowpass(self, data, block_id):
+        """
+        Apply the low-pass filter phi_J of the given block to data already downsampled to lowpass_dg(block_id)
+        along this block. phi_J is the cascade of the smoothing kernels of these downsamplings, so the data are
+        left unchanged: only a new orientation dimension of size 1 is inserted in front of the spatial dimensions,
+        as apply does for the orientations of the wavelets.
+        """
+        if data.dg[block_id] != self.lowpass_dg(block_id):
+            raise ValueError(
+                f"data.dg[{block_id}]={data.dg[block_id]} must be {self.lowpass_dg(block_id)} to apply the low-pass filter."
+            )
+
+        filtered_data = data.copy(empty=True)
+        filtered_data.array = data.array.unsqueeze(data.array.ndim - self.ndim)
+
+        return filtered_data
+
     def downsample(self, data, dg_out, block_id, inplace=True, replace_nan_value=nan):
         """
         Downsample the data to the dg_out resolution along the specified block.
