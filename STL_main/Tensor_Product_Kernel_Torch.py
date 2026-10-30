@@ -400,8 +400,16 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         device,
         dtype,
         mask_full_res=None,
+        lowpass=False,
         **kwargs,
     ):
+        """
+        lowpass : bool, default False
+            Add a low-pass bin to each block, at index 0 (see CS_operator_2D_Kernel_Torch.lowpass_bin). Joint bins
+            then also cover the frequencies close to 0 in some blocks (e.g. the omega ~ 0 slab and the k ~ 0 cylinder
+            of a space-time spectrum), which tensor products of the other bins do not see. The joint bin with the
+            low-pass bin in all blocks excludes the zero frequency (the mean).
+        """
         self.data_structure = data_structure
         self._dim_handler = DimHandler(
             dim=[data_class.ndim for data_class in self.data_structure]
@@ -411,6 +419,7 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         self.device = device
         self.dtype = dtype
         self.mask_full_res = mask_full_res
+        self.lowpass = lowpass
 
         if mask_full_res is not None:
             raise NotImplementedError(
@@ -439,7 +448,20 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
 
         self.cs_ops = cs_ops
 
-        self.n_bins = [cs_op.n_bins for cs_op in self.cs_ops]
+        # bins of each block, with the low-pass bin at index 0 if any
+        self.bin_masks, self.crop_borders = [], []
+        for cs_op in self.cs_ops:
+            if self.lowpass:
+                lowpass_mask, lowpass_border = cs_op.lowpass_bin()
+                self.bin_masks.append(torch.cat([lowpass_mask, cs_op.bin_masks]))
+                self.crop_borders.append(
+                    torch.cat([lowpass_border, cs_op.crop_borders])
+                )
+            else:
+                self.bin_masks.append(cs_op.bin_masks)
+                self.crop_borders.append(cs_op.crop_borders)
+
+        self.n_bins = [masks.shape[0] for masks in self.bin_masks]
 
     def _block_crop_masks(self, data, get_crop_border_size_method):
         """
@@ -453,25 +475,25 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         """
         masks = []
         for block_id, cs_op in enumerate(self.cs_ops):
+            bin_masks = self.bin_masks[block_id]
             if data.pbc[block_id]:
-                masks.append(
-                    torch.ones_like(cs_op.bin_masks, dtype=cs_op.bin_masks.dtype)
-                )
+                masks.append(torch.ones_like(bin_masks, dtype=bin_masks.dtype))
                 continue
             method = (
                 cs_op.get_crop_border_size_method
                 if get_crop_border_size_method[block_id] is None
                 else get_crop_border_size_method[block_id]
             )
+            crop_borders = self.crop_borders[block_id]
             if method == "flexible_crop":
-                border = cs_op.crop_borders  # [n_bins]
+                border = crop_borders  # [n_bins]
             elif method == "largest_crop":
-                border = torch.full_like(cs_op.crop_borders, cs_op.crop_borders.max())
+                border = torch.full_like(crop_borders, crop_borders.max())
             else:
                 raise ValueError(f"Invalid get_crop_border_size_method: {method}")
             masks.append(
-                cs_op.build_mask_crop(cs_op.bin_masks, border=border).to(
-                    dtype=cs_op.bin_masks.dtype
+                cs_op.build_mask_crop(bin_masks, border=border).to(
+                    dtype=bin_masks.dtype
                 )
             )
         return masks
@@ -567,14 +589,21 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         bin_letters = "".join(chr(ord("A") + b) for b in range(self.nblock))
 
         bin_masks = [
-            cs_op.bin_masks.to(device=x.device, dtype=x_hat.dtype)
-            for cs_op in self.cs_ops
+            masks.to(device=x.device, dtype=x_hat.dtype) for masks in self.bin_masks
         ]  # [n_bins[b], *N0[b]]
         bin_norm = [
-            cs_op.bin_masks.sum(dim=tuple(range(1, cs_op.bin_masks.ndim)))
-            for cs_op in self.cs_ops
+            masks.sum(dim=tuple(range(1, masks.ndim))) for masks in self.bin_masks
         ]  # [n_bins[b]]
         n_bins = [masks.shape[0] for masks in bin_masks]
+
+        if self.lowpass:
+            # The joint bin with the low-pass bin in all blocks is the only one that contains the zero frequency:
+            # removing it from the data only excludes the mean from this bin.
+            zero_frequency = tuple(
+                N // 2 for N0 in data.N0 for N in N0
+            )  # center of the fftshifted grid
+            x_hat = x_hat.clone()
+            x_hat[(slice(None), slice(None)) + zero_frequency] = 0
 
         cross_spectrum = torch.full(
             (Nb, Nc, Nc, *n_bins),
@@ -609,6 +638,9 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
             for mask in self._block_crop_masks(data, get_crop_border_size_method)
         ]  # [n_bins[b], *N0[b]]
         x_conj = torch.conj(x[:, c2]).to(dtype=x_hat.dtype)  # [Nb, n_pairs, *N]
+        if self.lowpass:
+            # for the joint low-pass bin, from which the zero frequency was removed
+            x_conj_centered = x_conj - x_conj.mean(dim=fft_dims, keepdim=True)
         x_hat_c1 = x_hat[:, c1]  # [Nb, n_pairs, *N]
         N_total = float(np.prod([np.prod(N0) for N0 in data.N0]))
 
@@ -629,8 +661,12 @@ class CS_Operator_TensorProd_Kernel_Torch(CS_operator_2D_Kernel_Torch):
             norm = (N_total / crop.real.sum()) / np.prod(
                 [float(bin_norm[b][j]) for b, j in enumerate(bins)]
             )
+            joint_lowpass = self.lowpass and not any(bins)
             cross_spectrum[(slice(None), c1, c2) + bins] = (
-                (x_bin * x_conj * crop).sum(dim=fft_dims) * norm
+                (x_bin * (x_conj_centered if joint_lowpass else x_conj) * crop).sum(
+                    dim=fft_dims
+                )
+                * norm
             ).to(dtype=bk._DEFAULT_COMPLEX_DTYPE)
 
         return cross_spectrum  # [Nb, Nc, Nc, *n_bins]

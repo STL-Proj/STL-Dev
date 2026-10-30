@@ -366,7 +366,7 @@ class CS_operator_1D_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         )
         self.lam = None
 
-    def estimate_crop_borders(self):
+    def _estimate_crop_borders(self, bin_masks):
 
         (N,) = self.shape
 
@@ -380,7 +380,7 @@ class CS_operator_1D_Kernel_Torch(CS_operator_2D_Kernel_Torch):
         # Apply all masks in batch
         impulse_ft = impulse_ft.unsqueeze(0)  # [1, N] for broadcasting
         psfs = torch.fft.ifft(
-            torch.fft.ifftshift(impulse_ft * self.bin_masks, dim=(-1,)),
+            torch.fft.ifftshift(impulse_ft * bin_masks, dim=(-1,)),
             norm="ortho",
             dim=-1,
         ).real  # [n_bins, N]
@@ -390,11 +390,13 @@ class CS_operator_1D_Kernel_Torch(CS_operator_2D_Kernel_Torch):
 
         # Determine border where PSF drops below threshold_percent of the trace at the source pixel (maximum value)
         threshold_percent = 0.1
-        threshold = threshold_percent * traces[:, -1].unsqueeze(1)  # [n_bins, 1]
+        # value at the source pixel, where the traces stop (not at its neighbour, which can be close to a zero of the
+        # oscillating PSF of a narrow bin)
+        threshold = threshold_percent * psfs[:, N // 2].abs().unsqueeze(
+            1
+        )  # [n_bins, 1]
         above_thresh = traces > threshold  # [n_bins, N//2]
-        self.crop_borders = math.ceil(N / 2) - (
-            above_thresh.float().argmax(dim=1) + 1
-        )  # [n_bins]
+        return math.ceil(N / 2) - (above_thresh.float().argmax(dim=1) + 1)  # [n_bins]
 
     ###########################################################################
     def _build_smooth_mask_crop(self, array, border):

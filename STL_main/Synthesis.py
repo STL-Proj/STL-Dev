@@ -7,8 +7,74 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.signal.windows import tukey
 from torch import device, nn
 from torch.optim import LBFGS
+
+
+# === Initial field ===
+def gaussian_start(target, init_shape):
+    """
+    Gaussian start of a synthesis: circular convolution of the (standardized) target with a white noise, i.e. a
+    Gaussian field whose power spectrum is the periodogram of the target. The same white noise is used for all the
+    channels of a running map, so that the cross spectra between channels are also those of the target. With several
+    target maps, running map i uses target map i modulo their number.
+
+    Along non-periodic dimensions, the target is first multiplied by a Tukey window (alpha = 0.5, normalized to
+    preserve the variance): otherwise the discontinuities between opposite borders, seen by the circular convolution,
+    would enter the spectrum of the start (e.g. as a cross along the axes in 2D). On smooth SST maps, alpha = 0.25
+    still left part of this cross.
+
+    Parameters
+    ----------
+    target : data class instance
+        Target, with an array of shape [Nb, Nc, *N] without NaNs.
+    init_shape : tuple
+        Shape of the running field, (nbatch, Nc, *N).
+
+    Returns
+    -------
+    torch.Tensor of shape init_shape, or None if the target contains NaNs or if the running field has another size.
+    """
+    x = target.array
+    n_dims = target.ndim
+    if x.isnan().any() or tuple(x.shape[-n_dims:]) != tuple(init_shape[-n_dims:]):
+        return None
+    conv_dims = tuple(range(-n_dims, 0))
+
+    # periodicity of each convolved dimension
+    if hasattr(target, "nblock"):
+        pbc = [
+            block_pbc
+            for block_pbc, block_dim in zip(target.pbc, target.dim)
+            for _ in range(block_dim)
+        ]
+    else:
+        pbc = [target.pbc] * n_dims
+
+    window = torch.ones(x.shape[-n_dims:], dtype=x.dtype, device=x.device)
+    for axis, (n, periodic) in enumerate(zip(x.shape[-n_dims:], pbc)):
+        if not periodic:
+            shape = [1] * n_dims
+            shape[axis] = n
+            window = window * torch.as_tensor(
+                tukey(n, 0.5), dtype=x.dtype, device=x.device
+            ).reshape(shape)
+    x = (x - x.mean(dim=conv_dims, keepdim=True)) * window / window.pow(2).mean().sqrt()
+
+    nbatch = init_shape[0]
+    x = x[torch.arange(nbatch, device=x.device) % x.shape[0]]  # [nbatch, Nc, *N]
+    noise = torch.randn(
+        (nbatch, 1) + tuple(init_shape[2:]), dtype=x.dtype, device=x.device
+    )
+    u = torch.fft.ifftn(
+        torch.fft.fftn(x, dim=conv_dims) * torch.fft.fftn(noise, dim=conv_dims),
+        dim=conv_dims,
+    ).real
+
+    return u / np.sqrt(
+        np.prod(x.shape[-n_dims:])
+    )  # variance of the target, for each channel
 
 
 # === Learnable field model ===
@@ -54,9 +120,11 @@ class ScatteringMatchModel(nn.Module):
             self.u = torch.randn(init_shape, device=device, dtype=dtype)
         else:
             self.u = (
-                torch.tensor(self.init_map)
+                torch.as_tensor(self.init_map)
+                .detach()
                 .to(device=device, dtype=dtype)
                 .expand(init_shape)
+                .clone()  # writable copy, also when expanded over the batch
             )
 
         if prefilter_Nyquist:
@@ -174,6 +242,7 @@ def optimize_from_maps(
     pbc_running=True,
     running_shape=None,
     init_running=None,
+    init_method="gaussian",
     has_fewer_convolutions=False,
     compute_cross_matrix=None,
     compute_PS=False,
@@ -261,6 +330,20 @@ def optimize_from_maps(
         l_target, mean_target, std_target = st_op_target.wavelet_op.standardize(
             l_target, mean_field=mean_field, inplace=True
         )  # [Nb, Nc] if mean_field else [1, Nc]
+
+        # ------- Initial field, if not given: Gaussian start or white noise -------
+        if init_method not in ("gaussian", "white_noise"):
+            raise ValueError(
+                f'init_method must be "gaussian" or "white_noise", got {init_method}.'
+            )
+        if init_running is None and init_method == "gaussian":
+            init_running = gaussian_start(l_target, init_shape)
+            if init_running is None:
+                print(
+                    "Gaussian start not available (NaNs in the target, or running shape different from the target): starting from white noise"
+                )
+            else:
+                print("Gaussian start: target convolved with white noise")
 
         # ------- Compute target stats -------
         target_stats = st_op_target.apply(
@@ -477,6 +560,7 @@ def synthesize_from_maps(
     pbc_running,
     running_shape=None,
     init_running=None,
+    init_method="gaussian",
     running_mask=None,
     has_fewer_convolutions=False,
     compute_cross_matrix=None,
@@ -494,6 +578,14 @@ def synthesize_from_maps(
     ----------
     running_shape : tuple of int, optional
         Default is None. If None, the running field has the same shape as the target.
+
+    init_running : torch.Tensor, optional
+        Default is None. Initial running field. If None, it is built with init_method.
+
+    init_method : str, optional
+        Default is "gaussian": the initial running field is the target convolved with a white noise, a Gaussian field
+        with the power spectrum of the target (see gaussian_start), which falls back to white noise if the target has
+        NaNs or another size than the running field. "white_noise": a white noise of unit variance.
 
     running_mask : torch.BoolTensor, optional
         Default is None. If None, the same mask as the target is used.
@@ -582,8 +674,9 @@ def synthesize_from_maps(
             compute_PS = False
 
     if compute_PS:
-        n_bins_target = data_target.get_CS_op().n_bins
-        n_bins_running = data_running.get_CS_op().n_bins
+        # number of bins of the selected J, with which the cross spectrum operators are built below
+        n_bins_target = data_target.get_CS_op(J=J).n_bins
+        n_bins_running = data_running.get_CS_op(J=J).n_bins
         if isinstance(n_bins_target, int) and isinstance(n_bins_running, int):
             n_bins = min(n_bins_target, n_bins_running)
         elif isinstance(n_bins_target, list) and isinstance(n_bins_running, list):
@@ -645,6 +738,7 @@ def synthesize_from_maps(
         pbc_running=pbc_running,
         running_shape=running_shape,
         init_running=init_running,
+        init_method=init_method,
         mean_field=mean_field,
         has_fewer_convolutions=has_fewer_convolutions,
         compute_cross_matrix=compute_cross_matrix,

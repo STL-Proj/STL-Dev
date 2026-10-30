@@ -193,6 +193,7 @@ class ST_Operator:
                 )
             if Jmin is not None:
                 cross_spectrum_op_kwargs["Jmin"] = Jmin
+            cross_spectrum_op_kwargs.update(self._extra_cross_spectrum_op_kwargs())
             self.CS_op = data_example.get_CS_op(**cross_spectrum_op_kwargs)
             self.n_bins = self.CS_op.n_bins
             self.PS_ref_sqrt_chan_diag = PS_ref_sqrt_chan_diag
@@ -531,6 +532,12 @@ class ST_Operator:
         )
 
         return data_st
+
+    def _extra_cross_spectrum_op_kwargs(self):
+        """
+        Additional arguments of the cross spectrum operator, defined by subclasses (low-pass bins of tensor products).
+        """
+        return {}
 
     def _scales_S1_S2(self, J):
         """

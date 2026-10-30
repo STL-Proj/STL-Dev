@@ -1251,7 +1251,7 @@ class CS_operator_2D_Kernel_Torch:
 
         Args:
             N0 (tuple): Data shape
-            n_bins (int): Number of radial frequency bins (default: 2 per octave, 2 * (J - Jmin - 1))
+            n_bins (int): Number of radial frequency bins (default: 3 per octave, 3 * (J - Jmin - 1))
             Jmin (int): Coarsest scale index included in the bin masks
                 (0 <= Jmin < J). Only used if power_spectrum_method is
                 "gaussian_rings".
@@ -1272,9 +1272,9 @@ class CS_operator_2D_Kernel_Torch:
                 f"Jmin must satisfy 0 <= Jmin < J (got Jmin={Jmin}, J={self.J})."
             )
         self.Jmin = Jmin
-        # adaptive number of bins: 2 per octave between the frequencies 1/2^J and 0.5/2^Jmin,
-        # so that it grows like log(N) and bins stay wider than the frequency resolution
-        self.n_bins = max(1, 2 * (self.J - self.Jmin - 1)) if n_bins is None else n_bins
+        # adaptive number of bins: 3 per octave between the frequencies 1/2^J and 0.5/2^Jmin,
+        # so that it grows like log(N); with the default J, the narrowest bin is about one frequency step (1/N) wide
+        self.n_bins = max(1, 3 * (self.J - self.Jmin - 1)) if n_bins is None else n_bins
         self.DT = DT if DT is not None else self.default_DT
         self.power_spectrum_method = power_spectrum_method.lower().strip()
         if self.power_spectrum_method not in {"legacy", "gaussian_rings"}:
@@ -1386,6 +1386,9 @@ class CS_operator_2D_Kernel_Torch:
         self.lam = None
 
     def estimate_crop_borders(self):
+        self.crop_borders = self._estimate_crop_borders(self.bin_masks)  # [n_bins]
+
+    def _estimate_crop_borders(self, bin_masks):
 
         N, M = self.shape
 
@@ -1399,7 +1402,7 @@ class CS_operator_2D_Kernel_Torch:
         # Apply all masks in batch
         impulse_ft = impulse_ft.unsqueeze(0)  # [1, N, M] for broadcasting
         psfs = torch.fft.ifft2(
-            torch.fft.ifftshift(impulse_ft * self.bin_masks, dim=(-2, -1)),
+            torch.fft.ifftshift(impulse_ft * bin_masks, dim=(-2, -1)),
             norm="ortho",
             dim=(-2, -1),
         ).real  # [n_bins, N, M]
@@ -1409,11 +1412,38 @@ class CS_operator_2D_Kernel_Torch:
 
         # Determine border where PSF drops below threshold_percent of the trace at the source pixel (maximum value)
         threshold_percent = 0.1
-        threshold = threshold_percent * traces[:, -1].unsqueeze(1)  # [n_bins, 1]
+        # value at the source pixel, where the traces stop (not at its neighbour, which can be close to a zero of the
+        # oscillating PSF of a narrow bin)
+        threshold = threshold_percent * psfs[:, N // 2, M // 2].abs().unsqueeze(
+            1
+        )  # [n_bins, 1]
         above_thresh = traces > threshold  # [n_bins, M//2]
-        self.crop_borders = math.ceil(M / 2) - (
-            above_thresh.float().argmax(dim=1) + 1
-        )  # [n_bins]
+        return math.ceil(M / 2) - (above_thresh.float().argmax(dim=1) + 1)  # [n_bins]
+
+    def lowpass_bin(self):
+        """
+        Low-pass bin, below the first bin of the log-Gaussian rings: a Gaussian of the frequency centered on 0,
+        equal to 1/2 where the first bin is 1/2 on its low-frequency side. Contrary to the other bins, it
+        contains the zero frequency. Used by tensor products, where it covers e.g. the omega ~ 0 slab of a
+        space-time spectrum (see CS_Operator_TensorProd_Kernel_Torch).
+
+        Returns
+        -------
+        mask : torch.Tensor
+            Bin mask, shape [1, *shape], with the zero frequency at the center as the other bin masks.
+        crop_border : torch.Tensor
+            Crop border for non-periodic data, shape [1].
+        """
+        if self.power_spectrum_method != "gaussian_rings":
+            raise NotImplementedError(
+                "The low-pass bin is only implemented for the gaussian_rings power spectrum method."
+            )
+        half_max = np.sqrt(2 * np.log(2))  # exp(-x**2 / 2) = 1/2 for x = half_max
+        log_sigma_first = np.log(float(self.bin_edges[1]) / float(self.bin_edges[0]))
+        freq_half_max = float(self.bin_centers[0]) * np.exp(-half_max * log_sigma_first)
+        sigma = freq_half_max / half_max
+        mask = torch.exp(-0.5 * (self.radial_freq / sigma) ** 2)[None]  # [1, *shape]
+        return mask, self._estimate_crop_borders(mask)
 
     ###########################################################################
     def build_mask_crop(self, array, border):

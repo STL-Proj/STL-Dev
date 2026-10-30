@@ -9,36 +9,64 @@ class ST_Operator_TensorProd(ST_Operator):
     """
     Scattering operator for tensor products of 1D and 2D blocks, with the parameters of ST_Operator and:
 
-    - lowpass : bool, default True
-        Add the low-pass filter phi_J of each block to its wavelets. Tensor products of wavelets alone do not
-        see the frequencies close to 0 in any block (e.g. omega ~ 0 at any spatial frequency, the time average
-        of a space-time field), since their Littlewood-Paley sum is the product of those of the blocks. In S1 and
-        S2, the low-pass filter of block b is the scale j_b = J_b, after its wavelets, with a single orientation
-        stored at index 0 (the other orientations are NaN). The combination with the low-pass filter in all
-        blocks is not computed: the frequencies below the coarsest scale of every block are only described by the
-        mean, as below the coarsest scale in 1D and 2D. S3 and S4 have no low-pass coefficients (see
-        _compute_ST_loop).
-        Blocks whose size is not divisible by 2**J_b (one more downsampling than the wavelets) get no low-pass
-        filter.
+    - lowpass : "ST", "PS", ("ST", "PS") or None, default "ST"
+        Tensor products of wavelets alone do not see the frequencies close to 0 in any block (e.g. omega ~ 0 at
+        any spatial frequency, the time average of a space-time field), since their Littlewood-Paley sum is the
+        product of those of the blocks. This option adds low-pass filters to cover them, in S1 and S2 ("ST"),
+        in the power spectrum ("PS") or in both:
+        - "ST": the low-pass filter phi_J of each block is added to its wavelets in S1 and S2. The low-pass
+          filter of block b is the scale j_b = J_b, after its wavelets, with a single orientation stored at
+          index 0 (the other orientations are NaN). The filter with the low-pass filter in all blocks is the
+          only one without zero mean: S1 and S2 are computed on the coarse-grained data X = I * (phi_J0 x
+          phi_J1 x ...) with its mean removed, S1 = Mean(|X - Mean(X)|) and S2 = Mean(|X - Mean(X)|^2), the
+          variance of X, i.e. the energy of the data in the low-frequency box around the origin, without the
+          mean. S3 and S4 have no low-pass coefficients (see _compute_ST_loop). Blocks whose size is not
+          divisible by 2**J_b (one more downsampling than the wavelets) get no low-pass filter, and there is then
+          no filter with the low-pass filter in all blocks.
+        - "PS": a low-pass bin is added to each block of the power spectrum, at index 0, the joint low-pass bin
+          excluding the mean (see CS_Operator_TensorProd_Kernel_Torch). Only effective with compute_PS=True.
+        - ("ST", "PS"): both. The joint low-pass bin of the power spectrum then measures nearly the same energy
+          as S2 of the filter with the low-pass filter in all blocks, with a wider filter.
+        - None: no low-pass filter.
+        True and False are accepted as "ST" and None.
     """
 
-    def __init__(self, data_example, *args, lowpass=True, **kwargs):
+    def __init__(self, data_example, *args, lowpass="ST", **kwargs):
+        if isinstance(lowpass, bool):
+            lowpass = "ST" if lowpass else None
+        lowpass_modes = (
+            set()
+            if lowpass is None
+            else {lowpass} if isinstance(lowpass, str) else set(lowpass)
+        )
+        if not lowpass_modes <= {"ST", "PS"}:
+            raise ValueError(
+                f'lowpass must be "ST", "PS", ("ST", "PS") or None, got {lowpass}.'
+            )
+        self.lowpass_modes = lowpass_modes  # needed by _extra_cross_spectrum_op_kwargs during the initialization
         super().__init__(data_example, *args, **kwargs)
+        if "PS" in lowpass_modes and not self.compute_PS:
+            warnings.warn(
+                'lowpass="PS" has no effect without the power spectrum (compute_PS=False).'
+            )
 
-        # low-pass filter of each block, if its size allows one more downsampling than the wavelets
+        # low-pass filter of each block in S1 and S2, if its size allows one more downsampling than the wavelets
         self.lowpass = [
-            lowpass
+            "ST" in lowpass_modes
             and all(
                 N % 2 ** self.wavelet_op.lowpass_dg(block_id) == 0
                 for N in data_example.N0[block_id]
             )
             for block_id in range(self.wavelet_op.nblock)
         ]
-        if lowpass and not all(self.lowpass):
+        if "ST" in lowpass_modes and not all(self.lowpass):
             warnings.warn(
                 f"No low-pass filter for blocks {[block_id for block_id, lowpass_block in enumerate(self.lowpass) if not lowpass_block]}, "
                 f"whose size {data_example.N0} is not divisible by 2**J with J = {self.J}."
             )
+
+    def _extra_cross_spectrum_op_kwargs(self):
+        return {"lowpass": "PS" in self.lowpass_modes}
 
     def _scales_S1_S2(self, J):
         # the low-pass filter of a block is its scale J_b, after the wavelets
@@ -69,8 +97,9 @@ class ST_Operator_TensorProd(ST_Operator):
         # S4 = Cov(|I*psi1|*psi3, |I*psi2|*psi3)
 
         # Low-pass filters (self.lowpass): the low-pass filter phi_J of block b is used as its scale j_b = J_b,
-        # after its wavelets, and the multi-scales j3 run over the grid extended with these scales, except the
-        # multi-scale with the low-pass filter in all blocks (not a zero-mean filter, it contains the mean).
+        # after its wavelets, and the multi-scales j3 run over the grid extended with these scales. The last one,
+        # with the low-pass filter in all blocks, is the only filter without zero mean: S1 and S2 are computed
+        # after removing the mean of its filtered data.
         # S3 and S4 are expected to approximately vanish when their last filter psi3 includes a low-pass filter,
         # and are not computed. Since j1 <= j2 <= j3 componentwise and the low-pass filter is the coarsest scale of
         # its block, this excludes all S3 and S4 involving a low-pass filter: low-pass multi-scales only give S1
@@ -83,6 +112,10 @@ class ST_Operator_TensorProd(ST_Operator):
         def is_lowpass(j):
             # whether the multi-scale j includes a low-pass filter
             return any(j_block == J_block for j_block, J_block in zip(j, J))
+
+        def is_all_lowpass(j):
+            # whether the multi-scale j is the low-pass filter in all blocks
+            return all(j_block == J_block for j_block, J_block in zip(j, J))
 
         def dg_of(block_id, j_block):
             # resolution of the scale j_block of a block, the low-pass filter being one downsampling below the coarsest wavelet
@@ -104,16 +137,14 @@ class ST_Operator_TensorProd(ST_Operator):
         ### Higher order computation ###
 
         # J = (Jx, ..., Jz)
-        J_range = [
-            j3
-            for j3 in product(
+        J_range = list(
+            product(
                 *(
                     range(J_block + 1 if lowpass_block else J_block)
                     for J_block, lowpass_block in zip(J, self.lowpass)
                 )
             )
-            if not all(j3_block == J_block for j3_block, J_block in zip(j3, J))
-        ]  # [(0, ..., 0), (0, ..., 1), ..., (Jx-1, ..., Jz-1)] lexicographic order, extended with the low-pass scales Jx, ..., Jz
+        )  # [(0, ..., 0), (0, ..., 1), ..., (Jx-1, ..., Jz-1)] lexicographic order, extended with the low-pass scales Jx, ..., Jz
 
         # next wavelet multi-scale after each multi-scale, for the second-layer path
         next_wavelet_j3 = {}
@@ -176,9 +207,18 @@ class ST_Operator_TensorProd(ST_Operator):
                     else None
                 )
 
+            data_l1_j3 = data_l1[j3]
+            if is_all_lowpass(j3):
+                # not a zero-mean filter: the mean of the filtered data is removed, so that S1 and S2 describe the
+                # fluctuations of the coarse-grained data (see the class docstring)
+                data_l1_j3 = data_l1[j3].copy(empty=True)
+                data_l1_j3.array = data_l1[j3].array - self.wavelet_op.mean(
+                    data_l1[j3], keepdim=True
+                )  # (Nb,Nc,1x,...,1z,Nx_3,...,Nz_3)
+
             if is_lowpass(j3):
                 # only used for S1 and S2, so not stored in the second-layer path
-                data_l1m_j3 = data_l1[j3].modulus(inplace=False)
+                data_l1m_j3 = data_l1_j3.modulus(inplace=False)
             else:
                 data_l1m_multi_res[j3] = [
                     data_l1[j3].modulus(inplace=False)
@@ -239,7 +279,7 @@ class ST_Operator_TensorProd(ST_Operator):
 
             # cross S1 terms (sub diagonal only)
             if (compute_cross_matrix * (~bk.eye(Nc, dtype=bool, device=device))).any():
-                data_l1_modulus_square_rooted = data_l1[j3].divide(
+                data_l1_modulus_square_rooted = data_l1_j3.divide(
                     data_l1m_j3, epsilon=1e-8, pow=0.5, inplace=False
                 )  # [Nb,Nc,L,N3]
 
@@ -278,8 +318,8 @@ class ST_Operator_TensorProd(ST_Operator):
             # cross S2 terms (sub diagonal only)
             if (compute_cross_matrix * (~bk.eye(Nc, dtype=bool, device=device))).any():
                 self.wavelet_op._compute_and_store_cross_cov(
-                    data_l1[j3],
-                    data_l1[j3],
+                    data_l1_j3,
+                    data_l1_j3,
                     output=data_st.S2[
                         (slice(None), slice(None), slice(None), *j3, *orientations_j3)
                     ],
@@ -390,14 +430,18 @@ class ST_Operator_TensorProd(ST_Operator):
                     ############## S4(j1,j2,j3) = Cov(|I*psi1|*psi3, |I*psi2|*psi3) ##############
                     ##############################################################################
                     if not has_fewer_convolutions:
+                        # [REVIEW] fix: the new axes of the orientations of psi2 go after all the orientation axes of
+                        # psi1 (one per block), not after the first one only. Inserting them after the first one paired
+                        # the psi1 and psi2 orientations of the other blocks (l1 = l2 only) instead of combining them:
+                        # S4 did not depend on the psi1 orientations of these blocks, and the l1 != l2 entries were
+                        # copies of the l1 = l2 ones.
                         self.wavelet_op._compute_and_store_cross_cov(
                             data_l1m_l2[(j3, j1)][
-                                (slice(None), slice(None), slice(None))
-                                + (None,) * len(j2)
-                            ],  # (Nb,Nc,L1,1x,...,1z,L3,N3)
+                                (slice(None),) * (2 + len(j1)) + (None,) * len(j2)
+                            ],  # (Nb,Nc,L1x,...,L1z,1x,...,1z,L3x,...,L3z,N3)
                             data_l1m_l2[(j3, j2)][
                                 (slice(None), slice(None)) + (None,) * len(j1)
-                            ],  # (Nb,Nc,1x,...,1z,L2,L3,N3)
+                            ],  # (Nb,Nc,1x,...,1z,L2x,...,L2z,L3x,...,L3z,N3)
                             output=data_st.S4[
                                 (slice(None), slice(None), slice(None), *j1, *j2, *j3)
                             ],  # (Nb,Nc,Nc,L1,L2,L3)
@@ -407,6 +451,7 @@ class ST_Operator_TensorProd(ST_Operator):
 
                     else:
                         raise NotImplementedError
+                        # [REVIEW] the indexing of data_l1m[j1] below has the same issue as the one fixed above for S4
                         # Sihao S4 version : S4(j1,j2,j3) = Cov(|I*psi1|, |I*psi2|*psi3)
                         self.wavelet_op._compute_and_store_cross_cov(
                             data_l1m[j1][
@@ -677,6 +722,8 @@ class ST_Operator_TensorProd(ST_Operator):
 # With low-pass filters, the low-pass multi-scales j3 only use l_data and data_l1 (S1 and S2), the low-pass filter
 # of a block being applied by downsampling l_data_multi_res and data_l1[j3[:b]] once more along this block. The
 # objects of the second layer (data_l1m, data_l1m_l2) are only used, and updated, at the wavelet multi-scales.
+# The multi-scale with the low-pass filter in all blocks is the last one of J_range: its centered copy of
+# data_l1[j3] (data_l1_j3) is local to its iteration and does not change data_l1.
 
 # l_data      used for data_l1[[j3x]] @j3 for apply at j3x
 #          + used for S3 Sihao       @j3,j2

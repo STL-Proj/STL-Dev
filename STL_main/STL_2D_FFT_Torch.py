@@ -1291,7 +1291,7 @@ class CS_operator_2D_FFT_torch:
 
         Args:
             N0 (tuple): Image size (N, M)
-            n_bins (int): Number of radial frequency bins (default: 2 per octave, 2 * (J - Jmin - 1))
+            n_bins (int): Number of radial frequency bins (default: 3 per octave, 3 * (J - Jmin - 1))
             device: torch device
             dtype: torch dtype
             get_crop_border_size_method : str ("flexible_crop" or "largest_crop")
@@ -1303,9 +1303,9 @@ class CS_operator_2D_FFT_torch:
                 f"Jmin must satisfy 0 <= Jmin < J (got Jmin={Jmin}, J={self.J})."
             )
         self.Jmin = Jmin
-        # adaptive number of bins: 2 per octave between the frequencies 1/2^J and 0.5/2^Jmin,
-        # so that it grows like log(N) and bins stay wider than the frequency resolution
-        self.n_bins = max(1, 2 * (self.J - self.Jmin - 1)) if n_bins is None else n_bins
+        # adaptive number of bins: 3 per octave between the frequencies 1/2^J and 0.5/2^Jmin,
+        # so that it grows like log(N); with the default J, the narrowest bin is about one frequency step (1/N) wide
+        self.n_bins = max(1, 3 * (self.J - self.Jmin - 1)) if n_bins is None else n_bins
         self.power_spectrum_method = power_spectrum_method.lower().strip()
         if self.power_spectrum_method not in {"legacy", "gaussian_rings"}:
             raise ValueError(
@@ -1438,7 +1438,11 @@ class CS_operator_2D_FFT_torch:
 
         # Determine border where PSF drops below threshold_percent of the trace at the source pixel (maximum value)
         threshold_percent = 0.1
-        threshold = threshold_percent * traces[:, -1].unsqueeze(1)  # [n_bins, 1]
+        # value at the source pixel, where the traces stop (not at its neighbour, which can be close to a zero of the
+        # oscillating PSF of a narrow bin)
+        threshold = threshold_percent * psfs[:, N // 2, M // 2].abs().unsqueeze(
+            1
+        )  # [n_bins, 1]
         above_thresh = traces > threshold  # [n_bins, M//2]
         self.crop_borders = math.ceil(M / 2) - (
             above_thresh.float().argmax(dim=1) + 1
